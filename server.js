@@ -9,8 +9,8 @@ const publicDir = path.join(__dirname, 'public');
 const dataDir = path.join(__dirname, 'data');
 const dbFile = path.join(dataDir, 'db.json');
 const PORT = Number(process.env.PORT || 8787);
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@example.com';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'change-this-password';
+const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'change-me';
 const ADMIN_USERNAME = (() => {
   const raw = String(process.env.ADMIN_USERNAME || 'ashura').trim().toLowerCase();
   return /^[a-z0-9][a-z0-9_-]{2,31}$/.test(raw) ? raw : 'ashura';
@@ -235,9 +235,10 @@ function ensureUsername(user, db) {
 }
 
 function ensureAdminUser(db) {
-  const email = String(ADMIN_EMAIL || '').trim().toLowerCase();
+  const email = ADMIN_EMAIL;
   let admin = db.users.find(x => x.id === 'usr_admin')
     || (email && db.users.find(x => (x.email || '').toLowerCase() === email))
+    || db.users.find(x => (x.username || '').toLowerCase() === ADMIN_USERNAME && x.role === 'admin')
     || db.users.find(x => x.role === 'admin');
   for (const u of db.users) {
     if ((!admin || u.id !== admin.id) && (u.username || '').toLowerCase() === ADMIN_USERNAME) {
@@ -247,7 +248,7 @@ function ensureAdminUser(db) {
   if (!admin) {
     db.users.push({
       id: 'usr_admin',
-      email: email || `${ADMIN_USERNAME}@example.com`,
+      email: email || '',
       username: ADMIN_USERNAME,
       name: 'Admin',
       password: hash(ADMIN_PASSWORD),
@@ -1153,7 +1154,7 @@ for (const user of initial.users) {
   user.reservedTokens ??= 0;
   user.reservedBalance ??= 0;
   user.accountActive ??= (user.balance || 0) > 0;
-  user.role ??= user.email === ADMIN_EMAIL.toLowerCase() ? 'admin' : 'user';
+  user.role ??= (ADMIN_EMAIL && user.email === ADMIN_EMAIL) ? 'admin' : 'user';
   ensureUsername(user, initial);
   ensureUserKeys(user);
 }

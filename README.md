@@ -19,9 +19,9 @@ $env:UPSTREAM_API_KEY="sk-your-authorized-key"
 $env:UPSTREAM_MODEL="gpt-4o-mini"
 $env:UPSTREAM_PRICE_PER_1K="0.01"
 $env:BALANCE_SAFETY_BUFFER="0.01"
-$env:ADMIN_EMAIL="admin@your-domain.com"
 $env:ADMIN_USERNAME="ashura"
 $env:ADMIN_PASSWORD="change-me"
+$env:ADMIN_EMAIL="admin@your-domain.com"
 $env:CONTACT_EMAIL="support@your-domain.com"
 $env:CONTACT_WECHAT="YourSupportWechat"
 $env:PAYMENT_QR="/payment-qr.svg"
@@ -51,7 +51,7 @@ Content-Type: application/json
 
 ## 多渠道与实时定价
 
-使用 `ADMIN_USERNAME`（默认 `ashura`）或 `ADMIN_EMAIL` 与 `ADMIN_PASSWORD` 登录后，侧栏会显示“运营配置”。在这里可以实时切换 2x、3x、4x 计费倍率，并录入多个模型渠道。渠道配置按模型名称路由，每个渠道分别填写：
+使用 `ADMIN_USERNAME`（默认 `ashura`）或可选的 `ADMIN_EMAIL`，以及 `ADMIN_PASSWORD` 登录后，侧栏会显示“运营配置”。在这里可以实时切换 2x、3x、4x 计费倍率，并录入多个模型渠道。渠道配置按模型名称路由，每个渠道分别填写：
 
 - `models`：该渠道负责的模型数组；例如 `gpt-4o-mini`
 - `inputPricePer1K`：该渠道输入每千 Token 实际成本

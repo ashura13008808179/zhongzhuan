@@ -124,7 +124,7 @@ POST   /api/keys/:id/rotate
 
 ## 管理员 API
 
-管理员由用户对象的 `role: "admin"` 标识。默认管理员由环境变量 `ADMIN_EMAIL` / `ADMIN_PASSWORD` 初始化。非管理员访问返回 403。
+管理员由用户对象的 `role: "admin"` 标识。首次启动用 `ADMIN_USERNAME`（默认 `ashura`）+ `ADMIN_PASSWORD` 创建管理员；`ADMIN_EMAIL` 可选，设置后挂到该账号，可用用户名或邮箱登录。密码只从环境变量读取，文档用 `change-me` 占位。非管理员访问返回 403。
 
 ```text
 GET  /api/admin/pricing          # 倍率、渠道摘要（无 apiKey）、健康摘要
@@ -154,9 +154,9 @@ GET  /api/admin/orders           # 卡密兑换订单 stub
 
 ```powershell
 $env:PORT="8787"
-$env:ADMIN_EMAIL="admin@your-domain.com"
 $env:ADMIN_USERNAME="ashura"
 $env:ADMIN_PASSWORD="change-me"
+$env:ADMIN_EMAIL="admin@your-domain.com"
 $env:CONTACT_EMAIL="support@your-domain.com"
 $env:CONTACT_WECHAT="YourSupportWechat"
 $env:PAYMENT_QR="/payment-qr.svg"
