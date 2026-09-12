@@ -84,10 +84,63 @@ function userFrom(req, db) {
 }
 function isAdmin(user) { return user?.role === 'admin'; }
 function availableTokens(user) { return Math.max(0, (user.quotaTokens || 0) - (user.usedTokens || 0) - (user.reservedTokens || 0)); }
+const USERNAME_RE = /^[a-z0-9][a-z0-9_-]{2,31}$/i;
+
+function slugifyUsername(raw) {
+  let s = String(raw || '')
+    .trim()
+    .toLowerCase()
+    .replace(/@.*$/, '')
+    .replace(/[^a-z0-9_-]+/g, '_')
+    .replace(/^[_-]+|[_-]+$/g, '')
+    .replace(/[_-]{2,}/g, '_')
+    .slice(0, 24);
+  if (s.length < 3) s = `${s}user`.replace(/[_-]{2,}/g, '_').slice(0, 24);
+  if (s.length < 3) s = 'user';
+  if (!/^[a-z]/.test(s)) s = `u_${s}`.slice(0, 24);
+  return s;
+}
+
+function usernameTaken(db, username, exceptId) {
+  const lower = String(username || '').toLowerCase();
+  if (!lower) return false;
+  return db.users.some(u => u.id !== exceptId && (u.username || '').toLowerCase() === lower);
+}
+
+function allocateUsername(db, seed, exceptId) {
+  const base = slugifyUsername(seed);
+  let candidate = base;
+  let n = 0;
+  while (usernameTaken(db, candidate, exceptId)) {
+    n += 1;
+    const suffix = String(n);
+    candidate = `${base.slice(0, Math.max(3, 24 - suffix.length))}${suffix}`;
+  }
+  return candidate;
+}
+
+function ensureUsername(user, db) {
+  if (user.username && USERNAME_RE.test(user.username) && !usernameTaken(db, user.username, user.id)) return;
+  const seed = user.username || user.name || (user.email || '').split('@')[0] || 'user';
+  user.username = allocateUsername(db, seed, user.id);
+}
+
+function findUserByIdentifier(db, identifier) {
+  const raw = String(identifier || '').trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  const byEmail = db.users.find(x => (x.email || '').toLowerCase() === lower);
+  if (byEmail) return byEmail;
+  const byUsername = db.users.find(x => x.username && x.username.toLowerCase() === lower);
+  if (byUsername) return byUsername;
+  return db.users.find(x => x.name && x.name.toLowerCase() === lower) || null;
+}
+
 function safeUser(user) {
   return {
     id: user.id,
     email: user.email,
+    username: user.username || '',
     name: user.name,
     apiKey: user.apiKey,
     balance: user.balance || 0,
@@ -107,6 +160,7 @@ function adminUserView(user) {
   return {
     id: user.id,
     email: user.email,
+    username: user.username || '',
     name: user.name,
     balance: user.balance || 0,
     quotaTokens: user.quotaTokens || 0,
@@ -529,13 +583,24 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/api/auth/register') {
     if (!rateLimit(req, res, AUTH_RATE_LIMIT, 'auth')) return;
     const p = await body(req);
-    if (!p?.email || !p?.password || p.password.length < 8) return fail(res, 400, '请输入邮箱和至少 8 位密码');
-    if (db.users.some(x => x.email === p.email.toLowerCase())) return fail(res, 409, '该邮箱已注册');
+    const email = String(p?.email || '').trim().toLowerCase();
+    if (!email || !email.includes('@') || !p?.password || p.password.length < 8) return fail(res, 400, '请输入邮箱和至少 8 位密码');
+    if (db.users.some(x => x.email === email)) return fail(res, 409, '该邮箱已注册');
+    const requestedUsername = String(p.username || '').trim();
+    let username;
+    if (requestedUsername) {
+      if (!USERNAME_RE.test(requestedUsername)) return fail(res, 400, '用户名需为 3–32 位字母、数字、下划线或连字符，并以字母或数字开头');
+      if (usernameTaken(db, requestedUsername)) return fail(res, 409, '该用户名已被占用');
+      username = requestedUsername.toLowerCase();
+    } else {
+      username = allocateUsername(db, p.name || email.split('@')[0] || 'user');
+    }
     const inviter = p.inviteCode ? db.users.find(x => x.inviteCode === p.inviteCode) : null;
     const user = {
       id: id('usr'),
-      email: p.email.toLowerCase(),
-      name: p.name || p.email.split('@')[0],
+      email,
+      username,
+      name: String(p.name || '').trim() || email.split('@')[0],
       password: hash(p.password),
       apiKey: userKey(),
       balance: 0,
@@ -562,8 +627,9 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/api/auth/login') {
     if (!rateLimit(req, res, AUTH_RATE_LIMIT, 'auth')) return;
     const p = await body(req);
-    const user = db.users.find(x => x.email === p?.email?.toLowerCase());
-    if (!user || !p.password || !verify(p.password, user.password)) return fail(res, 401, '邮箱或密码错误');
+    const identifier = String(p?.login ?? p?.username ?? p?.email ?? '').trim();
+    const user = findUserByIdentifier(db, identifier);
+    if (!user || !p?.password || !verify(p.password, user.password)) return fail(res, 401, '用户名/邮箱或密码错误');
     const token = crypto.randomBytes(32).toString('hex');
     sessions.set(token, user.id);
     persistSession(db, token, user.id);
@@ -824,6 +890,7 @@ for (const user of initial.users) {
   user.reservedBalance ??= 0;
   user.accountActive ??= (user.balance || 0) > 0;
   user.role ??= user.email === ADMIN_EMAIL.toLowerCase() ? 'admin' : 'user';
+  ensureUsername(user, initial);
 }
 for (const provider of initial.settings.providers) {
   provider.priority ??= 100;
@@ -852,7 +919,7 @@ if (!initial.settings.providers.length && LEGACY_UPSTREAM.url && LEGACY_UPSTREAM
 }
 initial.settings.defaultProviderId ??= initial.settings.providers[0]?.id ?? null;
 if (!initial.users.some(x => x.email === ADMIN_EMAIL.toLowerCase())) {
-  initial.users.push({
+  const adminUser = {
     id: 'usr_admin',
     email: ADMIN_EMAIL.toLowerCase(),
     name: 'Admin',
@@ -869,7 +936,9 @@ if (!initial.users.some(x => x.email === ADMIN_EMAIL.toLowerCase())) {
     invited: 0,
     inviteCode: 'ADMIN',
     createdAt: new Date().toISOString()
-  });
+  };
+  ensureUsername(adminUser, initial);
+  initial.users.push(adminUser);
 }
 const envCodes = (process.env.RECHARGE_CODES || '').split(',').map(x => x.trim()).filter(Boolean);
 for (const item of envCodes) {
