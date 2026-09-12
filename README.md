@@ -19,11 +19,13 @@ $env:UPSTREAM_API_KEY="sk-your-authorized-key"
 $env:UPSTREAM_MODEL="gpt-4o-mini"
 $env:UPSTREAM_PRICE_PER_1K="0.01"
 $env:BALANCE_SAFETY_BUFFER="0.01"
-$env:ADMIN_USERNAME="ashura"
+$env:ADMIN_USERNAME="admin"
 $env:ADMIN_PASSWORD="change-me"
 $env:ADMIN_EMAIL="admin@your-domain.com"
-$env:CONTACT_EMAIL="support@your-domain.com"
-$env:CONTACT_WECHAT="YourSupportWechat"
+$env:CONTACT_EMAIL="3845440106@qq.com"
+$env:CONTACT_WECHAT=""
+$env:CONTACT_QQ="3845440106"
+$env:CONTACT_QQ_GROUP="1061247399"
 $env:PAYMENT_QR="/payment-qr.svg"
 $env:RECHARGE_CODES="RELAY-100-A:100,RELAY-300-B:300"
 npm start
@@ -51,7 +53,7 @@ Content-Type: application/json
 
 ## 多渠道与实时定价
 
-使用 `ADMIN_USERNAME`（默认 `ashura`）或可选的 `ADMIN_EMAIL`，以及 `ADMIN_PASSWORD` 登录后，侧栏会显示“运营配置”。在这里可以实时切换 2x、3x、4x 计费倍率，并在「渠道」页用卡片配置上游：上游地址、支持的模型（芯片）、掩码 API 密钥（留空保留原密钥，接口不回显明文）、内部名称、启用、优先级与价格。渠道配置按模型名称路由，每个渠道分别填写：
+使用环境变量中的 `ADMIN_USERNAME` / `ADMIN_PASSWORD`（以及可选 `ADMIN_EMAIL`）登录后，侧栏会显示“运营配置”。在这里可以实时切换 2x、3x、4x 计费倍率，并在「渠道」页用卡片配置上游：上游地址、支持的模型（芯片）、掩码 API 密钥（留空保留原密钥，接口不回显明文）、内部名称、启用、优先级与价格。渠道配置按模型名称路由，每个渠道分别填写：
 
 - `models`：该渠道负责的模型数组；例如 `gpt-4o-mini`
 - `inputPricePer1K`：该渠道输入每千 Token 实际成本
@@ -60,6 +62,11 @@ Content-Type: application/json
 
 请求会匹配模型对应的渠道，并以该渠道真实输入/输出成本乘当前倍率计算用户扣款和用户可见 Token。渠道密钥、地址和真实成本不会通过用户接口返回。倍率和渠道改动对之后的新请求实时生效；已开始的请求固定使用发起时的快照价格。
 
+
+
+## 管理员凭据（保密）
+
+管理员用户名与密码**只**通过本机环境变量或 gitignore 的 `start-local.ps1` 配置，**不要**写进仓库、前端页面或公开文档。密码也**不会**出现在任何 API 响应里。普通用户无法注册保留用户名（如 `admin`）。
 
 ## 管理员接口（需 role=admin）
 
@@ -78,3 +85,31 @@ GET  /api/admin/orders
 管理员登录后侧栏「运营配置」提供倍率、渠道表单、用户、卡密、审计、订单 Tab。渠道密钥不会返回给普通用户接口。数据仍使用 `data/db.json`（MySQL 暂缓）。
 
 认证限流约 60 次/分钟/IP，聊天接口约 120 次/分钟/IP。`POST /api/auth/logout` 可清除会话。
+
+
+## 聚合支付（易支付兼容）
+
+在管理后台「运营配置 → 聚合支付」填写：
+
+- 网关 API 地址（如 `https://pay.xxx.com`）
+- 商户 ID `pid`、密钥 `key`
+- 网站公网 `siteUrl`（用于回调）
+
+启用后用户购买将跳转 `submit.php` 支付；异步通知地址：
+
+`{siteUrl}/api/pay/epay/notify`
+
+支付成功且验签通过后自动发放卡密。未启用时回退个人收款码 + 备注核对。
+
+
+## 站点网址（用户侧 Base URL）
+
+用户 / Cursor / CC Switch 应填写**你的中转站**地址，不是 OpenAI 或上游：
+
+- 环境变量：`PUBLIC_BASE_URL=https://你的域名`
+- 或管理后台「运营配置 → 站点网址」
+
+客户端 Base URL 形如：`https://你的域名/v1`  
+完整对话：`https://你的域名/v1/chat/completions`
+
+上游渠道（如 Codex 直连 vip1129）只配在管理后台「渠道」，不对用户展示。

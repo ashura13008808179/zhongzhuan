@@ -27,7 +27,7 @@
 ## 当前已实现功能
 
 - 注册与登录：登录标识为用户名或邮箱 + 密码；注册写入唯一 `username`；`safeUser` 返回 `username`
-- 默认管理员用户名来自 `ADMIN_USERNAME`（默认 `ashura`），可用用户名或邮箱登录；密码仅来自 `ADMIN_PASSWORD`，仓库中不要写入真实密码
+- 默认管理员用户名来自 `ADMIN_USERNAME`（由环境变量配置），可用用户名或邮箱登录；密码仅来自 `ADMIN_PASSWORD`，仓库中不要写入真实密码
 - 用户可创建多个 API Key：选择允许的模型，设置消费上限 / Token 上限 / RPM / TPM；`/v1/chat/completions` 与 `/api/chat` 会强制校验
 - 会话令牌：内存 Map + 可选持久化到 `db.sessions`（启动时加载）
 - `POST /api/auth/logout` 清除会话
@@ -124,7 +124,7 @@ POST   /api/keys/:id/rotate
 
 ## 管理员 API
 
-管理员由用户对象的 `role: "admin"` 标识。首次启动用 `ADMIN_USERNAME`（默认 `ashura`）+ `ADMIN_PASSWORD` 创建管理员；`ADMIN_EMAIL` 可选，设置后挂到该账号，可用用户名或邮箱登录。密码只从环境变量读取，文档用 `change-me` 占位。非管理员访问返回 403。
+管理员由用户对象的 `role: "admin"` 标识。首次启动用 `ADMIN_USERNAME`（由环境变量配置）+ `ADMIN_PASSWORD` 创建管理员；`ADMIN_EMAIL` 可选，设置后挂到该账号，可用用户名或邮箱登录。密码只从环境变量 / 本地 `start-local.ps1`（已 gitignore）读取，文档只用 `change-me` 占位；真实管理员账号密码不得写入仓库或展示给普通用户。非管理员访问返回 403。
 
 ```text
 GET  /api/admin/pricing          # 倍率、渠道摘要（无 apiKey）、健康摘要
@@ -154,11 +154,13 @@ GET  /api/admin/orders           # 卡密兑换订单 stub
 
 ```powershell
 $env:PORT="8787"
-$env:ADMIN_USERNAME="ashura"
+$env:ADMIN_USERNAME="admin"
 $env:ADMIN_PASSWORD="change-me"
 $env:ADMIN_EMAIL="admin@your-domain.com"
-$env:CONTACT_EMAIL="support@your-domain.com"
-$env:CONTACT_WECHAT="YourSupportWechat"
+$env:CONTACT_EMAIL="3845440106@qq.com"
+$env:CONTACT_WECHAT=""
+$env:CONTACT_QQ="3845440106"
+$env:CONTACT_QQ_GROUP="1061247399"
 $env:PAYMENT_QR="/payment-qr.svg"
 $env:RECHARGE_CODES="CARD-100:100:1000000"
 $env:BILLING_MULTIPLIER="2"

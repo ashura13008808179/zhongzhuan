@@ -33,30 +33,23 @@
       </div>
       <div id="authMessage" class="auth-message"></div>
       <form id="loginForm" class="auth-form auth-form-login">
-        <div class="auth-heading">
-          <p class="eyebrow">WELCOME BACK</p>
-          <h2>登录控制台</h2>
-          <p class="auth-lead">使用用户名或邮箱进入工作台，无需重复填写邮箱。</p>
-        </div>
         <label>用户名 / 邮箱
           <input id="loginIdentifier" type="text" autocomplete="username" placeholder="用户名或邮箱" required>
         </label>
         <label>密码
           <input id="loginPassword" type="password" autocomplete="current-password" placeholder="输入密码" required>
         </label>
+        <div class="form-row">
+          <label class="check"><input type="checkbox"> 记住我</label>
+        </div>
         <button class="primary-btn" type="submit">登录控制台 <span>↗</span></button>
       </form>
       <form id="registerForm" class="auth-form auth-form-register" hidden>
-        <div class="auth-heading">
-          <p class="eyebrow">CREATE ACCOUNT</p>
-          <h2>注册</h2>
-          <p class="auth-lead">创建新账号，获取专属 API 密钥。用户名用于登录，且必须唯一。</p>
-        </div>
         <label>邮箱
           <input id="regEmail" type="email" autocomplete="email" placeholder="you@example.com" required>
         </label>
         <label>用户名
-          <input id="regUsername" type="text" autocomplete="username" placeholder="3–32 位，字母数字或下划线" required minlength="3" maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9_-]{2,31}">
+          <input id="regUsername" type="text" autocomplete="username" placeholder="3-32 位字母数字下划线" required minlength="3" maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9_-]{2,31}">
         </label>
         <label>显示名称 <span class="optional">可选</span>
           <input id="regName" autocomplete="nickname" placeholder="你的名字">
@@ -67,7 +60,7 @@
         <label>邀请码 <span class="optional">可选</span>
           <input id="regInvite" placeholder="有邀请码可获得奖励">
         </label>
-        <button class="primary-btn register-btn" type="submit">创建账号 <span>↗</span></button>
+        <button class="primary-btn" type="submit">创建账号 <span>↗</span></button>
       </form>
       <p class="auth-legal">继续即表示你同意 <a href="/terms.html" target="_blank">服务条款</a>、<a href="/privacy.html" target="_blank">隐私政策</a> 与 <a href="/refund.html" target="_blank">退款规则</a></p>
     </div>

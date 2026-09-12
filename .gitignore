@@ -6,3 +6,6 @@ node_modules/
 *.log
 .DS_Store
 payment-qr.svg
+
+start-local.ps1
+

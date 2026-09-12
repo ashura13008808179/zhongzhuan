@@ -3,21 +3,314 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { epaySign, epayVerify, normalizeGateway, gatewayReady, buildEpaySubmitUrl, publicGatewayView } from './payment/epay.js';
+import {
+  login as vip1129Login,
+  createKey as vip1129CreateKey,
+  deleteKey as vip1129DeleteKey,
+  listAvailableGroups as vip1129ListGroups,
+  extractCreatedSecret as vip1129ExtractSecret,
+  isVip1129Provider,
+  defaultGroupMap as vip1129DefaultGroupMap,
+  normalizeBase as vip1129NormalizeBase,
+  DEFAULT_BASE as VIP1129_DEFAULT_BASE
+} from './upstream/vip1129.js';
+import {
+  login as beibeihaiLogin,
+  createKey as beibeihaiCreateKey,
+  deleteKey as beibeihaiDeleteKey,
+  listAvailableGroups as beibeihaiListGroups,
+  extractCreatedSecret as beibeihaiExtractSecret,
+  isBeibeihaiProvider,
+  defaultGroupMap as beibeihaiDefaultGroupMap,
+  normalizeBase as beibeihaiNormalizeBase,
+  DEFAULT_BASE as BEIBEIHAI_DEFAULT_BASE
+} from './upstream/beibeihai.js';
+import { ensureSiteErrors, recordSiteError, clearSiteErrors, tipsForCode, failPayload, SITE_ERROR_CAP } from './diagnostics/site-errors.js';
+import { runDiagnosticSuite } from './diagnostics/run-suite.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, 'public');
 const dataDir = path.join(__dirname, 'data');
 const dbFile = path.join(dataDir, 'db.json');
 const PORT = Number(process.env.PORT || 8787);
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || process.env.SITE_URL || '').trim().replace(/\/$/, '');
+const VIP1129_EMAIL = String(process.env.VIP1129_EMAIL || '').trim();
+const VIP1129_PASSWORD = String(process.env.VIP1129_PASSWORD || '');
+const VIP1129_BASE_URL = String(process.env.VIP1129_BASE_URL || VIP1129_DEFAULT_BASE).trim();
+const BEIBEIHAI_EMAIL = String(process.env.BEIBEIHAI_EMAIL || '').trim();
+const BEIBEIHAI_PASSWORD = String(process.env.BEIBEIHAI_PASSWORD || '');
+const BEIBEIHAI_BASE_URL = String(process.env.BEIBEIHAI_BASE_URL || BEIBEIHAI_DEFAULT_BASE).trim();
+
+
 const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'change-me';
 const ADMIN_USERNAME = (() => {
-  const raw = String(process.env.ADMIN_USERNAME || 'ashura').trim().toLowerCase();
-  return /^[a-z0-9][a-z0-9_-]{2,31}$/.test(raw) ? raw : 'ashura';
+  const raw = String(process.env.ADMIN_USERNAME || 'admin').trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9_-]{2,31}$/.test(raw) ? raw : 'admin';
 })();
-const CONTACT_EMAIL = process.env.CONTACT_EMAIL || 'support@example.com';
-const CONTACT_WECHAT = process.env.CONTACT_WECHAT || 'RelaySupport';
+const CONTACT_EMAIL = process.env.CONTACT_EMAIL || '3845440106@qq.com';
+const CONTACT_WECHAT = process.env.CONTACT_WECHAT || '';
+const CONTACT_QQ = process.env.CONTACT_QQ || '3845440106';
+const CONTACT_QQ_GROUP = process.env.CONTACT_QQ_GROUP || '1061247399';
 const PAYMENT_QR = process.env.PAYMENT_QR || '/payment-qr.svg';
+const PAYMENT_AMOUNTS = [10, 30, 50, 100];
+const PAYMENT_METHODS = [
+  { id: 'wechat', label: '微信支付' },
+  { id: 'alipay', label: '支付宝' }
+];
+
+function normalizePaymentQrs(raw) {
+  const empty = () => Object.fromEntries(PAYMENT_AMOUNTS.map(a => [String(a), '']));
+  const out = { wechat: empty(), alipay: empty() };
+  if (!raw || typeof raw !== 'object') return out;
+  if (raw.wechat || raw.alipay) {
+    for (const method of ['wechat', 'alipay']) {
+      const src = raw[method] || {};
+      for (const amount of PAYMENT_AMOUNTS) {
+        const key = String(amount);
+        out[method][key] = String(src[key] || src[amount] || '').trim();
+      }
+    }
+    return out;
+  }
+  // legacy flat map = wechat only
+  for (const amount of PAYMENT_AMOUNTS) {
+    const key = String(amount);
+    out.wechat[key] = String(raw[key] || raw[amount] || '').trim();
+  }
+  return out;
+}
+
+function ensurePaymentQrs(db) {
+  const next = normalizePaymentQrs(db.settings?.paymentQrs);
+  for (const amount of PAYMENT_AMOUNTS) {
+    const key = String(amount);
+    if (!next.wechat[key]) next.wechat[key] = `/payment-qr/${amount}.png`;
+    if (!next.alipay[key]) next.alipay[key] = `/payment-qr/alipay/${amount}.png`;
+  }
+  db.settings = db.settings || {};
+  db.settings.paymentQrs = next;
+  return next;
+}
+
+
+function makePayNote(db) {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  for (let attempt = 0; attempt < 40; attempt++) {
+    let note = '';
+    for (let i = 0; i < 6; i++) note += alphabet[crypto.randomInt(0, alphabet.length)];
+    const exists = (db.paymentOrders || []).some(o => String(o.payNote || '').toUpperCase() === note);
+    if (!exists) return note;
+  }
+  return crypto.randomBytes(3).toString('hex').toUpperCase();
+}
+
+function resolvePublicBaseUrl(db, req) {
+  const fromSettings = String(db.settings?.publicBaseUrl || '').trim().replace(/\/$/, '');
+  if (fromSettings) return fromSettings;
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
+  if (req) {
+    const proto = String(req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
+    const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+    if (host) return `${proto}://${host}`;
+  }
+  return '';
+}
+
+function getPaymentGateway(db) {
+  return normalizeGateway(db.settings?.paymentGateway || {});
+}
+
+function fulfillPaymentOrder(db, order, meta = {}) {
+  if (!order) return { ok: false, error: '订单不存在' };
+  if (order.status === 'confirmed' && order.code) return { ok: true, order, already: true };
+  if (order.status === 'rejected') return { ok: false, error: '订单已拒绝' };
+  const day = localDay();
+  const issuedToday = (db.rechargeCodes || []).filter(c => c.issuedTo === order.userId && c.issuedAt && localDay(new Date(c.issuedAt)) === day).length;
+  if (issuedToday >= CLAIM_DAILY_LIMIT) return { ok: false, error: `该用户今日发卡已达上限（${CLAIM_DAILY_LIMIT}）` };
+  let card = (db.rechargeCodes || []).find(c => Number(c.amount) === Number(order.amount) && codeAvailable(c));
+  if (!card) {
+    topUpCodePools(db, CODE_POOL_TARGET);
+    card = (db.rechargeCodes || []).find(c => Number(c.amount) === Number(order.amount) && codeAvailable(c));
+  }
+  if (!card) return { ok: false, error: '该金额卡密暂时售罄' };
+  card.issuedAt = new Date().toISOString();
+  card.issuedTo = order.userId;
+  order.status = 'confirmed';
+  order.code = card.code;
+  order.confirmedAt = new Date().toISOString();
+  order.confirmedBy = meta.confirmedBy || 'gateway';
+  order.gatewayTradeNo = meta.tradeNo || order.gatewayTradeNo || null;
+  order.payChannel = meta.payChannel || order.payChannel || null;
+  if (!order.userReportedAt) order.userReportedAt = order.confirmedAt;
+  audit(db, { actorId: meta.confirmedBy || 'gateway', action: 'payment.order.confirm', target: order.id, detail: { amount: order.amount, method: order.method, code: card.code, userId: order.userId, tradeNo: order.gatewayTradeNo, via: meta.via || 'gateway' } });
+  return { ok: true, order, card };
+}
+
+
+function paymentQrMeta(db) {
+  const m = (db.settings && db.settings.paymentQrMeta) || {};
+  return {
+    wechatExpiresAt: m.wechatExpiresAt || null,
+    alipayExpiresAt: m.alipayExpiresAt || null,
+    note: String(m.note || '个人静态收款码一般长期有效；若扫码提示已过期/无法支付，请换另一种付款方式或联系客服更换收款码。')
+  };
+}
+
+function paymentQrStatus(expiresAt) {
+  if (!expiresAt) {
+    return { expiresAt: null, expired: false, daysLeft: null, tip: '未设置到期日（个人静态码通常长期有效，仍可能因风控/换号失效）' };
+  }
+  const end = new Date(expiresAt);
+  if (Number.isNaN(end.getTime())) {
+    return { expiresAt, expired: false, daysLeft: null, tip: '到期日格式无效，请管理员重新设置' };
+  }
+  const now = new Date();
+  const ms = end.getTime() - now.getTime();
+  const daysLeft = Math.ceil(ms / 86400000);
+  if (ms <= 0) {
+    return { expiresAt, expired: true, daysLeft: 0, tip: '该付款码已到设置的有效期，可能已失效，请勿继续付款，并联系客服更换收款码' };
+  }
+  if (daysLeft <= 3) {
+    return { expiresAt, expired: false, daysLeft, tip: `该付款码将在约 ${daysLeft} 天后到期，若扫码失败请联系客服` };
+  }
+  return { expiresAt, expired: false, daysLeft, tip: `管理员登记有效期至 ${end.toISOString().slice(0, 10)}` };
+}
+
+function paymentPlans(db) {
+  const map = ensurePaymentQrs(db);
+  const meta = paymentQrMeta(db);
+  const wechatStatus = paymentQrStatus(meta.wechatExpiresAt);
+  const alipayStatus = paymentQrStatus(meta.alipayExpiresAt);
+  return PAYMENT_AMOUNTS.map(amount => {
+    const key = String(amount);
+    return {
+      amount,
+      label: `¥${amount}`,
+      qr: map.wechat[key] || '',
+      wechat: map.wechat[key] || '',
+      alipay: map.alipay[key] || '',
+      methods: {
+        wechat: map.wechat[key] || '',
+        alipay: map.alipay[key] || ''
+      },
+      status: {
+        wechat: wechatStatus,
+        alipay: alipayStatus
+      },
+      tip: meta.note
+    };
+  });
+}
+
+const CODE_POOL_TARGET = Number(process.env.CODE_POOL_TARGET || 10000);
+const CLAIM_DAILY_LIMIT = Number(process.env.CLAIM_DAILY_LIMIT || 20);
+
+function localDay(d = new Date()) {
+  const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 10);
+}
+
+function quotaForAmount(amount, db) {
+  const perYuan = Number(db.settings?.quotaTokensPerYuan || 10000);
+  const map = db.settings?.quotaByAmount || {};
+  if (map[String(amount)] != null) return Math.max(0, Math.floor(Number(map[String(amount)]) || 0));
+  return Math.max(0, Math.floor(Number(amount) * (Number.isFinite(perYuan) ? perYuan : 10000)));
+}
+
+function codeAvailable(c) {
+  return c && !c.usedAt && !c.issuedAt;
+}
+
+function topUpCodePools(db, target = CODE_POOL_TARGET) {
+  db.rechargeCodes ??= [];
+  let added = 0;
+  for (const amount of PAYMENT_AMOUNTS) {
+    const available = db.rechargeCodes.filter(c => Number(c.amount) === Number(amount) && codeAvailable(c)).length;
+    const need = Math.max(0, target - available);
+    const quota = quotaForAmount(amount, db);
+    for (let i = 0; i < need; i++) {
+      db.rechargeCodes.push({
+        code: `R${amount}-${crypto.randomBytes(5).toString('hex').toUpperCase()}`,
+        amount: Number(amount),
+        quotaTokens: quota,
+        usedAt: null,
+        userId: null,
+        issuedAt: null,
+        issuedTo: null,
+        createdAt: new Date().toISOString(),
+        source: 'pool'
+      });
+      added += 1;
+    }
+  }
+  return added;
+}
+
+function poolStats(db) {
+  const day = localDay();
+  const byAmount = {};
+  for (const amount of PAYMENT_AMOUNTS) {
+    byAmount[amount] = { amount, available: 0, issuedToday: 0, issuedTodaySum: 0, redeemedToday: 0, redeemedTodaySum: 0 };
+  }
+  for (const c of db.rechargeCodes || []) {
+    const amount = Number(c.amount);
+    if (!byAmount[amount]) continue;
+    if (codeAvailable(c)) byAmount[amount].available += 1;
+    if (c.issuedAt && localDay(new Date(c.issuedAt)) === day) {
+      byAmount[amount].issuedToday += 1;
+      byAmount[amount].issuedTodaySum += amount;
+    }
+    if (c.usedAt && localDay(new Date(c.usedAt)) === day) {
+      byAmount[amount].redeemedToday += 1;
+      byAmount[amount].redeemedTodaySum += amount;
+    }
+  }
+  const list = PAYMENT_AMOUNTS.map(a => byAmount[a]);
+  const issuedTodaySum = list.reduce((s, x) => s + x.issuedTodaySum, 0);
+  const redeemedTodaySum = list.reduce((s, x) => s + x.redeemedTodaySum, 0);
+
+  // 上游 API 开销：当日成功请求的 upstreamCost 合计（按渠道拆分）
+  const upstreamByProvider = {};
+  let upstreamCostToday = 0;
+  let chargedToday = 0;
+  let requestCountToday = 0;
+  for (const log of db.logs || []) {
+    if (!log?.createdAt || localDay(new Date(log.createdAt)) !== day) continue;
+    if (log.status === 'referral_rebate') continue;
+    requestCountToday += 1;
+    const up = Number(log.upstreamCost || 0);
+    const charged = Number(log.chargedAmount || 0);
+    if (Number.isFinite(up)) {
+      upstreamCostToday += up;
+      const pid = log.providerId || 'unknown';
+      if (!upstreamByProvider[pid]) upstreamByProvider[pid] = { providerId: pid, providerName: log.providerName || pid, upstreamCost: 0, chargedAmount: 0, requests: 0 };
+      upstreamByProvider[pid].upstreamCost += up;
+      upstreamByProvider[pid].chargedAmount += Number.isFinite(charged) ? charged : 0;
+      upstreamByProvider[pid].requests += 1;
+    }
+    if (Number.isFinite(charged) && charged > 0) chargedToday += charged;
+  }
+
+  return {
+    day,
+    target: CODE_POOL_TARGET,
+    byAmount: list,
+    issuedTodayCount: list.reduce((s, x) => s + x.issuedToday, 0),
+    issuedTodaySum,
+    redeemedTodayCount: list.reduce((s, x) => s + x.redeemedToday, 0),
+    redeemedTodaySum,
+    // 财务口径（仅管理员接口返回）
+    incomeToday: issuedTodaySum,          // 今日收入：用户付款领取卡密的面额合计
+    cardSpendToday: redeemedTodaySum,     // 卡密支出：今日兑换成余额的卡密面额合计
+    upstreamCostToday: Math.round(upstreamCostToday * 10000) / 10000,
+    chargedToday: Math.round(chargedToday * 10000) / 10000,
+    requestCountToday,
+    upstreamByProvider: Object.values(upstreamByProvider).sort((a, b) => b.upstreamCost - a.upstreamCost)
+  };
+}
+
 const DEFAULT_MAX_TOKENS = Number(process.env.DEFAULT_MAX_TOKENS || 1024);
 const DEFAULT_MULTIPLIER = Number(process.env.BILLING_MULTIPLIER || 2);
 const BALANCE_SAFETY_BUFFER = Number(process.env.BALANCE_SAFETY_BUFFER || 0);
@@ -58,16 +351,284 @@ function catalogModels(db) {
   return [...set];
 }
 
-function normalizeApiKey(item, previous = null) {
-  const models = Array.isArray(item?.models)
+function resolveGroupModels(db, groupId) {
+  if (!groupId) return null;
+  const provider = (db.settings?.providers || []).find(p => p.id === groupId && p.enabled !== false);
+  if (!provider) return null;
+  return [...new Set((provider.models || []).map(m => String(m).trim()).filter(Boolean))];
+}
+
+
+
+function isMaintenanceProvider(provider) {
+  return !!(provider && (provider.maintenance === true || provider.status === 'maintenance'));
+}
+
+function getBeibeihaiConfig(db) {
+  db.settings ??= {};
+  const raw = db.settings.upstreamBeibeihai && typeof db.settings.upstreamBeibeihai === 'object'
+    ? db.settings.upstreamBeibeihai
+    : {};
+  const groupMap = { ...beibeihaiDefaultGroupMap(), ...(raw.groupMap || {}) };
+  return {
+    enabled: raw.enabled !== false,
+    baseUrl: beibeihaiNormalizeBase(raw.baseUrl || BEIBEIHAI_BASE_URL || BEIBEIHAI_DEFAULT_BASE),
+    email: String(raw.email || BEIBEIHAI_EMAIL || '').trim(),
+    password: String(raw.password || BEIBEIHAI_PASSWORD || ''),
+    accessToken: String(raw.accessToken || '').trim(),
+    tokenExpiresAt: Number(raw.tokenExpiresAt || 0) || 0,
+    groupMap,
+    lastError: raw.lastError || null
+  };
+}
+
+function saveBeibeihaiConfig(db, cfg) {
+  db.settings ??= {};
+  db.settings.upstreamBeibeihai = {
+    enabled: cfg.enabled !== false,
+    baseUrl: beibeihaiNormalizeBase(cfg.baseUrl || BEIBEIHAI_DEFAULT_BASE),
+    email: String(cfg.email || '').trim(),
+    password: String(cfg.password || ''),
+    accessToken: String(cfg.accessToken || '').trim(),
+    tokenExpiresAt: Number(cfg.tokenExpiresAt || 0) || 0,
+    groupMap: { ...(cfg.groupMap || beibeihaiDefaultGroupMap()) },
+    lastError: cfg.lastError || null
+  };
+  return db.settings.upstreamBeibeihai;
+}
+
+function publicBeibeihaiView(cfg) {
+  return {
+    enabled: cfg.enabled !== false,
+    baseUrl: cfg.baseUrl,
+    email: cfg.email,
+    hasPassword: !!cfg.password,
+    hasToken: !!cfg.accessToken,
+    tokenExpiresAt: cfg.tokenExpiresAt || null,
+    groupMap: cfg.groupMap || {},
+    lastError: cfg.lastError || null,
+    ready: !!(cfg.enabled !== false && cfg.email && (cfg.password || cfg.accessToken))
+  };
+}
+
+async function ensureBeibeihaiToken(db) {
+  const cfg = getBeibeihaiConfig(db);
+  if (!cfg.enabled) return { ok: false, error: 'upstream_disabled', cfg };
+  const now = Date.now();
+  if (cfg.accessToken && cfg.tokenExpiresAt && cfg.tokenExpiresAt - 60_000 > now) {
+    return { ok: true, token: cfg.accessToken, cfg };
+  }
+  if (!cfg.email || !cfg.password) return { ok: false, error: 'missing_credentials', cfg };
+  const logged = await beibeihaiLogin(cfg.baseUrl, cfg.email, cfg.password);
+  if (!logged.ok) {
+    cfg.lastError = `login_failed:${logged.status || logged.error || ''}`;
+    saveBeibeihaiConfig(db, cfg);
+    return { ok: false, error: 'login_failed', detail: logged, cfg };
+  }
+  cfg.accessToken = logged.token;
+  const expiresIn = Number(logged.expiresIn || 3600);
+  cfg.tokenExpiresAt = Date.now() + Math.max(60, expiresIn) * 1000;
+  cfg.lastError = null;
+  saveBeibeihaiConfig(db, cfg);
+  return { ok: true, token: cfg.accessToken, cfg };
+}
+
+function resolveBeibeihaiGroupId(db, localGroupId) {
+  if (!localGroupId) return null;
+  const cfg = getBeibeihaiConfig(db);
+  const mapped = cfg.groupMap?.[String(localGroupId)];
+  if (mapped == null || mapped === '') return null;
+  return Number(mapped);
+}
+
+function providerNeedsBeibeihaiSync(db, groupId) {
+  if (!groupId) return false;
+  const provider = (db.settings?.providers || []).find(p => p.id === groupId);
+  if (!provider || provider.enabled === false || isMaintenanceProvider(provider)) return false;
+  if (!isBeibeihaiProvider(provider)) return false;
+  return resolveBeibeihaiGroupId(db, groupId) != null;
+}
+
+async function syncCreateBeibeihaiKey(db, user, localKey) {
+  const upstreamGroupId = resolveBeibeihaiGroupId(db, localKey.groupId);
+  if (upstreamGroupId == null) return { ok: false, error: 'no_group_map' };
+  const auth = await ensureBeibeihaiToken(db);
+  if (!auth.ok) return { ok: false, error: auth.error, detail: auth.detail };
+  const name = `${user.username || user.name || 'user'}-${String(localKey.name || 'key').slice(0, 24)}`.slice(0, 60);
+  const body = { name, group_id: upstreamGroupId };
+  if (localKey.spendLimit > 0) body.quota = Number(localKey.spendLimit);
+  const created = await beibeihaiCreateKey(auth.cfg.baseUrl, auth.token, body);
+  if (!created.ok) {
+    auth.cfg.lastError = `create_failed:${created.status}`;
+    saveBeibeihaiConfig(db, auth.cfg);
+    return { ok: false, error: 'create_failed', detail: created };
+  }
+  const secret = beibeihaiExtractSecret(created.data);
+  if (!secret.key) return { ok: false, error: 'create_no_secret', detail: created.data };
+  localKey.key = secret.key;
+  localKey.upstream = {
+    provider: 'beibeihai',
+    id: secret.id,
+    groupId: upstreamGroupId,
+    syncedAt: new Date().toISOString()
+  };
+  auth.cfg.lastError = null;
+  saveBeibeihaiConfig(db, auth.cfg);
+  return { ok: true, key: secret.key, upstreamId: secret.id };
+}
+
+async function syncDeleteBeibeihaiKey(db, localKey) {
+  const upstreamId = localKey?.upstream?.id;
+  if (!upstreamId || localKey?.upstream?.provider !== 'beibeihai') return { ok: true, skipped: true };
+  const auth = await ensureBeibeihaiToken(db);
+  if (!auth.ok) return { ok: false, error: auth.error };
+  const deleted = await beibeihaiDeleteKey(auth.cfg.baseUrl, auth.token, upstreamId);
+  return { ok: deleted.ok || deleted.status === 404, detail: deleted };
+}
+
+
+function getVip1129Config(db) {
+  db.settings ??= {};
+  const raw = db.settings.upstreamVip1129 && typeof db.settings.upstreamVip1129 === 'object'
+    ? db.settings.upstreamVip1129
+    : {};
+  const groupMap = { ...vip1129DefaultGroupMap(), ...(raw.groupMap || {}) };
+  return {
+    enabled: raw.enabled !== false,
+    baseUrl: vip1129NormalizeBase(raw.baseUrl || VIP1129_BASE_URL || VIP1129_DEFAULT_BASE),
+    email: String(raw.email || VIP1129_EMAIL || '').trim(),
+    password: String(raw.password || VIP1129_PASSWORD || ''),
+    accessToken: String(raw.accessToken || '').trim(),
+    tokenExpiresAt: Number(raw.tokenExpiresAt || 0) || 0,
+    groupMap,
+    lastError: raw.lastError || null
+  };
+}
+
+function saveVip1129Config(db, cfg) {
+  db.settings ??= {};
+  db.settings.upstreamVip1129 = {
+    enabled: cfg.enabled !== false,
+    baseUrl: vip1129NormalizeBase(cfg.baseUrl || VIP1129_DEFAULT_BASE),
+    email: String(cfg.email || '').trim(),
+    password: String(cfg.password || ''),
+    accessToken: String(cfg.accessToken || '').trim(),
+    tokenExpiresAt: Number(cfg.tokenExpiresAt || 0) || 0,
+    groupMap: { ...(cfg.groupMap || vip1129DefaultGroupMap()) },
+    lastError: cfg.lastError || null
+  };
+  return db.settings.upstreamVip1129;
+}
+
+function publicVip1129View(cfg) {
+  return {
+    enabled: cfg.enabled !== false,
+    baseUrl: cfg.baseUrl,
+    email: cfg.email,
+    hasPassword: !!cfg.password,
+    hasToken: !!cfg.accessToken,
+    tokenExpiresAt: cfg.tokenExpiresAt || null,
+    groupMap: cfg.groupMap || {},
+    lastError: cfg.lastError || null,
+    ready: !!(cfg.enabled !== false && cfg.email && (cfg.password || cfg.accessToken))
+  };
+}
+
+async function ensureVip1129Token(db) {
+  const cfg = getVip1129Config(db);
+  if (!cfg.enabled) return { ok: false, error: 'upstream_disabled', cfg };
+  const now = Date.now();
+  if (cfg.accessToken && cfg.tokenExpiresAt && cfg.tokenExpiresAt - 60_000 > now) {
+    return { ok: true, token: cfg.accessToken, cfg };
+  }
+  if (!cfg.email || !cfg.password) return { ok: false, error: 'missing_credentials', cfg };
+  const logged = await vip1129Login(cfg.baseUrl, cfg.email, cfg.password);
+  if (!logged.ok) {
+    cfg.lastError = `login_failed:${logged.status || logged.error || ''}`;
+    saveVip1129Config(db, cfg);
+    return { ok: false, error: 'login_failed', detail: logged, cfg };
+  }
+  cfg.accessToken = logged.token;
+  const expiresIn = Number(logged.expiresIn || 3600);
+  cfg.tokenExpiresAt = Date.now() + Math.max(60, expiresIn) * 1000;
+  cfg.lastError = null;
+  saveVip1129Config(db, cfg);
+  return { ok: true, token: cfg.accessToken, cfg };
+}
+
+function resolveVip1129GroupId(db, localGroupId) {
+  if (!localGroupId) return null;
+  const cfg = getVip1129Config(db);
+  const mapped = cfg.groupMap?.[String(localGroupId)];
+  if (mapped != null && mapped !== '') return Number(mapped);
+  return null;
+}
+
+function providerNeedsVip1129Sync(db, groupId) {
+  if (!groupId) return false;
+  const provider = (db.settings?.providers || []).find(p => p.id === groupId);
+  if (!provider || provider.enabled === false || isMaintenanceProvider(provider)) return false;
+  if (!isVip1129Provider(provider)) return false;
+  const upstreamGroupId = resolveVip1129GroupId(db, groupId);
+  return upstreamGroupId != null;
+}
+
+async function syncCreateVip1129Key(db, user, localKey) {
+  const upstreamGroupId = resolveVip1129GroupId(db, localKey.groupId);
+  if (upstreamGroupId == null) return { ok: false, error: 'no_group_map' };
+  const auth = await ensureVip1129Token(db);
+  if (!auth.ok) return { ok: false, error: auth.error, detail: auth.detail };
+  const name = `${user.username || user.name || 'user'}-${String(localKey.name || 'key').slice(0, 24)}`.slice(0, 60);
+  const body = { name, group_id: upstreamGroupId };
+  if (localKey.spendLimit > 0) body.quota = Number(localKey.spendLimit);
+  const created = await vip1129CreateKey(auth.cfg.baseUrl, auth.token, body);
+  if (!created.ok) {
+    auth.cfg.lastError = `create_failed:${created.status}`;
+    saveVip1129Config(db, auth.cfg);
+    return { ok: false, error: 'create_failed', detail: created };
+  }
+  const secret = vip1129ExtractSecret(created.data);
+  if (!secret.key) return { ok: false, error: 'create_no_secret', detail: created.data };
+  localKey.key = secret.key;
+  localKey.upstream = {
+    provider: 'vip1129',
+    id: secret.id,
+    groupId: upstreamGroupId,
+    syncedAt: new Date().toISOString()
+  };
+  auth.cfg.lastError = null;
+  saveVip1129Config(db, auth.cfg);
+  return { ok: true, key: secret.key, upstreamId: secret.id };
+}
+
+async function syncDeleteVip1129Key(db, localKey) {
+  const upstreamId = localKey?.upstream?.id;
+  if (!upstreamId || localKey?.upstream?.provider !== 'vip1129') return { ok: true, skipped: true };
+  const auth = await ensureVip1129Token(db);
+  if (!auth.ok) return { ok: false, error: auth.error };
+  const deleted = await vip1129DeleteKey(auth.cfg.baseUrl, auth.token, upstreamId);
+  return { ok: deleted.ok || deleted.status === 404, detail: deleted };
+}
+
+
+function normalizeApiKey(item, previous = null, db = null) {
+  let models = Array.isArray(item?.models)
     ? [...new Set(item.models.map(m => String(m).trim()).filter(Boolean))]
     : (previous?.models || []);
+  const groupIdRaw = item?.groupId !== undefined ? item.groupId : previous?.groupId;
+  const groupId = groupIdRaw ? String(groupIdRaw) : null;
+  if (groupId && db) {
+    const groupModels = resolveGroupModels(db, groupId);
+    if (groupModels) models = groupModels;
+  }
   return {
     id: String(item?.id || previous?.id || id('key')),
     name: String(item?.name || previous?.name || '未命名密钥').trim().slice(0, 40) || '未命名密钥',
     key: previous?.key || item?.key || userKey(),
+    groupId,
     models,
     spendLimit: Math.max(0, Number(item?.spendLimit ?? previous?.spendLimit ?? 0) || 0),
+    // backward-compat fields (not primary UI)
     tokenLimit: Math.max(0, Math.floor(Number(item?.tokenLimit ?? previous?.tokenLimit ?? 0) || 0)),
     rpm: Math.max(0, Math.min(10000, Math.floor(Number(item?.rpm ?? previous?.rpm ?? 0) || 0))),
     tpm: Math.max(0, Math.min(10_000_000, Math.floor(Number(item?.tpm ?? previous?.tpm ?? 0) || 0))),
@@ -76,7 +637,8 @@ function normalizeApiKey(item, previous = null) {
     reservedSpend: Math.max(0, Number(previous?.reservedSpend || 0) || 0),
     reservedTokens: Math.max(0, Number(previous?.reservedTokens || 0) || 0),
     enabled: item?.enabled !== false,
-    createdAt: previous?.createdAt || item?.createdAt || new Date().toISOString()
+    createdAt: previous?.createdAt || item?.createdAt || new Date().toISOString(),
+    upstream: item?.upstream || previous?.upstream || null
   };
 }
 
@@ -86,6 +648,7 @@ function publicApiKey(key) {
     name: key.name,
     key: key.key,
     keyMasked: `${String(key.key).slice(0, 6)}****${String(key.key).slice(-4)}`,
+    groupId: key.groupId || null,
     models: key.models || [],
     spendLimit: key.spendLimit || 0,
     tokenLimit: key.tokenLimit || 0,
@@ -94,27 +657,40 @@ function publicApiKey(key) {
     spendUsed: Number(key.spendUsed || 0),
     tokenUsed: Number(key.tokenUsed || 0),
     enabled: key.enabled !== false,
-    createdAt: key.createdAt
+    createdAt: key.createdAt,
+    upstreamSynced: !!(key.upstream && key.upstream.id),
+    upstreamProvider: key.upstream?.provider || null,
+    upstreamGroupId: key.upstream?.groupId || null
   };
+}
+
+function keyOptionsPayload(db) {
+  const groups = (db.settings?.providers || [])
+    .filter(p => p.enabled !== false || isMaintenanceProvider(p))
+    .map(p => ({
+      id: p.id,
+      name: p.name,
+      models: [...new Set((p.models || []).map(String))],
+      multiplier: providerMultiplier(p, db),
+      maintenance: isMaintenanceProvider(p),
+      maintenanceMessage: p.maintenanceMessage || (isMaintenanceProvider(p) ? '维护中' : null)
+    }));
+  return { groups, models: catalogModels(db) };
 }
 
 function ensureUserKeys(user) {
   user.apiKeys ??= [];
-  if (!user.apiKey) user.apiKey = userKey();
-  if (!user.apiKeys.some(k => k.key === user.apiKey)) {
-    user.apiKeys.unshift(normalizeApiKey({
-      name: '默认密钥',
-      key: user.apiKey,
-      models: [],
-      spendLimit: 0,
-      tokenLimit: 0,
-      rpm: 0,
-      tpm: 0,
-      enabled: true,
-      createdAt: user.createdAt
-    }));
-  }
+  // No auto-created default key — users create keys themselves.
+  // Drop legacy bootstrap keys named 默认密钥.
+  user.apiKeys = user.apiKeys.filter(k => (k?.name || '') !== '默认密钥');
   user.apiKeys = user.apiKeys.map(k => normalizeApiKey(k, k));
+  if (user.apiKeys.length) {
+    if (!user.apiKey || !user.apiKeys.some(k => k.key === user.apiKey)) {
+      user.apiKey = user.apiKeys[0].key;
+    }
+  } else {
+    user.apiKey = null;
+  }
 }
 
 function findByApiSecret(db, secret) {
@@ -151,7 +727,13 @@ function keyRateOk(res, key, tokensEstimate) {
   return true;
 }
 function json(res, status, body) { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); }
-function fail(res, status, error) { return json(res, status, { error }); }
+function fail(res, status, error, opts = null) {
+  if (opts && typeof opts === 'object') {
+    const { status: _s, body } = failPayload(status, error, opts);
+    return json(res, status, body);
+  }
+  return json(res, status, { error });
+}
 async function body(req) { let raw = ''; for await (const chunk of req) raw += chunk; try { return raw ? JSON.parse(raw) : {}; } catch { return null; } }
 function clientIp(req) {
   const fwd = req.headers['x-forwarded-for'];
@@ -192,8 +774,15 @@ function userFrom(req, db) {
   return userId ? db.users.find(u => u.id === userId) : null;
 }
 function isAdmin(user) { return user?.role === 'admin'; }
+function isUnlimited(user) { return !!(user && (user.unlimited || user.role === 'admin')); }
 function availableTokens(user) { return Math.max(0, (user.quotaTokens || 0) - (user.usedTokens || 0) - (user.reservedTokens || 0)); }
 const USERNAME_RE = /^[a-z0-9][a-z0-9_-]{2,31}$/i;
+const RESERVED_USERNAMES = new Set(['admin', 'administrator', 'root', 'system', 'support', 'official', ADMIN_USERNAME.toLowerCase()]);
+function isReservedUsername(name) {
+  const n = String(name || '').trim().toLowerCase();
+  return !n || RESERVED_USERNAMES.has(n) || n === ADMIN_USERNAME.toLowerCase();
+}
+
 
 function slugifyUsername(raw) {
   let s = String(raw || '')
@@ -228,6 +817,43 @@ function allocateUsername(db, seed, exceptId) {
   return candidate;
 }
 
+
+const DEFAULT_MODEL_GROUPS = [
+  { id: 'grp_deepseek', name: 'DeepSeek', url: 'https://api.deepseek.com/v1/chat/completions', defaultModel: 'deepseek-chat', models: [], priority: 10, billingMultiplier: 0.5 },
+  { id: 'grp_gpt_pro', name: 'GPT PRO', url: 'https://api.vip1129.cc/v1/chat/completions', defaultModel: 'gpt-5.6', models: [], priority: 20, billingMultiplier: 0.2 },
+  { id: 'grp_gpt_plus', name: 'GPT-PLUS', url: 'https://api.vip1129.cc/v1/chat/completions', defaultModel: 'gpt-5.6', models: [], priority: 30, billingMultiplier: 0.1 },
+  { id: 'grp_gpt_mix', name: 'GPT 混用', url: 'https://api.vip1129.cc/v1/chat/completions', defaultModel: 'gpt-5.6', models: [], priority: 40, billingMultiplier: 0.05 },
+  { id: 'grp_grok', name: 'Grok', url: 'https://api.x.ai/v1/chat/completions', defaultModel: 'grok-3', models: [], priority: 50, billingMultiplier: 0.5 },
+  { id: 'grp_cc_max', name: 'CC-MAX', url: 'https://api.anthropic.com/v1/messages', defaultModel: 'claude-sonnet-4', models: [], priority: 60, billingMultiplier: 0.6 },
+  { id: 'grp_claude_cursor', name: 'Claude-Cursor', url: 'https://api.anthropic.com/v1/messages', defaultModel: 'claude-sonnet-4', models: [], priority: 70, billingMultiplier: 0.6 },
+  { id: 'grp_cursor_pool', name: 'Cursor账号池', url: 'https://api2.cursor.sh/v1/chat/completions', defaultModel: 'claude-sonnet-4', models: [], priority: 80, billingMultiplier: 0.1 }
+];
+
+function seedDefaultProviders(db) {
+  db.settings ??= {};
+  db.settings.providers ??= [];
+  if (db.settings.providers.length) return false;
+  db.settings.providers = DEFAULT_MODEL_GROUPS.map(g => ({
+    id: g.id,
+    name: g.name,
+    url: g.url,
+    apiKey: '',
+    defaultModel: g.defaultModel,
+    models: [...g.models],
+    inputPricePer1K: 0.01,
+    outputPricePer1K: 0.03,
+    enabled: true,
+    priority: g.priority,
+    billingMultiplier: Number(g.billingMultiplier) || 1,
+    timeoutMs: 60000,
+    maxRetries: 1,
+    modelPrices: {},
+    health: { ok: true, lastCheckedAt: null, lastError: null }
+  }));
+  db.settings.defaultProviderId = DEFAULT_MODEL_GROUPS[0].id;
+  return true;
+}
+
 function ensureUsername(user, db) {
   if (user.username && USERNAME_RE.test(user.username) && !usernameTaken(db, user.username, user.id)) return;
   const seed = user.username || user.name || (user.email || '').split('@')[0] || 'user';
@@ -252,14 +878,16 @@ function ensureAdminUser(db) {
       username: ADMIN_USERNAME,
       name: 'Admin',
       password: hash(ADMIN_PASSWORD),
-      apiKey: userKey(),
-      balance: 0,
+      apiKey: null,
+      apiKeys: [],
+      balance: 999999999,
       bonusBalance: 0,
-      quotaTokens: 0,
+      quotaTokens: 999999999,
       usedTokens: 0,
       reservedTokens: 0,
       reservedBalance: 0,
-      accountActive: false,
+      accountActive: true,
+      unlimited: true,
       role: 'admin',
       invited: 0,
       inviteCode: 'ADMIN',
@@ -270,7 +898,13 @@ function ensureAdminUser(db) {
   }
   admin.username = ADMIN_USERNAME;
   admin.role = 'admin';
+  admin.unlimited = true;
+  admin.accountActive = true;
+  if ((admin.balance || 0) < 1000000) admin.balance = 999999999;
+  if ((admin.quotaTokens || 0) < 1000000) admin.quotaTokens = 999999999;
   if (email) admin.email = email;
+  // Keep local admin password in sync with ADMIN_PASSWORD env (start-local.ps1)
+  if (ADMIN_PASSWORD) admin.password = hash(ADMIN_PASSWORD);
 }
 
 function findUserByIdentifier(db, identifier) {
@@ -298,6 +932,7 @@ function safeUser(user) {
     availableTokens: availableTokens(user),
     accountActive: user.accountActive !== false,
     isAdmin: isAdmin(user),
+    unlimited: !!(user.unlimited || isAdmin(user)),
     role: user.role || 'user',
     invited: user.invited || 0,
     createdAt: user.createdAt
@@ -322,7 +957,12 @@ function adminUserView(user) {
 }
 function multiplier(db) {
   const value = Number(db.settings?.billingMultiplier ?? DEFAULT_MULTIPLIER);
-  return Number.isFinite(value) && value >= 1 && value <= 10 ? value : DEFAULT_MULTIPLIER;
+  return Number.isFinite(value) && value > 0 && value <= 10 ? value : DEFAULT_MULTIPLIER;
+}
+function providerMultiplier(provider, db) {
+  const value = Number(provider?.billingMultiplier);
+  if (Number.isFinite(value) && value > 0 && value <= 10) return value;
+  return multiplier(db);
 }
 function normalizeProvider(item, previous = null) {
   const modelPrices = {};
@@ -345,22 +985,127 @@ function normalizeProvider(item, previous = null) {
     outputPricePer1K: Math.max(0, Number(item.outputPricePer1K ?? previous?.outputPricePer1K ?? 0)),
     enabled: item.enabled !== false,
     priority: Number.isFinite(Number(item.priority)) ? Number(item.priority) : (Number(previous?.priority) || 100),
+    billingMultiplier: (() => {
+      const v = Number(item.billingMultiplier ?? previous?.billingMultiplier ?? 1);
+      return Number.isFinite(v) && v > 0 && v <= 10 ? v : 1;
+    })(),
     timeoutMs: Math.max(1000, Number(item.timeoutMs ?? previous?.timeoutMs ?? 60000) || 60000),
     maxRetries: Math.max(0, Math.min(5, Number(item.maxRetries ?? previous?.maxRetries ?? 0) || 0)),
     modelPrices,
     health: previous?.health || { ok: true, lastCheckedAt: null, lastError: null }
   };
 }
+
+function modelsEndpointFromChatUrl(url) {
+  const raw = String(url || '').trim().replace(/\/+$/, '');
+  if (!raw) return '';
+  if (/\/chat\/completions$/i.test(raw)) return raw.replace(/\/chat\/completions$/i, '/models');
+  if (/\/messages$/i.test(raw)) return raw.replace(/\/messages$/i, '/models');
+  if (/\/v1$/i.test(raw)) return `${raw}/models`;
+  const v1 = raw.indexOf('/v1/');
+  if (v1 >= 0) return `${raw.slice(0, v1 + 3)}/models`;
+  return `${raw}/models`;
+}
+
+async function fetchUpstreamModels(provider) {
+  if (!provider?.url || !provider?.apiKey) {
+    const err = new Error('请先填写上游 HTTPS 地址和 API Key');
+    err.status = 400;
+    throw err;
+  }
+  const endpoint = modelsEndpointFromChatUrl(provider.url);
+  if (!endpoint || !/^https:\/\//i.test(endpoint)) {
+    const err = new Error('无法从上游地址推导 /v1/models');
+    err.status = 400;
+    throw err;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Number(provider.timeoutMs || 20000));
+  try {
+    const upstream = await fetch(endpoint, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${provider.apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      signal: controller.signal
+    });
+    const text = await upstream.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+    if (!upstream.ok) {
+      const err = new Error(`上游返回 ${upstream.status}: ${String(text || '').slice(0, 180)}`);
+      err.status = 502;
+      throw err;
+    }
+    const rows = Array.isArray(data?.data) ? data.data
+      : (Array.isArray(data?.models) ? data.models
+        : (Array.isArray(data) ? data : []));
+    const ids = [...new Set(rows.map(x => {
+      if (typeof x === 'string') return x.trim();
+      return String(x?.id || x?.name || x?.model || '').trim();
+    }).filter(Boolean))];
+    if (!ids.length) {
+      const err = new Error('上游未返回可用模型');
+      err.status = 502;
+      throw err;
+    }
+    return { endpoint, models: ids };
+  } catch (e) {
+    if (e?.name === 'AbortError') {
+      const err = new Error('拉取上游模型超时');
+      err.status = 504;
+      throw err;
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+
+async function syncAllUpstreamModels(db, { onlyStaleMs = 0, ids = null } = {}) {
+  db.settings ??= {};
+  db.settings.providers ??= [];
+  const now = Date.now();
+  const results = [];
+  const list = db.settings.providers.filter(p => {
+    if (ids?.length && !ids.includes(p.id)) return false;
+    if (p.enabled === false) return false;
+    if (!p.url || !p.apiKey) return false;
+    if (onlyStaleMs > 0 && p.modelsSyncedAt) {
+      const age = now - new Date(p.modelsSyncedAt).getTime();
+      if (Number.isFinite(age) && age < onlyStaleMs) return false;
+    }
+    return true;
+  });
+  for (const provider of list) {
+    try {
+      const { endpoint, models } = await fetchUpstreamModels(provider);
+      provider.models = models;
+      if (!provider.defaultModel || !models.includes(provider.defaultModel)) {
+        provider.defaultModel = models[0];
+      }
+      provider.modelsSyncedAt = new Date().toISOString();
+      provider.modelsSource = endpoint;
+      results.push({ id: provider.id, name: provider.name, ok: true, count: models.length, endpoint });
+    } catch (err) {
+      results.push({ id: provider.id, name: provider.name, ok: false, error: err.message || String(err) });
+    }
+  }
+  return results;
+}
+
 function providers(db) {
   return Array.isArray(db.settings?.providers)
-    ? db.settings.providers.filter(p => p.enabled !== false && p.url && p.apiKey)
+    ? db.settings.providers.filter(p => p.enabled !== false && !isMaintenanceProvider(p) && p.url && (p.apiKey || isVip1129Provider(p) || isBeibeihaiProvider(p)))
     : [];
 }
 function providersForModel(payload, db) {
   const list = providers(db);
   const model = String(payload.model || '');
   const matched = list
-    .filter(p => Array.isArray(p.models) && p.models.includes(model))
+    .filter(p => !Array.isArray(p.models) || !p.models.length || p.models.includes(model))
     .sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100));
   if (matched.length) return matched;
   const fallback = list.find(p => p.id === db.settings.defaultProviderId) || list[0];
@@ -400,11 +1145,14 @@ function publicProvider(provider) {
     name: provider.name,
     url: provider.url || '',
     models: provider.models || [],
+    modelsSyncedAt: provider.modelsSyncedAt || null,
+    modelsSource: provider.modelsSource || null,
     defaultModel: provider.defaultModel || '',
     enabled: provider.enabled !== false,
     inputPricePer1K: Number(provider.inputPricePer1K ?? provider.pricePer1K ?? 0),
     outputPricePer1K: Number(provider.outputPricePer1K ?? provider.pricePer1K ?? 0),
     priority: Number(provider.priority ?? 100),
+    billingMultiplier: Number(provider.billingMultiplier) > 0 ? Number(provider.billingMultiplier) : 1,
     timeoutMs: Number(provider.timeoutMs ?? 60000),
     maxRetries: Number(provider.maxRetries ?? 0),
     modelPrices: provider.modelPrices || {},
@@ -433,6 +1181,65 @@ function updateProviderHealth(db, providerId, ok, errorMessage = null) {
     lastError: ok ? null : String(errorMessage || 'upstream_error').slice(0, 300)
   };
 }
+
+async function probeProviderHealth(db, provider) {
+  if (!provider) return { id: null, ok: false, error: 'missing_provider' };
+  if (provider.enabled === false) {
+    updateProviderHealth(db, provider.id, true, null);
+    provider.health.skipped = true;
+    provider.health.lastError = null;
+    provider.health.ok = true;
+    provider.health.lastCheckedAt = new Date().toISOString();
+    provider.health.note = 'disabled';
+    return { id: provider.id, name: provider.name, ok: true, skipped: true, reason: 'disabled' };
+  }
+  if (isMaintenanceProvider(provider)) {
+    updateProviderHealth(db, provider.id, true, null);
+    provider.health.skipped = true;
+    provider.health.note = 'maintenance';
+    return { id: provider.id, name: provider.name, ok: true, skipped: true, reason: 'maintenance' };
+  }
+  if (!provider.url) {
+    updateProviderHealth(db, provider.id, false, '缺少上游地址');
+    return { id: provider.id, name: provider.name, ok: false, error: '缺少上游地址', fix: tipsForCode('channel_down') };
+  }
+  if (!provider.apiKey && (isVip1129Provider(provider) || isBeibeihaiProvider(provider))) {
+    updateProviderHealth(db, provider.id, true, null);
+    provider.health.skipped = true;
+    provider.health.note = 'per_user_upstream_key';
+    return { id: provider.id, name: provider.name, ok: true, skipped: true, reason: 'per_user_upstream_key' };
+  }
+  if (!provider.apiKey) {
+    updateProviderHealth(db, provider.id, false, '缺少上游地址或 API Key');
+    return { id: provider.id, name: provider.name, ok: false, error: '缺少渠道 API Key', fix: tipsForCode('channel_no_key') };
+  }
+  try {
+    const { endpoint, models } = await fetchUpstreamModels(provider);
+    updateProviderHealth(db, provider.id, true);
+    provider.health.probe = 'models';
+    provider.health.endpoint = endpoint;
+    provider.health.modelCount = models.length;
+    // 探测成功时顺带刷新模型列表，保持与上游一致
+    provider.models = models;
+    if (!provider.defaultModel || !models.includes(provider.defaultModel)) provider.defaultModel = models[0];
+    provider.modelsSyncedAt = new Date().toISOString();
+    provider.modelsSource = endpoint;
+    return { id: provider.id, name: provider.name, ok: true, count: models.length, endpoint };
+  } catch (err) {
+    updateProviderHealth(db, provider.id, false, err.message || String(err));
+    return { id: provider.id, name: provider.name, ok: false, error: err.message || String(err) };
+  }
+}
+
+async function probeAllProviderHealth(db) {
+  const list = (db.settings?.providers || []).filter(p => p && p.id);
+  const results = [];
+  for (const provider of list) {
+    results.push(await probeProviderHealth(db, provider));
+  }
+  return results;
+}
+
 function settleUsage(db, user, provider, usage, rate, tokenReservation, amountReservation, started, model, status = 'success', apiKeyRec = null) {
   const upstreamTokens = Math.max(0, Number(usage.total_tokens || ((usage.prompt_tokens || 0) + (usage.completion_tokens || 0))));
   const billedTokens = Math.min(upstreamTokens * rate, tokenReservation);
@@ -440,17 +1247,26 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
   const chargedAmount = upstreamCost * rate;
   user.reservedTokens = Math.max(0, (user.reservedTokens || 0) - tokenReservation);
   user.reservedBalance = Math.max(0, (user.reservedBalance || 0) - amountReservation);
-  user.usedTokens = Math.min(user.quotaTokens || 0, (user.usedTokens || 0) + billedTokens);
-  user.balance = Math.max(0, (user.balance || 0) - chargedAmount);
-  if (apiKeyRec) {
+  if (isUnlimited(user)) {
+    user.usedTokens = (user.usedTokens || 0) + billedTokens;
+    // Admin / unlimited: do not deduct local balance; upstream billing is the real limit
+    user.accountActive = true;
+  } else {
+    user.usedTokens = Math.min(user.quotaTokens || 0, (user.usedTokens || 0) + billedTokens);
+    user.balance = Math.max(0, (user.balance || 0) - chargedAmount);
+  }
+  if (apiKeyRec && !isUnlimited(user)) {
     apiKeyRec.reservedTokens = Math.max(0, (apiKeyRec.reservedTokens || 0) - tokenReservation);
     apiKeyRec.reservedSpend = Math.max(0, (apiKeyRec.reservedSpend || 0) - amountReservation);
     apiKeyRec.tokenUsed = (apiKeyRec.tokenUsed || 0) + billedTokens;
     apiKeyRec.spendUsed = (apiKeyRec.spendUsed || 0) + chargedAmount;
     if (apiKeyRec.tokenLimit > 0) apiKeyRec.tokenUsed = Math.min(apiKeyRec.tokenLimit, apiKeyRec.tokenUsed);
     if (apiKeyRec.spendLimit > 0) apiKeyRec.spendUsed = Math.min(apiKeyRec.spendLimit, apiKeyRec.spendUsed);
+  } else if (apiKeyRec) {
+    apiKeyRec.reservedTokens = Math.max(0, (apiKeyRec.reservedTokens || 0) - tokenReservation);
+    apiKeyRec.reservedSpend = Math.max(0, (apiKeyRec.reservedSpend || 0) - amountReservation);
   }
-  if (user.balance <= safetyBuffer(provider, rate, model)) {
+  if (!isUnlimited(user) && user.balance <= safetyBuffer(provider, rate, model)) {
     user.balance = 0;
     user.accountActive = false;
   }
@@ -484,13 +1300,21 @@ function estimateTokensFromText(text) {
   if (!text) return 0;
   return Math.max(1, Math.ceil(String(text).length / 4));
 }
-async function fetchUpstream(provider, payload, outputBudget, model) {
+function resolveProxyApiKey(provider, apiKeyRec) {
+  if (apiKeyRec?.upstream?.provider === 'vip1129' && apiKeyRec.key) return apiKeyRec.key;
+  if (apiKeyRec?.upstream?.provider === 'beibeihai' && apiKeyRec.key) return apiKeyRec.key;
+  if ((isVip1129Provider(provider) || isBeibeihaiProvider(provider)) && apiKeyRec?.key && String(apiKeyRec.key).startsWith('sk-')) return apiKeyRec.key;
+  return provider.apiKey;
+}
+
+async function fetchUpstream(provider, payload, outputBudget, model, overrideApiKey = null) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), provider.timeoutMs || 60000);
+  const bearer = String(overrideApiKey || provider.apiKey || '').trim();
   try {
     const upstream = await fetch(provider.url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${provider.apiKey}` },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer}` },
       body: JSON.stringify({ ...payload, model: model || payload.model || provider.defaultModel, max_tokens: outputBudget }),
       signal: controller.signal
     });
@@ -507,9 +1331,9 @@ async function chat(req, res, db, user, apiKeyRec = null) {
 
   const requestedModel = String(payload.model || '');
   if (apiKeyRec && Array.isArray(apiKeyRec.models) && apiKeyRec.models.length && requestedModel && !apiKeyRec.models.includes(requestedModel)) {
-    return fail(res, 403, '该密钥无权调用此模型');
+    return fail(res, 400, '该密钥无权调用此模型');
   }
-  if (user.accountActive === false) return fail(res, 402, '账户余额不足，API 已暂停，请充值后继续使用');
+  if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, '账户余额不足，API 已暂停，请充值后继续使用');
 
   const candidates = providersForModel(payload, db);
   if (!candidates.length) return fail(res, 503, '模型服务暂不可用，请稍后重试');
@@ -517,56 +1341,70 @@ async function chat(req, res, db, user, apiKeyRec = null) {
   const primary = candidates[0];
   const model = String(payload.model || primary.defaultModel || '');
   if (apiKeyRec && Array.isArray(apiKeyRec.models) && apiKeyRec.models.length && !apiKeyRec.models.includes(model)) {
-    return fail(res, 403, '该密钥无权调用此模型');
+    return fail(res, 400, '该密钥无权调用此模型');
   }
-  const rate = multiplier(db);
+  const rate = providerMultiplier(primary, db);
   const inputReserve = Math.ceil(JSON.stringify(payload.messages).length * 2) + 256;
   const requestedOutput = Math.max(1, Math.min(Number(payload.max_tokens) || DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOKENS));
   if (apiKeyRec && !keyRateOk(res, apiKeyRec, inputReserve + requestedOutput)) return;
-  let tokenBudget = Math.floor(availableTokens(user) / rate);
-  if (apiKeyRec && apiKeyRec.tokenLimit > 0) {
-    const keyLeft = Math.max(0, apiKeyRec.tokenLimit - (apiKeyRec.tokenUsed || 0) - (apiKeyRec.reservedTokens || 0));
-    tokenBudget = Math.min(tokenBudget, Math.floor(keyLeft / rate));
-  }
-  if (tokenBudget <= inputReserve) return fail(res, 402, apiKeyRec?.tokenLimit > 0 ? '该密钥 Token 额度不足' : 'API 配额不足，无法发起请求');
 
-  let availableBalance = Math.max(0, (user.balance || 0) - (user.reservedBalance || 0));
-  if (apiKeyRec && apiKeyRec.spendLimit > 0) {
-    availableBalance = Math.min(availableBalance, Math.max(0, apiKeyRec.spendLimit - (apiKeyRec.spendUsed || 0) - (apiKeyRec.reservedSpend || 0)));
-  }
-  const safety = safetyBuffer(primary, rate, model);
-  const inputEstimate = estimatedCost(primary, inputReserve, 0, model) * rate;
-  const outputUnitPrice = Math.max(modelPrice(primary, model, 'outputPricePer1K') / 1000 * rate, Number.EPSILON);
-  const moneyBudget = Math.floor(Math.max(0, availableBalance - safety - inputEstimate) / outputUnitPrice);
-  const outputBudget = Math.min(requestedOutput, tokenBudget - inputReserve, moneyBudget);
-  if (outputBudget < 1) {
-    if (!apiKeyRec?.spendLimit) {
-      user.balance = 0;
-      user.accountActive = false;
-      writeDb(db);
+  let tokenReservation = 0;
+  let amountReservation = 0;
+  let outputBudget = requestedOutput;
+
+  if (isUnlimited(user)) {
+    // Admin: skip local balance/quota gates; only upstream availability matters
+    outputBudget = requestedOutput;
+    tokenReservation = 0;
+    amountReservation = 0;
+    user.accountActive = true;
+    writeDb(db);
+  } else {
+    let tokenBudget = Math.floor(availableTokens(user) / rate);
+    if (apiKeyRec && apiKeyRec.tokenLimit > 0) {
+      const keyLeft = Math.max(0, apiKeyRec.tokenLimit - (apiKeyRec.tokenUsed || 0) - (apiKeyRec.reservedTokens || 0));
+      tokenBudget = Math.min(tokenBudget, Math.floor(keyLeft / rate));
     }
-    return fail(res, 402, apiKeyRec?.spendLimit > 0 ? '该密钥消费额度不足' : '账户余额接近用尽，API 已暂停，请充值后继续使用');
-  }
+    if (tokenBudget <= inputReserve) return fail(res, 402, apiKeyRec?.tokenLimit > 0 ? '该密钥 Token 额度不足' : 'API 配额不足，无法发起请求');
 
-  const upstreamReservation = inputReserve + outputBudget;
-  const tokenReservation = upstreamReservation * rate;
-  const amountReservation = estimatedCost(primary, inputReserve, outputBudget, model) * rate;
-  if (availableBalance < amountReservation + safety) {
-    if (!apiKeyRec?.spendLimit) {
-      user.balance = 0;
-      user.accountActive = false;
-      writeDb(db);
+    let availableBalance = Math.max(0, (user.balance || 0) - (user.reservedBalance || 0));
+    if (apiKeyRec && apiKeyRec.spendLimit > 0) {
+      availableBalance = Math.min(availableBalance, Math.max(0, apiKeyRec.spendLimit - (apiKeyRec.spendUsed || 0) - (apiKeyRec.reservedSpend || 0)));
     }
-    return fail(res, 402, apiKeyRec?.spendLimit > 0 ? '该密钥消费额度不足' : '账户余额接近用尽，API 已暂停，请充值后继续使用');
-  }
+    const safety = safetyBuffer(primary, rate, model);
+    const inputEstimate = estimatedCost(primary, inputReserve, 0, model) * rate;
+    const outputUnitPrice = Math.max(modelPrice(primary, model, 'outputPricePer1K') / 1000 * rate, Number.EPSILON);
+    const moneyBudget = Math.floor(Math.max(0, availableBalance - safety - inputEstimate) / outputUnitPrice);
+    outputBudget = Math.min(requestedOutput, tokenBudget - inputReserve, moneyBudget);
+    if (outputBudget < 1) {
+      if (!apiKeyRec?.spendLimit) {
+        user.balance = 0;
+        user.accountActive = false;
+        writeDb(db);
+      }
+      return fail(res, 402, apiKeyRec?.spendLimit > 0 ? '该密钥消费额度不足' : '账户余额接近用尽，API 已暂停，请充值后继续使用');
+    }
 
-  user.reservedTokens = (user.reservedTokens || 0) + tokenReservation;
-  user.reservedBalance = (user.reservedBalance || 0) + amountReservation;
-  if (apiKeyRec) {
-    apiKeyRec.reservedTokens = (apiKeyRec.reservedTokens || 0) + tokenReservation;
-    apiKeyRec.reservedSpend = (apiKeyRec.reservedSpend || 0) + amountReservation;
+    const upstreamReservation = inputReserve + outputBudget;
+    tokenReservation = upstreamReservation * rate;
+    amountReservation = estimatedCost(primary, inputReserve, outputBudget, model) * rate;
+    if (availableBalance < amountReservation + safety) {
+      if (!apiKeyRec?.spendLimit) {
+        user.balance = 0;
+        user.accountActive = false;
+        writeDb(db);
+      }
+      return fail(res, 402, apiKeyRec?.spendLimit > 0 ? '该密钥消费额度不足' : '账户余额接近用尽，API 已暂停，请充值后继续使用');
+    }
+
+    user.reservedTokens = (user.reservedTokens || 0) + tokenReservation;
+    user.reservedBalance = (user.reservedBalance || 0) + amountReservation;
+    if (apiKeyRec) {
+      apiKeyRec.reservedTokens = (apiKeyRec.reservedTokens || 0) + tokenReservation;
+      apiKeyRec.reservedSpend = (apiKeyRec.reservedSpend || 0) + amountReservation;
+    }
+    writeDb(db);
   }
-  writeDb(db);
 
   const started = Date.now();
   const wantStream = payload.stream === true;
@@ -575,10 +1413,11 @@ async function chat(req, res, db, user, apiKeyRec = null) {
   for (const provider of candidates) {
     try {
       const upstreamPayload = { ...payload, stream: wantStream };
-      const upstream = await fetchUpstream(provider, upstreamPayload, outputBudget, model || provider.defaultModel);
+      const upstream = await fetchUpstream(provider, upstreamPayload, outputBudget, model || provider.defaultModel, resolveProxyApiKey(provider, apiKeyRec));
       if (!upstream.ok) {
         const errText = await upstream.text().catch(() => '');
         updateProviderHealth(db, provider.id, false, `HTTP ${upstream.status}: ${errText.slice(0, 120)}`);
+      recordSiteError(db, { source: 'chat', code: 'channel_down', message: `上游对话失败 HTTP ${upstream.status}（${provider.name}）`, detail: errText.slice(0, 300), fix: tipsForCode('channel_down'), context: { providerId: provider.id, userId: user.id } });
         writeDb(db);
         lastError = new Error('provider_error');
         continue;
@@ -611,7 +1450,7 @@ async function chat(req, res, db, user, apiKeyRec = null) {
       }
 
       const usage = result.usage || {};
-      settleUsage(db, user, provider, usage, rate, tokenReservation, amountReservation, started, result.model || model || provider.defaultModel, 'success', apiKeyRec);
+      settleUsage(db, user, provider, usage, providerMultiplier(provider, db), tokenReservation, amountReservation, started, result.model || model || provider.defaultModel, 'success', apiKeyRec);
       writeDb(db);
       return json(res, 200, result);
     } catch (err) {
@@ -744,7 +1583,7 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
   }
 
   settled = true;
-  settleUsage(db, user, provider, usage, rate, tokenReservation, amountReservation, started, model, 'success', apiKeyRec);
+  settleUsage(db, user, provider, usage, providerMultiplier(provider, db), tokenReservation, amountReservation, started, model, 'success', apiKeyRec);
   writeDb(db);
   try { res.end(); } catch { /* ignore */ }
 }
@@ -754,6 +1593,11 @@ const mime = {
   '.css': 'text/css; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
   '.json': 'application/json; charset=utf-8',
   '.md': 'text/markdown; charset=utf-8'
 };
@@ -766,7 +1610,8 @@ const server = http.createServer(async (req, res) => {
   db.settings ??= {};
 
   if (req.method === 'GET' && url.pathname === '/api/config') {
-    return json(res, 200, { contactEmail: CONTACT_EMAIL, contactWechat: CONTACT_WECHAT, paymentQr: PAYMENT_QR, appName: 'Relay Station' });
+    return json(res, 200, { contactEmail: CONTACT_EMAIL, contactWechat: CONTACT_WECHAT, contactQq: CONTACT_QQ, contactQqGroup: CONTACT_QQ_GROUP, paymentQr: PAYMENT_QR, paymentPlans: paymentPlans(db), paymentMethods: PAYMENT_METHODS, paymentGateway: publicGatewayView(getPaymentGateway(db)), publicBaseUrl: resolvePublicBaseUrl(db, req), recommendedModel: String(db.settings?.recommendedModel || 'gpt-5.6'),
+      apiBaseUrl: `${resolvePublicBaseUrl(db, req)}/v1`, paymentQrMeta: (() => { const meta = paymentQrMeta(db); return { ...meta, wechat: paymentQrStatus(meta.wechatExpiresAt), alipay: paymentQrStatus(meta.alipayExpiresAt) }; })(), appName: 'Relay Station' });
   }
 
   if (req.method === 'POST' && url.pathname === '/api/auth/register') {
@@ -779,10 +1624,12 @@ const server = http.createServer(async (req, res) => {
     let username;
     if (requestedUsername) {
       if (!USERNAME_RE.test(requestedUsername)) return fail(res, 400, '用户名需为 3–32 位字母、数字、下划线或连字符，并以字母或数字开头');
+      if (isReservedUsername(requestedUsername)) return fail(res, 400, '该用户名不可用');
       if (usernameTaken(db, requestedUsername)) return fail(res, 409, '该用户名已被占用');
       username = requestedUsername.toLowerCase();
     } else {
       username = allocateUsername(db, p.name || email.split('@')[0] || 'user');
+      if (isReservedUsername(username)) username = allocateUsername(db, 'user');
     }
     const inviter = p.inviteCode ? db.users.find(x => x.inviteCode === p.inviteCode) : null;
     const user = {
@@ -791,9 +1638,11 @@ const server = http.createServer(async (req, res) => {
       username,
       name: String(p.name || '').trim() || email.split('@')[0],
       password: hash(p.password),
-      apiKey: userKey(),
+      apiKey: null,
+      apiKeys: [],
       balance: 0,
-      bonusBalance: inviter ? 10 : 0,
+      bonusBalance: 0,
+      invitedBy: inviter ? inviter.id : null,
       quotaTokens: 0,
       usedTokens: 0,
       reservedTokens: 0,
@@ -804,7 +1653,7 @@ const server = http.createServer(async (req, res) => {
       inviteCode: crypto.randomBytes(4).toString('hex').toUpperCase(),
       createdAt: new Date().toISOString()
     };
-    if (inviter) { inviter.invited += 1; inviter.bonusBalance += 20; }
+    if (inviter) { inviter.invited = (inviter.invited || 0) + 1; }
     db.users.push(user);
     ensureUserKeys(user);
     const token = crypto.randomBytes(32).toString('hex');
@@ -848,6 +1697,11 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { models: catalogModels(db) });
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/key-options') {
+    if (!user) return fail(res, 401, '未登录');
+    return json(res, 200, keyOptionsPayload(db));
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/keys') {
     if (!user) return fail(res, 401, '未登录');
     ensureUserKeys(user);
@@ -858,19 +1712,43 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/api/keys') {
     if (!user) return fail(res, 401, '未登录');
     ensureUserKeys(user);
-    if (user.apiKeys.length >= MAX_USER_KEYS) return fail(res, 400, `每个账户最多 ${MAX_USER_KEYS} 个密钥`);
+    if (user.apiKeys.length >= MAX_USER_KEYS) return fail(res, 400, `每个账户最多 ${MAX_USER_KEYS} 把密钥`);
     const p = await body(req);
-    if (!p || typeof p !== 'object') return fail(res, 400, '无效请求体');
+    if (!p || typeof p !== 'object') return fail(res, 400, '无效的请求');
+    if (p.groupId) {
+      const provider = (db.settings?.providers || []).find(x => x.id === String(p.groupId));
+      if (provider && isMaintenanceProvider(provider)) {
+        return fail(res, 503, provider.maintenanceMessage || '该模型组维护中，暂不可用', { code: 'maintenance', fix: tipsForCode('maintenance') });
+      }
+      const groupModels = resolveGroupModels(db, String(p.groupId));
+      if (!groupModels) return fail(res, 400, '模型组不存在或已停用');
+    }
     const created = normalizeApiKey({
       name: p.name,
+      groupId: p.groupId || null,
       models: p.models,
       spendLimit: p.spendLimit,
-      tokenLimit: p.tokenLimit,
-      rpm: p.rpm,
-      tpm: p.tpm,
       enabled: p.enabled !== false
-    });
+    }, null, db);
+    if (providerNeedsVip1129Sync(db, created.groupId)) {
+      const synced = await syncCreateVip1129Key(db, user, created);
+      if (!synced.ok) {
+        const fix = tipsForCode(synced.error || 'create_failed');
+        recordSiteError(db, { source: 'key_sync', code: synced.error || 'create_failed', message: `vip1129 同步建钥失败: ${synced.error}`, detail: JSON.stringify(synced.detail || {}).slice(0, 500), fix, context: { groupId: created.groupId, userId: user.id } });
+        writeDb(db);
+        return fail(res, 502, `上游同步建钥失败: ${synced.error}`, { code: synced.error || 'create_failed', fix });
+      }
+    } else if (providerNeedsBeibeihaiSync(db, created.groupId)) {
+      const synced = await syncCreateBeibeihaiKey(db, user, created);
+      if (!synced.ok) {
+        const fix = tipsForCode(synced.error || 'create_failed');
+        recordSiteError(db, { source: 'key_sync', code: synced.error || 'create_failed', message: `Beibeihai 同步建钥失败: ${synced.error}`, detail: JSON.stringify(synced.detail || {}).slice(0, 500), fix, context: { groupId: created.groupId, userId: user.id } });
+        writeDb(db);
+        return fail(res, 502, `上游同步建钥失败: ${synced.error}`, { code: synced.error || 'create_failed', fix });
+      }
+    }
     user.apiKeys.push(created);
+    if (!user.apiKey) user.apiKey = created.key;
     writeDb(db);
     return json(res, 201, { key: publicApiKey(created) });
   }
@@ -883,9 +1761,9 @@ const server = http.createServer(async (req, res) => {
     const rec = user.apiKeys.find(k => k.id === keyId);
     if (!rec) return fail(res, 404, '密钥不存在');
     if (req.method === 'DELETE') {
-      if (user.apiKeys.length <= 1) return fail(res, 400, '至少保留一个密钥');
+      await syncDeleteVip1129Key(db, rec);
       user.apiKeys = user.apiKeys.filter(k => k.id !== keyId);
-      if (user.apiKey === rec.key) user.apiKey = user.apiKeys[0].key;
+      user.apiKey = user.apiKeys[0]?.key || null;
       writeDb(db);
       return json(res, 200, { ok: true });
     }
@@ -899,16 +1777,18 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'PUT') {
       const p = await body(req);
       if (!p || typeof p !== 'object') return fail(res, 400, '无效请求体');
+      if ('groupId' in p && p.groupId) {
+        const groupModels = resolveGroupModels(db, String(p.groupId));
+        if (!groupModels) return fail(res, 400, '模型组不存在或已停用');
+      }
       const next = normalizeApiKey({
         ...rec,
         name: p.name ?? rec.name,
+        groupId: 'groupId' in p ? (p.groupId || null) : rec.groupId,
         models: Array.isArray(p.models) ? p.models : rec.models,
         spendLimit: p.spendLimit ?? rec.spendLimit,
-        tokenLimit: p.tokenLimit ?? rec.tokenLimit,
-        rpm: p.rpm ?? rec.rpm,
-        tpm: p.tpm ?? rec.tpm,
         enabled: 'enabled' in p ? p.enabled !== false : rec.enabled
-      }, rec);
+      }, rec, db);
       Object.assign(rec, next);
       writeDb(db);
       return json(res, 200, { key: publicApiKey(rec) });
@@ -918,7 +1798,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/dashboard') {
     if (!user) return fail(res, 401, '未登录');
-    const logs = db.logs.filter(x => x.userId === user.id);
+    const logs = db.logs.filter(x => x.userId === user.id && x.status !== 'referral_rebate');
     const totalTokens = logs.reduce((sum, x) => sum + (x.billedTokens ?? x.tokens * (x.multiplier || DEFAULT_MULTIPLIER)), 0);
     const avgLatency = logs.length ? Math.round(logs.reduce((sum, x) => sum + x.latency, 0) / logs.length) : 0;
     const displayLogs = logs.slice(0, 30).map(x => ({
@@ -943,22 +1823,613 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+
+  if (req.method === 'POST' && url.pathname === '/api/recharge/prepare') {
+    if (!user) return fail(res, 401, '未登录');
+    if (!rateLimit(req, res, 30, 'pay-prepare')) return;
+    const p = await body(req);
+    const amount = Number(p?.amount);
+    if (!PAYMENT_AMOUNTS.includes(amount)) return fail(res, 400, '金额无效');
+    const method = String(p?.method || 'wechat').toLowerCase();
+    if (!['wechat', 'alipay'].includes(method)) return fail(res, 400, '付款方式无效');
+    db.paymentOrders ??= [];
+    const payNote = String(user.username || user.name || '').trim() || makePayNote(db);
+    const order = {
+      id: id('pay'),
+      userId: user.id,
+      username: user.username || '',
+      email: user.email || '',
+      amount,
+      method,
+      payNote,
+      status: 'awaiting_payment',
+      code: null,
+      createdAt: new Date().toISOString(),
+      userReportedAt: null,
+      confirmedAt: null,
+      confirmedBy: null,
+      rejectedAt: null,
+      rejectReason: null
+    };
+    const gw = getPaymentGateway(db);
+    const useGateway = gatewayReady(gw);
+    if (useGateway) {
+      order.payMode = 'gateway';
+      order.gateway = gw.type;
+      order.payNote = null;
+      order.payUrl = buildEpaySubmitUrl(gw, order);
+    } else {
+      order.payMode = 'manual_qr';
+    }
+    db.paymentOrders.unshift(order);
+    audit(db, { actorId: user.id, action: 'payment.order.prepare', target: order.id, detail: { amount, method, payNote: order.payNote, payMode: order.payMode } });
+    writeDb(db);
+    if (useGateway) {
+      return json(res, 200, {
+        orderId: order.id,
+        status: order.status,
+        amount,
+        method,
+        payMode: 'gateway',
+        payUrl: order.payUrl,
+        message: `请完成在线支付 ¥${amount}，支付成功后自动发卡`
+      });
+    }
+    return json(res, 200, {
+      orderId: order.id,
+      status: order.status,
+      amount,
+      method,
+      payMode: 'manual_qr',
+      payNote,
+      message: `请扫码支付 ¥${amount}，付款备注请填写你的用户名`
+    });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/recharge/claim') {
+    if (!user) return fail(res, 401, '未登录');
+    if (!rateLimit(req, res, 30, 'claim')) return;
+    const p = await body(req);
+    db.paymentOrders ??= [];
+    const orderId = String(p?.orderId || '').trim();
+    let order = orderId ? db.paymentOrders.find(o => o.id === orderId && o.userId === user.id) : null;
+    if (!order) {
+      // fallback: latest awaiting_payment for amount+method
+      const amount = Number(p?.amount);
+      const method = String(p?.method || 'wechat').toLowerCase();
+      order = db.paymentOrders.find(o => o.userId === user.id && o.status === 'awaiting_payment' && Number(o.amount) === amount && o.method === method);
+    }
+    if (!order) return fail(res, 400, '请先确认购买生成付款备注，再提交付款确认');
+    if (order.status === 'confirmed') return fail(res, 400, '该订单已确认并发放过卡密');
+    if (order.status === 'rejected') return fail(res, 400, '该订单已被拒绝，请重新确认购买');
+    if (order.status === 'pending') {
+      return json(res, 200, {
+        orderId: order.id,
+        status: order.status,
+        amount: order.amount,
+        method: order.method,
+        payNote: order.payNote,
+        message: '已通知管理员，请等待按备注核对到账'
+      });
+    }
+    if (order.status !== 'awaiting_payment') return fail(res, 400, '订单状态不可提交');
+    order.status = 'pending';
+    order.userReportedAt = new Date().toISOString();
+    audit(db, { actorId: user.id, action: 'payment.order.claim', target: order.id, detail: { amount: order.amount, method: order.method, payNote: order.payNote } });
+    writeDb(db);
+    return json(res, 200, {
+      orderId: order.id,
+      status: order.status,
+      amount: order.amount,
+      method: order.method,
+      payNote: order.payNote,
+      message: `已提交付款确认通知（备注 ${order.payNote}），请等待管理员核对`
+    });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/recharge/orders') {
+    if (!user) return fail(res, 401, '未登录');
+    db.paymentOrders ??= [];
+    const orders = db.paymentOrders
+      .filter(o => o.userId === user.id)
+      .slice(0, 50)
+      .map(o => ({
+        id: o.id,
+        amount: o.amount,
+        method: o.method,
+        payNote: o.payNote || null,
+        status: o.status,
+        code: o.status === 'confirmed' ? o.code : null,
+        createdAt: o.createdAt,
+        userReportedAt: o.userReportedAt || null,
+        confirmedAt: o.confirmedAt || null,
+        rejectedAt: o.rejectedAt || null,
+        rejectReason: o.rejectReason || null
+      }));
+    return json(res, 200, { orders });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/admin/payment-orders') {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    db.paymentOrders ??= [];
+    const status = String(url.searchParams.get('status') || '').trim();
+    let list = db.paymentOrders.slice();
+    if (status) list = list.filter(o => o.status === status);
+    return json(res, 200, {
+      orders: list.slice(0, 200).map(o => ({
+        id: o.id,
+        userId: o.userId,
+        username: o.username,
+        email: o.email,
+        amount: o.amount,
+        method: o.method,
+        payNote: o.payNote || null,
+        status: o.status,
+        code: o.code,
+        createdAt: o.createdAt,
+        userReportedAt: o.userReportedAt,
+        confirmedAt: o.confirmedAt,
+        confirmedBy: o.confirmedBy,
+        rejectedAt: o.rejectedAt,
+        rejectReason: o.rejectReason
+      })),
+      pendingCount: db.paymentOrders.filter(o => o.status === 'pending').length
+    });
+  }
+
+  if (req.method === 'POST' && url.pathname.startsWith('/api/admin/payment-orders/') && url.pathname.endsWith('/confirm')) {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const orderId = decodeURIComponent(url.pathname.slice('/api/admin/payment-orders/'.length, -'/confirm'.length));
+    const p = await body(req);
+    db.paymentOrders ??= [];
+    const order = db.paymentOrders.find(o => o.id === orderId);
+    if (!order) return fail(res, 404, '订单不存在');
+    if (order.status !== 'pending' && order.status !== 'awaiting_payment') return fail(res, 400, '订单已处理');
+    // 人工确认：按用户名备注在账单核对，不再强制回填随机备注码
+
+    const day = localDay();
+    const issuedToday = (db.rechargeCodes || []).filter(c => c.issuedTo === order.userId && c.issuedAt && localDay(new Date(c.issuedAt)) === day).length;
+    if (issuedToday >= CLAIM_DAILY_LIMIT) return fail(res, 429, `该用户今日发卡已达上限（${CLAIM_DAILY_LIMIT}）`);
+    let card = (db.rechargeCodes || []).find(c => Number(c.amount) === Number(order.amount) && codeAvailable(c));
+    if (!card) {
+      const added = topUpCodePools(db, CODE_POOL_TARGET);
+      if (added) writeDb(db);
+      card = (db.rechargeCodes || []).find(c => Number(c.amount) === Number(order.amount) && codeAvailable(c));
+    }
+    if (!card) return fail(res, 503, '该金额卡密暂时售罄，请稍后重试');
+    card.issuedAt = new Date().toISOString();
+    card.issuedTo = order.userId;
+    order.status = 'confirmed';
+    order.code = card.code;
+    order.confirmedAt = new Date().toISOString();
+    order.confirmedBy = user.id;
+    if (!order.userReportedAt) order.userReportedAt = order.confirmedAt;
+    audit(db, { actorId: user.id, action: 'payment.order.confirm', target: order.id, detail: { amount: order.amount, method: order.method, code: card.code, userId: order.userId, payNote: order.payNote } });
+    writeDb(db);
+    return json(res, 200, { order, message: '已确认到账并发放卡密' });
+  }
+
+  if (req.method === 'POST' && url.pathname.startsWith('/api/admin/payment-orders/') && url.pathname.endsWith('/reject')) {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const orderId = decodeURIComponent(url.pathname.slice('/api/admin/payment-orders/'.length, -'/reject'.length));
+    const p = await body(req);
+    db.paymentOrders ??= [];
+    const order = db.paymentOrders.find(o => o.id === orderId);
+    if (!order) return fail(res, 404, '订单不存在');
+    if (!['pending', 'awaiting_payment'].includes(order.status)) return fail(res, 400, '订单已处理');
+    order.status = 'rejected';
+    order.rejectedAt = new Date().toISOString();
+    order.rejectReason = String(p?.reason || '未确认到账').slice(0, 200);
+    order.confirmedBy = user.id;
+    audit(db, { actorId: user.id, action: 'payment.order.reject', target: order.id, detail: { reason: order.rejectReason, payNote: order.payNote } });
+    writeDb(db);
+    return json(res, 200, { order, message: '已拒绝该付款确认' });
+  }
+
+
+
+  
+  
+  
+  if (req.method === 'GET' && url.pathname === '/api/admin/site-errors') {
+    if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
+    const list = ensureSiteErrors(db);
+    return json(res, 200, { errors: list.slice(0, 100), total: list.length, cap: SITE_ERROR_CAP });
+  }
+
+  if (req.method === 'DELETE' && url.pathname === '/api/admin/site-errors') {
+    if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
+    clearSiteErrors(db);
+    writeDb(db);
+    return json(res, 200, { ok: true });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/admin/diagnostics/run') {
+    if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
+    const report = await runDiagnosticSuite({
+      db,
+      ensureVip1129Token,
+      getVip1129Config,
+      ensureBeibeihaiToken,
+      getBeibeihaiConfig,
+      isVip1129Provider,
+      isBeibeihaiProvider,
+      isMaintenanceProvider,
+      probeProviderHealth,
+      gatewayReady,
+      getPaymentGateway,
+      paymentQrMeta,
+      paymentQrStatus,
+      resolvePublicBaseUrl,
+      fs,
+      dbFile,
+      tipsForCode
+    });
+    // persist failed items into site errors for the 网站错误栏
+    for (const r of report.results.filter(x => !x.ok)) {
+      recordSiteError(db, {
+        source: 'diagnostics',
+        code: r.id,
+        message: `${r.name}: ${r.message}`,
+        detail: r.detail,
+        fix: r.fix,
+        level: 'error'
+      });
+    }
+    db.settings ??= {};
+    db.settings.lastDiagnostics = { at: report.at, summary: report.summary };
+    writeDb(db);
+    return json(res, 200, report);
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/admin/diagnostics/last') {
+    if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
+    return json(res, 200, { last: db.settings?.lastDiagnostics || null });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/admin/upstream-beibeihai') {
+    if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
+    const cfg = getBeibeihaiConfig(db);
+    let groups = [];
+    if (cfg.email && (cfg.password || cfg.accessToken)) {
+      const auth = await ensureBeibeihaiToken(db);
+      if (auth.ok) {
+        const listed = await beibeihaiListGroups(auth.cfg.baseUrl, auth.token);
+        if (listed.ok) {
+          const arr = listed.data?.data || listed.data || [];
+          if (Array.isArray(arr)) groups = arr.map(g => ({ id: g.id, name: g.name, platform: g.platform, rate: g.rate_multiplier, status: g.status }));
+        }
+      }
+    }
+    const localGroups = (db.settings?.providers || []).filter(p => isBeibeihaiProvider(p) && !isMaintenanceProvider(p)).map(p => ({ id: p.id, name: p.name, url: p.url }));
+    return json(res, 200, { upstream: publicBeibeihaiView(getBeibeihaiConfig(db)), groups, localGroups });
+  }
+
+  if (req.method === 'PUT' && url.pathname === '/api/admin/upstream-beibeihai') {
+    if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
+    const p = await body(req);
+    const cur = getBeibeihaiConfig(db);
+    if ('enabled' in (p || {})) cur.enabled = p.enabled !== false;
+    if (p?.baseUrl != null) cur.baseUrl = beibeihaiNormalizeBase(p.baseUrl);
+    if (p?.email != null) cur.email = String(p.email || '').trim();
+    if (p?.password != null && String(p.password) !== '') cur.password = String(p.password);
+    if (p?.groupMap && typeof p.groupMap === 'object') {
+      const nextMap = { ...cur.groupMap };
+      for (const [k, v] of Object.entries(p.groupMap)) {
+        if (v === null || v === '') delete nextMap[k];
+        else nextMap[k] = Number(v);
+      }
+      cur.groupMap = nextMap;
+    }
+    if (p?.clearToken) {
+      cur.accessToken = '';
+      cur.tokenExpiresAt = 0;
+    }
+    saveBeibeihaiConfig(db, cur);
+    writeDb(db);
+    let probe = null;
+    if (cur.enabled && cur.email && cur.password) {
+      const auth = await ensureBeibeihaiToken(db);
+      probe = { ok: auth.ok, error: auth.ok ? null : auth.error };
+      writeDb(db);
+    }
+    return json(res, 200, { upstream: publicBeibeihaiView(getBeibeihaiConfig(db)), probe });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/admin/upstream-vip1129') {
+    if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
+    const cfg = getVip1129Config(db);
+    let groups = [];
+    if (cfg.email && (cfg.password || cfg.accessToken)) {
+      const auth = await ensureVip1129Token(db);
+      if (auth.ok) {
+        const listed = await vip1129ListGroups(auth.cfg.baseUrl, auth.token);
+        if (listed.ok) {
+          const arr = listed.data?.data || listed.data || [];
+          if (Array.isArray(arr)) groups = arr.map(g => ({ id: g.id, name: g.name, platform: g.platform, rate: g.rate_multiplier, status: g.status }));
+        }
+      }
+    }
+    const localGroups = (db.settings?.providers || []).filter(p => isVip1129Provider(p)).map(p => ({ id: p.id, name: p.name, url: p.url }));
+    return json(res, 200, { upstream: publicVip1129View(getVip1129Config(db)), groups, localGroups });
+  }
+
+  if (req.method === 'PUT' && url.pathname === '/api/admin/upstream-vip1129') {
+    if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
+    const p = await body(req);
+    const cur = getVip1129Config(db);
+    if ('enabled' in (p || {})) cur.enabled = p.enabled !== false;
+    if (p?.baseUrl != null) cur.baseUrl = vip1129NormalizeBase(p.baseUrl);
+    if (p?.email != null) cur.email = String(p.email || '').trim();
+    if (p?.password != null && String(p.password) !== '') cur.password = String(p.password);
+    if (p?.groupMap && typeof p.groupMap === 'object') {
+      const nextMap = { ...cur.groupMap };
+      for (const [k, v] of Object.entries(p.groupMap)) {
+        if (v === null || v === '') delete nextMap[k];
+        else nextMap[k] = Number(v);
+      }
+      cur.groupMap = nextMap;
+    }
+    if (p?.clearToken) {
+      cur.accessToken = '';
+      cur.tokenExpiresAt = 0;
+    }
+    saveVip1129Config(db, cur);
+    writeDb(db);
+    // probe login
+    let probe = null;
+    if (cur.enabled && cur.email && cur.password) {
+      const auth = await ensureVip1129Token(db);
+      probe = { ok: auth.ok, error: auth.ok ? null : auth.error };
+      writeDb(db);
+    }
+    return json(res, 200, { upstream: publicVip1129View(getVip1129Config(db)), probe });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/admin/site-settings') {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    return json(res, 200, {
+      publicBaseUrl: db.settings.publicBaseUrl || PUBLIC_BASE_URL || '',
+      resolvedBaseUrl: resolvePublicBaseUrl(db, req),
+      apiBaseUrl: `${resolvePublicBaseUrl(db, req)}/v1`
+    });
+  }
+
+  if (req.method === 'PUT' && url.pathname === '/api/admin/site-settings') {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const p = await body(req);
+    const next = String(p?.publicBaseUrl || '').trim().replace(/\/$/, '');
+    db.settings.publicBaseUrl = next;
+    audit(db, { actorId: user.id, action: 'siteSettings.save', target: 'publicBaseUrl', detail: { publicBaseUrl: next } });
+    writeDb(db);
+    const resolved = resolvePublicBaseUrl(db, req);
+    return json(res, 200, {
+      publicBaseUrl: next,
+      resolvedBaseUrl: resolved,
+      apiBaseUrl: `${resolved}/v1`,
+      message: next ? '已保存站点网址' : '已清空，将自动使用当前访问域名'
+    });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/admin/payment-gateway') {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const gw = getPaymentGateway(db);
+    return json(res, 200, {
+      gateway: {
+        ...gw,
+        key: gw.key ? '********' : '',
+        keySet: !!gw.key,
+        ready: gatewayReady(gw)
+      }
+    });
+  }
+
+  if (req.method === 'PUT' && url.pathname === '/api/admin/payment-gateway') {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const p = await body(req);
+    const cur = getPaymentGateway(db);
+    const next = normalizeGateway({
+      enabled: p?.enabled ?? cur.enabled,
+      type: p?.type || cur.type || 'epay',
+      name: p?.name || cur.name || '易支付',
+      apiUrl: p?.apiUrl != null ? p.apiUrl : cur.apiUrl,
+      pid: p?.pid != null ? p.pid : cur.pid,
+      key: (p?.key && p.key !== '********') ? p.key : cur.key,
+      siteUrl: p?.siteUrl != null ? p.siteUrl : cur.siteUrl
+    });
+    db.settings.paymentGateway = next;
+    audit(db, { actorId: user.id, action: 'paymentGateway.save', target: 'paymentGateway', detail: { enabled: next.enabled, apiUrl: next.apiUrl, pid: next.pid, siteUrl: next.siteUrl, keySet: !!next.key } });
+    writeDb(db);
+    return json(res, 200, {
+      gateway: { ...next, key: next.key ? '********' : '', keySet: !!next.key, ready: gatewayReady(next) },
+      message: gatewayReady(next) ? '聚合支付已就绪' : '已保存（尚未启用或配置不完整）'
+    });
+  }
+
+  // 易支付异步通知（无需登录）
+  if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/api/pay/epay/notify') {
+    const db2 = readDb();
+    const gw = getPaymentGateway(db2);
+    if (!gatewayReady(gw)) {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('fail');
+      return;
+    }
+    let params = Object.fromEntries(url.searchParams.entries());
+    if (req.method === 'POST') {
+      const p = await body(req);
+      if (p && typeof p === 'object') params = { ...params, ...p };
+    }
+    if (!epayVerify(params, gw.key)) {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('fail');
+      return;
+    }
+    const status = String(params.trade_status || '');
+    if (status && status !== 'TRADE_SUCCESS' && status !== 'TRADE_FINISHED') {
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('success');
+      return;
+    }
+    const outTradeNo = String(params.out_trade_no || '');
+    const money = Number(params.money || params.total_amount || 0);
+    db2.paymentOrders ??= [];
+    const order = db2.paymentOrders.find(o => o.id === outTradeNo);
+    if (!order) {
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('success');
+      return;
+    }
+    if (Math.abs(Number(order.amount) - money) > 0.01 && money > 0) {
+      audit(db2, { actorId: 'gateway', action: 'payment.notify.amount_mismatch', target: order.id, detail: { expect: order.amount, got: money } });
+      writeDb(db2);
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('fail');
+      return;
+    }
+    const result = fulfillPaymentOrder(db2, order, {
+      tradeNo: params.trade_no || params.transaction_id || '',
+      payChannel: params.type || order.method,
+      via: 'epay_notify',
+      confirmedBy: 'epay'
+    });
+    writeDb(db2);
+    res.writeHead(result.ok ? 200 : 500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(result.ok ? 'success' : 'fail');
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/pay/epay/return') {
+    const outTradeNo = String(url.searchParams.get('out_trade_no') || '');
+    const html = `<!doctype html><meta charset="utf-8"><title>支付结果</title>
+      <body style="font-family:sans-serif;background:#0d1016;color:#f2f4f7;display:grid;place-items:center;min-height:100vh">
+      <div style="max-width:420px;padding:24px;border:1px solid #2a303d;border-radius:12px;background:#151922">
+        <h2 style="margin:0 0 8px">支付已提交</h2>
+        <p style="color:#8b95a7;font-size:13px;line-height:1.6">若付款成功，卡密将自动发放。请返回网站打开「卡密充值 → 我的付款订单」查看或复制卡密。</p>
+        <p style="color:#626d80;font-size:11px">订单号：${outTradeNo || '-'}</p>
+        <p><a href="/" style="color:#c6f36a">返回首页</a></p>
+      </div></body>`;
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/admin/code-pool') {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    return json(res, 200, poolStats(db));
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/recharge/redeem') {
     if (!user) return fail(res, 401, '未登录');
     const p = await body(req);
     const code = db.rechargeCodes.find(x => x.code === p?.code && !x.usedAt);
     if (!code) return fail(res, 400, '卡密无效或已使用');
     const quotaTokens = Number(code.quotaTokens || 100000);
+    const payAmount = Number(code.amount || 0);
     code.usedAt = new Date().toISOString();
     code.userId = user.id;
-    user.balance += Number(code.amount || 0);
+    user.balance += payAmount;
     user.quotaTokens = (user.quotaTokens || 0) + quotaTokens;
     user.accountActive = true;
+    // Referral: only when invited user pays — inviter gets 10%
+    let rebate = 0;
+    if (user.invitedBy && payAmount > 0) {
+      const inviter = db.users.find(x => x.id === user.invitedBy);
+      if (inviter) {
+        rebate = Math.round(payAmount * 0.1 * 100) / 100;
+        inviter.bonusBalance = (inviter.bonusBalance || 0) + rebate;
+        inviter.balance = (inviter.balance || 0) + rebate;
+        db.logs = db.logs || [];
+        db.logs.unshift({
+          id: id('log'),
+          userId: inviter.id,
+          model: 'referral',
+          tokens: 0,
+          billedTokens: 0,
+          upstreamCost: 0,
+          chargedAmount: -rebate,
+          multiplier: 1,
+          latency: 0,
+          status: 'referral_rebate',
+          detail: { fromUserId: user.id, payAmount, rebate, rate: 0.1 },
+          createdAt: new Date().toISOString()
+        });
+        db.logs = db.logs.slice(0, 3000);
+      }
+    }
     writeDb(db);
     return json(res, 200, { user: safeUser(user), message: `充值成功，到账 ¥${code.amount}，新增 ${quotaTokens.toLocaleString()} Token 配额` });
   }
 
   // --- Admin APIs ---
+
+  if (req.method === 'GET' && url.pathname === '/api/admin/payment-qrs') {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const paymentQrs = ensurePaymentQrs(db);
+    const meta = paymentQrMeta(db);
+    return json(res, 200, {
+      plans: paymentPlans(db),
+      paymentQrs,
+      methods: PAYMENT_METHODS,
+      paymentQrMeta: {
+        ...meta,
+        wechat: paymentQrStatus(meta.wechatExpiresAt),
+        alipay: paymentQrStatus(meta.alipayExpiresAt)
+      }
+    });
+  }
+
+  if (req.method === 'PUT' && url.pathname === '/api/admin/payment-qrs') {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const p = await body(req);
+    const next = ensurePaymentQrs(db);
+    const incoming = p?.paymentQrs || {};
+    for (const method of ['wechat', 'alipay']) {
+      const src = incoming[method];
+      if (!src || typeof src !== 'object') continue;
+      for (const amount of PAYMENT_AMOUNTS) {
+        const key = String(amount);
+        if (Object.prototype.hasOwnProperty.call(src, key)) {
+          next[method][key] = String(src[key] || '').trim();
+        }
+      }
+    }
+    // legacy flat body still updates wechat
+    for (const amount of PAYMENT_AMOUNTS) {
+      const key = String(amount);
+      if (Object.prototype.hasOwnProperty.call(incoming, key) && typeof incoming[key] !== 'object') {
+        next.wechat[key] = String(incoming[key] || '').trim();
+      }
+    }
+    db.settings.paymentQrs = next;
+    if (p?.paymentQrMeta && typeof p.paymentQrMeta === 'object') {
+      const cur = paymentQrMeta(db);
+      const incoming = p.paymentQrMeta;
+      db.settings.paymentQrMeta = {
+        wechatExpiresAt: incoming.wechatExpiresAt === '' || incoming.wechatExpiresAt == null
+          ? null
+          : String(incoming.wechatExpiresAt),
+        alipayExpiresAt: incoming.alipayExpiresAt === '' || incoming.alipayExpiresAt == null
+          ? null
+          : String(incoming.alipayExpiresAt),
+        note: incoming.note != null ? String(incoming.note) : cur.note
+      };
+    }
+    const meta = paymentQrMeta(db);
+    audit(db, { actorId: user.id, action: 'paymentQrs.save', target: 'paymentQrs', detail: { methods: Object.keys(next), meta } });
+    writeDb(db);
+    return json(res, 200, {
+      plans: paymentPlans(db),
+      paymentQrs: next,
+      methods: PAYMENT_METHODS,
+      paymentQrMeta: {
+        ...meta,
+        wechat: paymentQrStatus(meta.wechatExpiresAt),
+        alipay: paymentQrStatus(meta.alipayExpiresAt)
+      }
+    });
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/admin/pricing') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
     return json(res, 200, {
@@ -978,12 +2449,48 @@ const server = http.createServer(async (req, res) => {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
     const p = await body(req);
     const value = Number(p?.multiplier);
-    if (!Number.isFinite(value) || value < 1 || value > 10) return fail(res, 400, '倍率必须在 1 到 10 之间');
+    if (!Number.isFinite(value) || value <= 0 || value > 10) return fail(res, 400, '倍率必须在 0 到 10 之间（不含 0）');
     const prev = db.settings.billingMultiplier;
     db.settings.billingMultiplier = value;
     audit(db, { actorId: user.id, action: 'pricing.change', target: 'billingMultiplier', detail: { from: prev, to: value } });
     writeDb(db);
     return json(res, 200, { multiplier: value });
+  }
+
+
+
+  if (req.method === 'POST' && url.pathname === '/api/admin/providers/health-check') {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const results = await probeAllProviderHealth(db);
+    audit(db, { actorId: user.id, action: 'providers.healthCheck', target: 'providers', detail: { results: results.map(r => ({ id: r.id, ok: r.ok, error: r.error })) } });
+    writeDb(db);
+    const bad = results.filter(r => !r.ok);
+    return json(res, 200, {
+      results,
+      providers: (db.settings.providers || []).map(publicProvider),
+      healthSummary: (db.settings.providers || []).map(p => ({
+        id: p.id,
+        name: p.name,
+        enabled: p.enabled !== false,
+        health: p.health || { ok: true, lastCheckedAt: null, lastError: null }
+      })),
+      message: bad.length ? `探测完成：异常 ${bad.length} 个渠道` : '探测完成：渠道全部可用'
+    });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/admin/providers/sync-models') {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const p = await body(req);
+    const ids = Array.isArray(p?.ids) ? p.ids.map(String) : (p?.id ? [String(p.id)] : null);
+    const results = await syncAllUpstreamModels(db, { ids });
+    audit(db, { actorId: user.id, action: 'providers.syncModels', target: 'providers', detail: { results: results.map(r => ({ id: r.id, ok: r.ok, count: r.count, error: r.error })) } });
+    writeDb(db);
+    const failed = results.filter(r => !r.ok);
+    return json(res, failed.length && failed.length === results.length ? 502 : 200, {
+      results,
+      providers: (db.settings.providers || []).map(publicProvider),
+      message: failed.length ? `同步完成：成功 ${results.length - failed.length}，失败 ${failed.length}` : `已从上游同步 ${results.length} 个渠道的模型`
+    });
   }
 
   if (req.method === 'PUT' && url.pathname === '/api/admin/providers') {
@@ -997,24 +2504,32 @@ const server = http.createServer(async (req, res) => {
         return fail(res, 400, '渠道名称和 HTTPS 地址不能为空');
       }
       const previous = existing.get(item.id);
-      const apiKey = item.apiKey || previous?.apiKey;
-      if (!apiKey) return fail(res, 400, `渠道 ${item.name} 缺少 API Key`);
+      const apiKey = item.apiKey || previous?.apiKey || '';
+      // apiKey 可为空：模型组可先上线，上游配好后再填 Key（无 Key 时不会参与实际转发）
       const normalized = normalizeProvider({ ...item, apiKey }, previous);
+      // 模型列表以上游 /v1/models 为准，允许先保存渠道再同步
       if (normalized.enabled !== false && (!normalized.models || !normalized.models.length)) {
-        return fail(res, 400, `渠道 ${normalized.name} 已启用，必须至少配置一个模型`);
+        normalized.models = previous?.models || [];
       }
       next.push(normalized);
     }
     db.settings.providers = next;
     db.settings.defaultProviderId = next.some(x => x.id === p.defaultProviderId) ? p.defaultProviderId : next[0].id;
+    // 保存后自动同步有 Key 的渠道模型
+    const syncResults = await syncAllUpstreamModels(db);
     audit(db, {
       actorId: user.id,
       action: 'providers.save',
       target: 'providers',
-      detail: { count: next.length, ids: next.map(x => x.id), defaultProviderId: db.settings.defaultProviderId }
+      detail: { count: next.length, ids: next.map(x => x.id), defaultProviderId: db.settings.defaultProviderId, sync: syncResults.map(r => ({ id: r.id, ok: r.ok, count: r.count })) }
     });
     writeDb(db);
-    return json(res, 200, { providers: next.map(publicProvider), defaultProviderId: db.settings.defaultProviderId });
+    return json(res, 200, {
+      providers: next.map(publicProvider),
+      defaultProviderId: db.settings.defaultProviderId,
+      syncResults,
+      message: syncResults.length ? `已保存，并自动同步 ${syncResults.filter(r => r.ok).length}/${syncResults.length} 个渠道模型` : '已保存'
+    });
   }
 
   if (req.method === 'GET' && url.pathname === '/api/admin/users') {
@@ -1122,7 +2637,21 @@ const server = http.createServer(async (req, res) => {
     ensureUserKeys(user);
     const keyId = url.searchParams.get('keyId');
     const rec = (keyId && user.apiKeys.find(k => k.id === keyId)) || user.apiKeys.find(k => k.enabled !== false) || user.apiKeys[0] || null;
+    if (!rec) return fail(res, 400, '请先在控制台创建 API 密钥');
     return chat(req, res, db, user, rec);
+  }
+
+  if (req.method === 'GET' && url.pathname === '/v1/models') {
+    const apiKey = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const found = findByApiSecret(db, apiKey);
+    if (!found) return fail(res, 401, '无效的 Relay API Key');
+    const allowed = (found.key && Array.isArray(found.key.models) && found.key.models.length)
+      ? found.key.models
+      : catalogModels(db);
+    return json(res, 200, {
+      object: 'list',
+      data: allowed.map(id => ({ id, object: 'model', owned_by: 'relay-station' }))
+    });
   }
 
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
@@ -1150,8 +2679,52 @@ const initial = readDb();
 initial.settings ??= {};
 initial.auditLogs ??= [];
 initial.sessions ??= {};
+initial.paymentOrders ??= [];
+initial.siteErrors ??= [];
+ensureSiteErrors(initial);
 initial.settings.billingMultiplier ??= DEFAULT_MULTIPLIER;
+initial.settings.paymentQrs ??= {};
+ensurePaymentQrs(initial);
+initial.settings.paymentQrMeta ??= {
+  wechatExpiresAt: null,
+  alipayExpiresAt: null,
+  note: '个人静态收款码一般长期有效；若扫码提示已过期/无法支付，请换另一种付款方式或联系客服更换收款码。'
+};
+initial.settings.publicBaseUrl ??= PUBLIC_BASE_URL || '';
+initial.settings.recommendedModel ??= 'gpt-5.6';
+initial.settings.upstreamBeibeihai ??= {
+  enabled: true,
+  baseUrl: BEIBEIHAI_BASE_URL || BEIBEIHAI_DEFAULT_BASE,
+  email: BEIBEIHAI_EMAIL || '',
+  password: BEIBEIHAI_PASSWORD || '',
+  accessToken: '',
+  tokenExpiresAt: 0,
+  groupMap: beibeihaiDefaultGroupMap(),
+  lastError: null
+};
+initial.settings.upstreamVip1129 ??= {
+  enabled: true,
+  baseUrl: VIP1129_BASE_URL || VIP1129_DEFAULT_BASE,
+  email: VIP1129_EMAIL || '',
+  password: VIP1129_PASSWORD || '',
+  accessToken: '',
+  tokenExpiresAt: 0,
+  groupMap: vip1129DefaultGroupMap(),
+  lastError: null
+};
+initial.settings.paymentGateway ??= {
+  enabled: false,
+  type: 'epay',
+  name: '易支付',
+  apiUrl: '',
+  pid: '',
+  key: '',
+  siteUrl: ''
+};
+
 initial.settings.providers ??= [];
+if (seedDefaultProviders(initial)) writeDb(initial);
+
 for (const user of initial.users) {
   user.quotaTokens ??= 0;
   user.usedTokens ??= 0;
@@ -1163,6 +2736,9 @@ for (const user of initial.users) {
   ensureUserKeys(user);
 }
 for (const provider of initial.settings.providers) {
+  if (provider.id === 'grp_cursor_pool') { provider.maintenance = true; provider.maintenanceMessage = '请联系站长购买'; }
+  provider.maintenance ??= (provider.id === 'grp_cursor_pool');
+  if (provider.id === 'grp_cursor_pool') provider.maintenanceMessage ??= '请联系站长购买';
   provider.priority ??= 100;
   provider.timeoutMs ??= 60000;
   provider.maxRetries ??= 0;
@@ -1200,4 +2776,56 @@ for (const [token, session] of Object.entries(initial.sessions || {})) {
   if (session?.userId) sessions.set(token, session.userId);
 }
 writeDb(initial);
+server.on('error', (err) => {
+  if (err && err.code === 'EADDRINUSE') {
+    console.error(`[启动失败] 端口 ${PORT} 已被占用（EADDRINUSE）。`);
+    console.error('解决办法：');
+    console.error(`  1) 关掉已在运行的中转站进程（任务管理器结束 node，或执行: Get-NetTCPConnection -LocalPort ${PORT} | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }）`);
+    console.error('  2) 或换端口启动: $env:PORT="8788"; npm start');
+    process.exit(1);
+  }
+  console.error('[启动失败]', err);
+  process.exit(1);
+});
 server.listen(PORT, () => console.log(`Relay Station running at http://localhost:${PORT}`));
+
+setImmediate(async () => {
+  try {
+    const bootDb = readDb();
+    const added = topUpCodePools(bootDb, CODE_POOL_TARGET);
+    let poolChanged = added > 0;
+    if (added) console.log(`Code pool topped up: +${added} (target ${CODE_POOL_TARGET}/amount)`);
+    else console.log(`Code pool ready (target ${CODE_POOL_TARGET}/amount)`);
+    const healthResults = await probeAllProviderHealth(bootDb);
+    writeDb(bootDb);
+    const ok = healthResults.filter(r => r.ok && !r.skipped).length;
+    const bad = healthResults.filter(r => !r.ok);
+    console.log(`Channel health probe: ${ok} ok, ${bad.length} down (of ${healthResults.length})`);
+    for (const r of bad) console.warn(`  channel down ${r.name}: ${r.error}`);
+  } catch (err) {
+    console.error('Boot pool/model sync failed:', err);
+  }
+});
+
+setInterval(async () => {
+  try {
+    const dbx = readDb();
+    let changed = false;
+    const added = topUpCodePools(dbx, CODE_POOL_TARGET);
+    if (added) {
+      changed = true;
+      console.log(`[pool] periodic refill +${added}`);
+    }
+    // 每小时探测渠道是否可用（并顺带刷新上游模型列表）
+    const healthResults = await probeAllProviderHealth(dbx);
+    changed = true;
+    const ok = healthResults.filter(r => r.ok && !r.skipped).length;
+    const bad = healthResults.filter(r => !r.ok);
+    console.log(`[health] hourly probe: ${ok} ok, ${bad.length} down`);
+    for (const r of bad) console.warn(`[health] down ${r.name}: ${r.error}`);
+    if (changed) writeDb(dbx);
+  } catch (err) {
+    console.error('[pool/models] periodic job failed:', err);
+  }
+}, 60 * 60 * 1000);
+
