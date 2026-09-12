@@ -1,0 +1,11 @@
+{
+  "name": "relay-station",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A polished, self-hosted AI API relay dashboard",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  }
+}
