@@ -26,10 +26,12 @@
 
 ## 当前已实现功能
 
-- 注册与登录，密码使用 Node `scrypt` 哈希
+- 注册与登录：登录标识为用户名或邮箱 + 密码；注册写入唯一 `username`；`safeUser` 返回 `username`
+- 默认管理员用户名来自 `ADMIN_USERNAME`（默认 `ashura`），可用用户名或邮箱登录；密码仅来自 `ADMIN_PASSWORD`，仓库中不要写入真实密码
+- 用户可创建多个 API Key：选择允许的模型，设置消费上限 / Token 上限 / RPM / TPM；`/v1/chat/completions` 与 `/api/chat` 会强制校验
 - 会话令牌：内存 Map + 可选持久化到 `db.sessions`（启动时加载）
 - `POST /api/auth/logout` 清除会话
-- 每个用户独立平台 API Key：`rk_...`
+- 每个用户可有多个平台 API Key：`rk_...`（`GET/POST /api/keys`，`PUT/DELETE /api/keys/:id`，`POST /api/keys/:id/rotate`）
 - OpenAI Chat Completions 兼容入口：`POST /v1/chat/completions`
 - 网页测试入口：`POST /api/chat`
 - **流式响应**：`stream: true` 时转发上游 SSE；结束时按 usage 或估算结算并释放预留；客户端中断时释放预留
@@ -64,7 +66,16 @@ Content-Type: application/json
 }
 ```
 
-也支持 `x-api-key: rk_user_key`。
+也支持 `x-api-key: rk_user_key`。密钥可限制 `models`、`spendLimit`、`tokenLimit`、`rpm`、`tpm`；空模型列表表示允许全部已上线模型。
+
+```text
+GET    /api/models
+GET    /api/keys
+POST   /api/keys                 # { name, models[], spendLimit, tokenLimit, rpm, tpm, enabled }
+PUT    /api/keys/:id
+DELETE /api/keys/:id
+POST   /api/keys/:id/rotate
+```
 
 已支持 `stream: true`：建立流前足额预留；流结束精确结算；断流/错误释放预留。
 
@@ -144,7 +155,8 @@ GET  /api/admin/orders           # 卡密兑换订单 stub
 ```powershell
 $env:PORT="8787"
 $env:ADMIN_EMAIL="admin@your-domain.com"
-$env:ADMIN_PASSWORD="use-a-long-random-password"
+$env:ADMIN_USERNAME="ashura"
+$env:ADMIN_PASSWORD="change-me"
 $env:CONTACT_EMAIL="support@your-domain.com"
 $env:CONTACT_WECHAT="YourSupportWechat"
 $env:PAYMENT_QR="/payment-qr.svg"

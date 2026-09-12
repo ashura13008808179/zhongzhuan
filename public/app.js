@@ -25,16 +25,123 @@ function shell(title,kicker,html){$('#pageTitle').textContent=title;page.innerHT
 function render(name){
   document.querySelectorAll('[data-page]').forEach(a=>a.classList.toggle('active',a.dataset.page===name));
   if(name==='overview')shell('数据概览','ACCOUNT OVERVIEW',`<div class="metric-grid"><article><small>账户余额</small><strong>¥${me.balance.toFixed(2)}</strong><span class="green">可用于 API 调用</span></article><article><small>累计请求</small><strong>${data.stats.requests.toLocaleString()}</strong><span>成功率 ${data.stats.requests?Math.round(data.stats.success/data.stats.requests*100):100}%</span></article><article><small>剩余 API 配额</small><strong>${data.stats.availableTokens.toLocaleString()}</strong><span>已使用 ${data.stats.usedTokens.toLocaleString()} / ${data.stats.quotaTokens.toLocaleString()}</span></article><article><small>邀请奖励</small><strong>¥${me.bonusBalance.toFixed(2)}</strong><span>已邀请 ${data.inviteCount} 位用户</span></article></div><div class="content-grid"><section class="card"><div class="card-head"><div><p class="eyebrow">RECENT REQUESTS</p><h2>最近请求</h2></div><button class="link-btn" data-page="logs">查看全部 →</button></div><table><thead><tr><th>模型</th><th>Token</th><th>延迟</th><th>状态</th><th>时间</th></tr></thead><tbody>${data.logs.slice(0,8).map(l=>`<tr><td>${esc(l.model)}</td><td>${l.tokens}</td><td>${l.latency}ms</td><td><span class="tag success">成功</span></td><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无请求记录</td></tr>'}</tbody></table></section><section class="card balance-card"><p class="eyebrow">QUICK ACTIONS</p><h2>快捷操作</h2><button class="action" data-page="api"><span>◈</span><div><b>查看 API 接入</b><small>复制你的专属调用密钥</small></div><i>→</i></button><button class="action" data-page="billing"><span>◇</span><div><b>卡密充值</b><small>充值后立即到账</small></div><i>→</i></button><button class="action" data-page="referral"><span>♧</span><div><b>邀请好友</b><small>每位好友奖励 ¥20</small></div><i>→</i></button></section></div>`);
-  if(name==='api'){shell('API 接入','DEVELOPER ACCESS',`<section class="card api-card"><div class="card-head"><div><p class="eyebrow">YOUR RELAY KEY</p><h2>专属 API 密钥</h2></div><span class="tag success">已启用</span></div><p class="sub">将此密钥放入你的应用中，即可调用 Relay Station 的统一接口。</p><div class="key-box"><code id="keyValue">${esc(me.apiKey)}</code><button id="copyKey">复制密钥</button></div><div class="code-box"><div><span class="method">POST</span> https://你的域名/v1/chat/completions</div><pre>curl https://你的域名/v1/chat/completions \\
-  -H "Authorization: Bearer ${esc(me.apiKey)}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"你好"}]}'</pre></div><p class="warning">请妥善保管密钥。该密钥仅用于访问 Relay Station API。</p></section>`);$('#copyKey')?.addEventListener('click',()=>{navigator.clipboard.writeText(me.apiKey);$('#copyKey').textContent='已复制 ✓'});}
+  if(name==='api'){renderApiKeys();return;}
   if(name==='logs')shell('使用日志','REQUEST LOGS',`<section class="card"><div class="card-head"><div><p class="eyebrow">AUDIT TRAIL</p><h2>全部请求记录</h2></div><span class="sub">最近 30 条</span></div><table><thead><tr><th>时间</th><th>模型</th><th>Token</th><th>延迟</th><th>状态</th></tr></thead><tbody>${data.logs.map(l=>`<tr><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td><td>${esc(l.model)}</td><td>${l.tokens}</td><td>${l.latency}ms</td><td><span class="tag success">成功</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无日志</td></tr>'}</tbody></table></section>`);
   if(name==='billing'){shell('卡密充值','BILLING & RECHARGE',`<div class="billing-grid"><section class="card recharge-card"><p class="eyebrow">REDEEM CODE</p><h2>使用充值卡密</h2><p class="sub">输入卡密，余额会立即到账。</p><form id="redeemForm"><input id="redeemCode" placeholder="例如：RELAY-XXXX-XXXX" required><button class="primary-btn">立即充值 ↗</button></form><div id="redeemMsg" class="inline-msg"></div></section><section class="card"><p class="eyebrow">PAYMENT</p><h2>购买卡密</h2><p class="sub">请联系支持获取卡密，或扫码付款后联系客服。</p><div class="qr-placeholder"><img src="${esc(window.appConfig?.paymentQr||'/payment-qr.svg')}" alt="微信收款二维码" onerror="this.style.display='none'"><span>微信收款二维码<br><small>由服务端 PAYMENT_QR 配置</small></span></div><p class="contact-line">微信：${esc(window.appConfig?.contactWechat||'RelaySupport')}</p></section></div>`);$('#redeemForm')?.addEventListener('submit',async e=>{e.preventDefault();try{const j=await api('/api/recharge/redeem',{method:'POST',body:JSON.stringify({code:$('#redeemCode').value.trim()})});me=j.user;$('#redeemMsg').textContent=j.message;$('#redeemMsg').className='inline-msg ok'}catch(err){$('#redeemMsg').textContent=err.message;$('#redeemMsg').className='inline-msg'}});}
   if(name==='referral'){shell('邀请返利','REFERRAL PROGRAM',`<section class="card referral-card"><div class="referral-hero"><div><p class="eyebrow">YOUR INVITE CODE</p><h2>邀请好友，一起获得奖励</h2><p class="sub">好友注册后你得 ¥20，好友得 ¥10。</p></div><div class="reward">¥20<span>/ 人</span></div></div><div class="invite-box"><code>${data.inviteCode}</code><button id="copyInvite">复制邀请码</button></div><div class="ref-stats"><div><b>${data.inviteCount}</b><span>已邀请好友</span></div><div><b>¥${me.bonusBalance.toFixed(2)}</b><span>累计奖励</span></div></div></section>`);$('#copyInvite')?.addEventListener('click',()=>{navigator.clipboard.writeText(data.inviteCode);$('#copyInvite').textContent='已复制 ✓'});}
   if(name==='contact')shell('联系支持','SUPPORT CENTER',`<div class="contact-grid"><section class="card"><p class="eyebrow">WE ARE HERE TO HELP</p><h2>需要帮助？</h2><p class="sub">遇到接入、充值或账单问题，工作日我们会尽快回复。</p><div class="contact-item"><span>◎</span><div><small>客服微信</small><b>${esc(window.appConfig?.contactWechat||'RelaySupport')}</b></div></div><div class="contact-item"><span>✉</span><div><small>支持邮箱</small><b>${esc(window.appConfig?.contactEmail||'support@example.com')}</b></div></div></section><section class="card"><p class="eyebrow">ACCOUNT</p><h2>账号信息</h2><div class="account-row"><span>用户名</span><b>@${esc(me.username||'-')}</b></div><div class="account-row"><span>显示名称</span><b>${esc(me.name)}</b></div><div class="account-row"><span>登录邮箱</span><b>${esc(me.email)}</b></div><div class="account-row"><span>注册时间</span><b>${new Date(me.createdAt).toLocaleDateString('zh-CN')}</b></div></section></div>`);
   page.querySelectorAll('[data-page]').forEach(a=>a.onclick=()=>render(a.dataset.page));
   document.querySelectorAll('[data-page]').forEach(a=>a.onclick=()=>render(a.dataset.page));
+}
+
+function keyLimitLabel(key){
+  const parts=[];
+  parts.push(key.spendLimit>0?`消费 ¥${Number(key.spendUsed||0).toFixed(2)} / ${Number(key.spendLimit).toFixed(2)}`:'消费不限');
+  parts.push(key.tokenLimit>0?`Token ${Number(key.tokenUsed||0).toLocaleString()} / ${Number(key.tokenLimit).toLocaleString()}`:'Token 不限');
+  if(key.rpm>0)parts.push(`RPM ${key.rpm}`);
+  if(key.tpm>0)parts.push(`TPM ${key.tpm.toLocaleString()}`);
+  return parts.join(' · ');
+}
+
+function modelPickerHtml(selected, catalog, prefix){
+  const chosen=new Set(selected||[]);
+  const all=[...new Set([...(catalog||[]),...chosen])];
+  return `<div class="model-picker" data-picker="${prefix}">
+    <div class="model-chip-row">${all.map(m=>`<label class="model-chip"><input type="checkbox" value="${esc(m)}" ${chosen.has(m)?'checked':''}><span>${esc(m)}</span></label>`).join('')||'<span class="sub">管理员尚未发布模型，可不选（表示允许全部）。</span>'}</div>
+    <p class="sub">不勾选任何模型表示该密钥可调用全部已上线模型。</p>
+  </div>`;
+}
+
+function readPicker(prefix){
+  return [...document.querySelectorAll(`[data-picker="${prefix}"] input[type="checkbox"]:checked`)].map(i=>i.value);
+}
+
+function keyFormFields(prefix, key, models){
+  const k=key||{};
+  return `<label>密钥名称<input data-kf="${prefix}-name" value="${esc(k.name||'')}" placeholder="例如：生产环境" required></label>
+    <div class="span-2"><p class="field-label">允许的模型</p>${modelPickerHtml(k.models||[],models,prefix)}</div>
+    <label>消费上限（元）<input data-kf="${prefix}-spend" type="number" min="0" step="0.01" value="${esc(k.spendLimit??0)}"><small class="hint">0 表示不限制，仍受账户余额约束</small></label>
+    <label>Token 上限<input data-kf="${prefix}-tokens" type="number" min="0" step="1" value="${esc(k.tokenLimit??0)}"><small class="hint">0 表示不限制，仍受账户配额约束</small></label>
+    <label>每分钟请求数 RPM<input data-kf="${prefix}-rpm" type="number" min="0" step="1" value="${esc(k.rpm??0)}"><small class="hint">0 表示使用平台默认</small></label>
+    <label>每分钟 Token 数 TPM<input data-kf="${prefix}-tpm" type="number" min="0" step="1" value="${esc(k.tpm??0)}"><small class="hint">0 表示不限制</small></label>
+    <label class="check-label"><input data-kf="${prefix}-enabled" type="checkbox" ${k.enabled!==false?'checked':''}> 启用此密钥</label>`;
+}
+
+function readKeyForm(prefix){
+  const num=s=>Number($( `[data-kf="${prefix}-${s}"]`)?.value||0);
+  return {
+    name: $(`[data-kf="${prefix}-name"]`)?.value.trim()||'未命名密钥',
+    models: readPicker(prefix),
+    spendLimit: num('spend'),
+    tokenLimit: Math.floor(num('tokens')),
+    rpm: Math.floor(num('rpm')),
+    tpm: Math.floor(num('tpm')),
+    enabled: Boolean($(`[data-kf="${prefix}-enabled"]`)?.checked)
+  };
+}
+
+async function renderApiKeys(){
+  shell('API 接入','DEVELOPER ACCESS','<section class="card"><p class="sub">正在加载密钥…</p></section>');
+  try{
+    const [{keys},{models}]=await Promise.all([api('/api/keys'),api('/api/models')]);
+    const first=keys[0];
+    const sample=first?.key||'rk_your_key';
+    shell('API 接入','DEVELOPER ACCESS',`<section class="card">
+      <div class="card-head"><div><p class="eyebrow">API KEYS</p><h2>密钥管理</h2><p class="sub">创建密钥时可选择允许调用的模型，并设置消费、Token 与速率上限。限制会在调用 /v1/chat/completions 与网页调试接口时生效。</p></div></div>
+      <div class="key-list">${keys.map(k=>`<article class="key-card" data-key-id="${esc(k.id)}">
+        <div class="card-head">
+          <div><h2>${esc(k.name)}</h2><p class="sub">${esc(keyLimitLabel(k))}</p></div>
+          <span class="tag ${k.enabled?'success':'danger'}">${k.enabled?'已启用':'已停用'}</span>
+        </div>
+        <div class="key-box"><code>${esc(k.key)}</code><button type="button" data-copy-key="${esc(k.key)}">复制密钥</button></div>
+        <div class="model-chip-row static">${(k.models||[]).length?k.models.map(m=>`<span class="model-chip on">${esc(m)}</span>`).join(''):'<span class="sub">全部模型</span>'}</div>
+        <details class="key-edit"><summary>编辑限制</summary>
+          <form class="form-grid key-edit-form" data-edit-key="${esc(k.id)}">${keyFormFields('e-'+k.id,k,models)}<button class="primary-btn" type="submit">保存</button></form>
+        </details>
+        <div class="ops-cell">
+          <button class="ghost-btn" data-rotate-key="${esc(k.id)}">轮换密钥</button>
+          <button class="ghost-btn danger" data-delete-key="${esc(k.id)}">删除</button>
+        </div>
+      </article>`).join('')||'<p class="sub">还没有密钥。</p>'}</div>
+    </section>
+    <section class="card" style="margin-top:16px">
+      <p class="eyebrow">CREATE KEY</p>
+      <h2>创建新密钥</h2>
+      <form id="createKeyForm" class="form-grid">${keyFormFields('new',{name:'新密钥',models:[],spendLimit:0,tokenLimit:0,rpm:0,tpm:0,enabled:true},models)}<button class="primary-btn" type="submit">创建密钥</button></form>
+      <div id="keyMsg" class="inline-msg"></div>
+    </section>
+    <section class="card" style="margin-top:16px">
+      <p class="eyebrow">QUICK START</p>
+      <h2>调用示例</h2>
+      <div class="code-box"><div><span class="method">POST</span> https://你的域名/v1/chat/completions</div><pre>curl https://你的域名/v1/chat/completions \\
+  -H "Authorization: Bearer ${esc(sample)}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"${esc((models[0]||'gpt-4o-mini'))}","messages":[{"role":"user","content":"你好"}]}'</pre></div>
+      <p class="warning">请妥善保管密钥。该密钥仅用于访问 Relay Station API。</p>
+    </section>`);
+    const flash=(t,ok=false)=>{const e=$('#keyMsg');if(e){e.textContent=t;e.className=`inline-msg ${ok?'ok':''}`;}};
+    $('#createKeyForm')?.addEventListener('submit',async e=>{
+      e.preventDefault();
+      try{await api('/api/keys',{method:'POST',body:JSON.stringify(readKeyForm('new'))});flash('已创建密钥',true);renderApiKeys();}
+      catch(err){flash(err.message);}
+    });
+    page.querySelectorAll('[data-edit-key]').forEach(form=>form.onsubmit=async e=>{
+      e.preventDefault();
+      try{await api(`/api/keys/${form.dataset.editKey}`,{method:'PUT',body:JSON.stringify(readKeyForm('e-'+form.dataset.editKey))});flash('已保存',true);renderApiKeys();}
+      catch(err){flash(err.message);}
+    });
+    page.querySelectorAll('[data-copy-key]').forEach(btn=>btn.onclick=()=>{navigator.clipboard.writeText(btn.dataset.copyKey);btn.textContent='已复制 ✓';});
+    page.querySelectorAll('[data-rotate-key]').forEach(btn=>btn.onclick=async()=>{
+      try{await api(`/api/keys/${btn.dataset.rotateKey}/rotate`,{method:'POST'});flash('密钥已轮换，请使用新密钥',true);renderApiKeys();}
+      catch(err){flash(err.message);}
+    });
+    page.querySelectorAll('[data-delete-key]').forEach(btn=>btn.onclick=async()=>{
+      try{await api(`/api/keys/${btn.dataset.deleteKey}`,{method:'DELETE'});flash('已删除',true);renderApiKeys();}
+      catch(err){flash(err.message);}
+    });
+  }catch(err){
+    shell('API 接入','DEVELOPER ACCESS',`<section class="card"><h2>无法加载密钥</h2><p class="sub">${esc(err.message)}</p></section>`);
+  }
 }
 
 fetch('/api/config').then(r=>r.json()).then(c=>window.appConfig=c);

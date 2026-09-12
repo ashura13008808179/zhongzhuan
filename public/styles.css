@@ -45,3 +45,16 @@
 .legal-card ul{padding-left:18px}
 .legal-back{color:var(--lime);text-decoration:none;font-size:12px;display:inline-block;margin-bottom:24px}
 @media(max-width:850px){.form-grid,.model-price-head,.model-price-row{grid-template-columns:1fr}.admin-table{display:block;overflow:auto}}
+.key-list{display:grid;gap:14px;margin-top:8px}
+.key-card{background:#10131a;border:1px solid #2a303d;border-radius:10px;padding:16px}
+.key-card h2{font-size:16px;margin:0 0 4px}
+.key-edit{margin:12px 0}
+.key-edit summary{cursor:pointer;color:var(--lime);font-size:12px}
+.key-edit-form{margin-top:12px}
+.model-picker{margin-top:6px}
+.model-chip-row{display:flex;flex-wrap:wrap;gap:8px}
+.model-chip{display:inline-flex;align-items:center;gap:6px;background:#1a2230;border:1px solid #334056;border-radius:999px;padding:5px 10px;font-size:11px;color:#c5cddd}
+.model-chip input{width:13px;height:13px;margin:0}
+.model-chip.on{background:#263326;border-color:#3d4f35;color:var(--lime)}
+.field-label{font-size:11px;color:var(--muted);margin:0 0 6px}
+.hint{display:block;color:#6c7688;font-size:10px;margin-top:4px}

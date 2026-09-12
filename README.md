@@ -20,7 +20,8 @@ $env:UPSTREAM_MODEL="gpt-4o-mini"
 $env:UPSTREAM_PRICE_PER_1K="0.01"
 $env:BALANCE_SAFETY_BUFFER="0.01"
 $env:ADMIN_EMAIL="admin@your-domain.com"
-$env:ADMIN_PASSWORD="change-to-a-strong-password"
+$env:ADMIN_USERNAME="ashura"
+$env:ADMIN_PASSWORD="change-me"
 $env:CONTACT_EMAIL="support@your-domain.com"
 $env:CONTACT_WECHAT="YourSupportWechat"
 $env:PAYMENT_QR="/payment-qr.svg"
@@ -28,7 +29,7 @@ $env:RECHARGE_CODES="RELAY-100-A:100,RELAY-300-B:300"
 npm start
 ```
 
-`RECHARGE_CODES` 仅用于首次启动时导入卡密，格式为 `卡密:金额:Token配额`，多个卡密用逗号分隔。例如 `RELAY-100-A:100:1000000` 表示充值 ¥100 并增加 1,000,000 Token 配额；省略第三段时默认增加 100,000 Token。用户注册时会自动生成自己的 Relay API Key；调用兼容接口时使用：
+`RECHARGE_CODES` 仅用于首次启动时导入卡密，格式为 `卡密:金额:Token配额`，多个卡密用逗号分隔。例如 `RELAY-100-A:100:1000000` 表示充值 ¥100 并增加 1,000,000 Token 配额；省略第三段时默认增加 100,000 Token。用户可在「API 接入」创建多个 Relay API Key，勾选允许的模型，并设置消费上限、Token 上限、每分钟请求数（RPM）和每分钟 Token 数（TPM）。这些限制在 `POST /v1/chat/completions` 与 `POST /api/chat` 上强制执行。调用兼容接口时使用：
 
 每个账号都有独立的 `quotaTokens`、`usedTokens` 和并发预留额度。用户配额按上游实际 Token 消耗的 2 倍计费：上游返回 `usage.total_tokens = N` 时，账号扣除 `2N`。请求在连接上游前会按 2 倍上限预留额度；配额不足直接返回 HTTP `402`，不会建立上游连接。`max_tokens` 会被服务端限制在账号剩余额度内，前端无法绕过。用户界面和日志中的 `tokens` 显示计费 Token（2N），日志另存 `upstreamTokens` 作为上游实际值，并保留 `billedTokens` 与倍率字段用于核对。
 
@@ -50,7 +51,7 @@ Content-Type: application/json
 
 ## 多渠道与实时定价
 
-使用 `ADMIN_EMAIL` 和 `ADMIN_PASSWORD` 登录后，侧栏会显示“运营配置”。在这里可以实时切换 2x、3x、4x 计费倍率，并录入多个模型渠道。渠道配置按模型名称路由，每个渠道分别填写：
+使用 `ADMIN_USERNAME`（默认 `ashura`）或 `ADMIN_EMAIL` 与 `ADMIN_PASSWORD` 登录后，侧栏会显示“运营配置”。在这里可以实时切换 2x、3x、4x 计费倍率，并录入多个模型渠道。渠道配置按模型名称路由，每个渠道分别填写：
 
 - `models`：该渠道负责的模型数组；例如 `gpt-4o-mini`
 - `inputPricePer1K`：该渠道输入每千 Token 实际成本

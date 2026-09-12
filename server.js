@@ -11,6 +11,10 @@ const dbFile = path.join(dataDir, 'db.json');
 const PORT = Number(process.env.PORT || 8787);
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@example.com';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'change-this-password';
+const ADMIN_USERNAME = (() => {
+  const raw = String(process.env.ADMIN_USERNAME || 'ashura').trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9_-]{2,31}$/.test(raw) ? raw : 'ashura';
+})();
 const CONTACT_EMAIL = process.env.CONTACT_EMAIL || 'support@example.com';
 const CONTACT_WECHAT = process.env.CONTACT_WECHAT || 'RelaySupport';
 const PAYMENT_QR = process.env.PAYMENT_QR || '/payment-qr.svg';
@@ -41,6 +45,111 @@ function verify(password, stored) {
   }
 }
 function userKey() { return `rk_${crypto.randomBytes(20).toString('hex')}`; }
+const keyRateBuckets = new Map();
+const MAX_USER_KEYS = 20;
+
+function catalogModels(db) {
+  const set = new Set();
+  for (const p of db.settings?.providers || []) {
+    if (p.enabled === false) continue;
+    for (const m of p.models || []) if (m) set.add(String(m));
+    if (p.defaultModel) set.add(String(p.defaultModel));
+  }
+  return [...set];
+}
+
+function normalizeApiKey(item, previous = null) {
+  const models = Array.isArray(item?.models)
+    ? [...new Set(item.models.map(m => String(m).trim()).filter(Boolean))]
+    : (previous?.models || []);
+  return {
+    id: String(item?.id || previous?.id || id('key')),
+    name: String(item?.name || previous?.name || '未命名密钥').trim().slice(0, 40) || '未命名密钥',
+    key: previous?.key || item?.key || userKey(),
+    models,
+    spendLimit: Math.max(0, Number(item?.spendLimit ?? previous?.spendLimit ?? 0) || 0),
+    tokenLimit: Math.max(0, Math.floor(Number(item?.tokenLimit ?? previous?.tokenLimit ?? 0) || 0)),
+    rpm: Math.max(0, Math.min(10000, Math.floor(Number(item?.rpm ?? previous?.rpm ?? 0) || 0))),
+    tpm: Math.max(0, Math.min(10_000_000, Math.floor(Number(item?.tpm ?? previous?.tpm ?? 0) || 0))),
+    spendUsed: Math.max(0, Number(previous?.spendUsed || 0) || 0),
+    tokenUsed: Math.max(0, Number(previous?.tokenUsed || 0) || 0),
+    reservedSpend: Math.max(0, Number(previous?.reservedSpend || 0) || 0),
+    reservedTokens: Math.max(0, Number(previous?.reservedTokens || 0) || 0),
+    enabled: item?.enabled !== false,
+    createdAt: previous?.createdAt || item?.createdAt || new Date().toISOString()
+  };
+}
+
+function publicApiKey(key) {
+  return {
+    id: key.id,
+    name: key.name,
+    key: key.key,
+    keyMasked: `${String(key.key).slice(0, 6)}****${String(key.key).slice(-4)}`,
+    models: key.models || [],
+    spendLimit: key.spendLimit || 0,
+    tokenLimit: key.tokenLimit || 0,
+    rpm: key.rpm || 0,
+    tpm: key.tpm || 0,
+    spendUsed: Number(key.spendUsed || 0),
+    tokenUsed: Number(key.tokenUsed || 0),
+    enabled: key.enabled !== false,
+    createdAt: key.createdAt
+  };
+}
+
+function ensureUserKeys(user) {
+  user.apiKeys ??= [];
+  if (!user.apiKey) user.apiKey = userKey();
+  if (!user.apiKeys.some(k => k.key === user.apiKey)) {
+    user.apiKeys.unshift(normalizeApiKey({
+      name: '默认密钥',
+      key: user.apiKey,
+      models: [],
+      spendLimit: 0,
+      tokenLimit: 0,
+      rpm: 0,
+      tpm: 0,
+      enabled: true,
+      createdAt: user.createdAt
+    }));
+  }
+  user.apiKeys = user.apiKeys.map(k => normalizeApiKey(k, k));
+}
+
+function findByApiSecret(db, secret) {
+  if (!secret) return null;
+  for (const u of db.users) {
+    ensureUserKeys(u);
+    const key = u.apiKeys.find(k => k.key === secret);
+    if (key) return { user: u, key };
+    if (u.apiKey === secret) return { user: u, key: u.apiKeys[0] || null };
+  }
+  return null;
+}
+
+function keyRateOk(res, key, tokensEstimate) {
+  const rpm = key.rpm > 0 ? key.rpm : 0;
+  const tpm = key.tpm > 0 ? key.tpm : 0;
+  if (!rpm && !tpm) return true;
+  const now = Date.now();
+  let bucket = keyRateBuckets.get(key.id);
+  if (!bucket || now - bucket.windowStart >= RATE_WINDOW_MS) {
+    bucket = { windowStart: now, requests: 0, tokens: 0 };
+    keyRateBuckets.set(key.id, bucket);
+  }
+  if (rpm && bucket.requests + 1 > rpm) {
+    fail(res, 429, '该密钥已达到每分钟请求上限');
+    return false;
+  }
+  if (tpm && bucket.tokens + tokensEstimate > tpm) {
+    fail(res, 429, '该密钥已达到每分钟 Token 上限');
+    return false;
+  }
+  bucket.requests += 1;
+  bucket.tokens += tokensEstimate;
+  return true;
+}
 function json(res, status, body) { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); }
 function fail(res, status, error) { return json(res, status, { error }); }
 async function body(req) { let raw = ''; for await (const chunk of req) raw += chunk; try { return raw ? JSON.parse(raw) : {}; } catch { return null; } }
@@ -123,6 +232,44 @@ function ensureUsername(user, db) {
   if (user.username && USERNAME_RE.test(user.username) && !usernameTaken(db, user.username, user.id)) return;
   const seed = user.username || user.name || (user.email || '').split('@')[0] || 'user';
   user.username = allocateUsername(db, seed, user.id);
+}
+
+function ensureAdminUser(db) {
+  const email = String(ADMIN_EMAIL || '').trim().toLowerCase();
+  let admin = db.users.find(x => x.id === 'usr_admin')
+    || (email && db.users.find(x => (x.email || '').toLowerCase() === email))
+    || db.users.find(x => x.role === 'admin');
+  for (const u of db.users) {
+    if ((!admin || u.id !== admin.id) && (u.username || '').toLowerCase() === ADMIN_USERNAME) {
+      u.username = allocateUsername(db, `${u.username || 'user'}_u`, u.id);
+    }
+  }
+  if (!admin) {
+    db.users.push({
+      id: 'usr_admin',
+      email: email || `${ADMIN_USERNAME}@example.com`,
+      username: ADMIN_USERNAME,
+      name: 'Admin',
+      password: hash(ADMIN_PASSWORD),
+      apiKey: userKey(),
+      balance: 0,
+      bonusBalance: 0,
+      quotaTokens: 0,
+      usedTokens: 0,
+      reservedTokens: 0,
+      reservedBalance: 0,
+      accountActive: false,
+      role: 'admin',
+      invited: 0,
+      inviteCode: 'ADMIN',
+      createdAt: new Date().toISOString()
+    });
+    ensureUserKeys(db.users[db.users.length - 1]);
+    return;
+  }
+  admin.username = ADMIN_USERNAME;
+  admin.role = 'admin';
+  if (email) admin.email = email;
 }
 
 function findUserByIdentifier(db, identifier) {
@@ -284,7 +431,7 @@ function updateProviderHealth(db, providerId, ok, errorMessage = null) {
     lastError: ok ? null : String(errorMessage || 'upstream_error').slice(0, 300)
   };
 }
-function settleUsage(db, user, provider, usage, rate, tokenReservation, amountReservation, started, model, status = 'success') {
+function settleUsage(db, user, provider, usage, rate, tokenReservation, amountReservation, started, model, status = 'success', apiKeyRec = null) {
   const upstreamTokens = Math.max(0, Number(usage.total_tokens || ((usage.prompt_tokens || 0) + (usage.completion_tokens || 0))));
   const billedTokens = Math.min(upstreamTokens * rate, tokenReservation);
   const upstreamCost = providerCost(provider, usage, model);
@@ -293,6 +440,14 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
   user.reservedBalance = Math.max(0, (user.reservedBalance || 0) - amountReservation);
   user.usedTokens = Math.min(user.quotaTokens || 0, (user.usedTokens || 0) + billedTokens);
   user.balance = Math.max(0, (user.balance || 0) - chargedAmount);
+  if (apiKeyRec) {
+    apiKeyRec.reservedTokens = Math.max(0, (apiKeyRec.reservedTokens || 0) - tokenReservation);
+    apiKeyRec.reservedSpend = Math.max(0, (apiKeyRec.reservedSpend || 0) - amountReservation);
+    apiKeyRec.tokenUsed = (apiKeyRec.tokenUsed || 0) + billedTokens;
+    apiKeyRec.spendUsed = (apiKeyRec.spendUsed || 0) + chargedAmount;
+    if (apiKeyRec.tokenLimit > 0) apiKeyRec.tokenUsed = Math.min(apiKeyRec.tokenLimit, apiKeyRec.tokenUsed);
+    if (apiKeyRec.spendLimit > 0) apiKeyRec.spendUsed = Math.min(apiKeyRec.spendLimit, apiKeyRec.spendUsed);
+  }
   if (user.balance <= safetyBuffer(provider, rate, model)) {
     user.balance = 0;
     user.accountActive = false;
@@ -300,6 +455,7 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
   db.logs.unshift({
     id: id('log'),
     userId: user.id,
+    apiKeyId: apiKeyRec?.id || null,
     model,
     providerId: provider.id,
     tokens: upstreamTokens,
@@ -314,9 +470,13 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
   db.logs = db.logs.slice(0, 3000);
   return { billedTokens, chargedAmount, upstreamTokens, upstreamCost };
 }
-function releaseReserve(user, tokenReservation, amountReservation) {
+function releaseReserve(user, tokenReservation, amountReservation, apiKeyRec = null) {
   user.reservedTokens = Math.max(0, (user.reservedTokens || 0) - tokenReservation);
   user.reservedBalance = Math.max(0, (user.reservedBalance || 0) - amountReservation);
+  if (apiKeyRec) {
+    apiKeyRec.reservedTokens = Math.max(0, (apiKeyRec.reservedTokens || 0) - tokenReservation);
+    apiKeyRec.reservedSpend = Math.max(0, (apiKeyRec.reservedSpend || 0) - amountReservation);
+  }
 }
 function estimateTokensFromText(text) {
   if (!text) return 0;
@@ -338,9 +498,15 @@ async function fetchUpstream(provider, payload, outputBudget, model) {
   }
 }
 
-async function chat(req, res, db, user) {
+async function chat(req, res, db, user, apiKeyRec = null) {
   const payload = await body(req);
   if (!payload || !Array.isArray(payload.messages) || !payload.messages.length) return fail(res, 400, 'messages 不能为空');
+  if (apiKeyRec && apiKeyRec.enabled === false) return fail(res, 403, '该 API 密钥已停用');
+
+  const requestedModel = String(payload.model || '');
+  if (apiKeyRec && Array.isArray(apiKeyRec.models) && apiKeyRec.models.length && requestedModel && !apiKeyRec.models.includes(requestedModel)) {
+    return fail(res, 403, '该密钥无权调用此模型');
+  }
   if (user.accountActive === false) return fail(res, 402, '账户余额不足，API 已暂停，请充值后继续使用');
 
   const candidates = providersForModel(payload, db);
@@ -348,37 +514,56 @@ async function chat(req, res, db, user) {
 
   const primary = candidates[0];
   const model = String(payload.model || primary.defaultModel || '');
+  if (apiKeyRec && Array.isArray(apiKeyRec.models) && apiKeyRec.models.length && !apiKeyRec.models.includes(model)) {
+    return fail(res, 403, '该密钥无权调用此模型');
+  }
   const rate = multiplier(db);
   const inputReserve = Math.ceil(JSON.stringify(payload.messages).length * 2) + 256;
   const requestedOutput = Math.max(1, Math.min(Number(payload.max_tokens) || DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOKENS));
-  const tokenBudget = Math.floor(availableTokens(user) / rate);
-  if (tokenBudget <= inputReserve) return fail(res, 402, 'API 配额不足，无法发起请求');
+  if (apiKeyRec && !keyRateOk(res, apiKeyRec, inputReserve + requestedOutput)) return;
+  let tokenBudget = Math.floor(availableTokens(user) / rate);
+  if (apiKeyRec && apiKeyRec.tokenLimit > 0) {
+    const keyLeft = Math.max(0, apiKeyRec.tokenLimit - (apiKeyRec.tokenUsed || 0) - (apiKeyRec.reservedTokens || 0));
+    tokenBudget = Math.min(tokenBudget, Math.floor(keyLeft / rate));
+  }
+  if (tokenBudget <= inputReserve) return fail(res, 402, apiKeyRec?.tokenLimit > 0 ? '该密钥 Token 额度不足' : 'API 配额不足，无法发起请求');
 
-  const availableBalance = Math.max(0, (user.balance || 0) - (user.reservedBalance || 0));
+  let availableBalance = Math.max(0, (user.balance || 0) - (user.reservedBalance || 0));
+  if (apiKeyRec && apiKeyRec.spendLimit > 0) {
+    availableBalance = Math.min(availableBalance, Math.max(0, apiKeyRec.spendLimit - (apiKeyRec.spendUsed || 0) - (apiKeyRec.reservedSpend || 0)));
+  }
   const safety = safetyBuffer(primary, rate, model);
   const inputEstimate = estimatedCost(primary, inputReserve, 0, model) * rate;
   const outputUnitPrice = Math.max(modelPrice(primary, model, 'outputPricePer1K') / 1000 * rate, Number.EPSILON);
   const moneyBudget = Math.floor(Math.max(0, availableBalance - safety - inputEstimate) / outputUnitPrice);
   const outputBudget = Math.min(requestedOutput, tokenBudget - inputReserve, moneyBudget);
   if (outputBudget < 1) {
-    user.balance = 0;
-    user.accountActive = false;
-    writeDb(db);
-    return fail(res, 402, '账户余额接近用尽，API 已暂停，请充值后继续使用');
+    if (!apiKeyRec?.spendLimit) {
+      user.balance = 0;
+      user.accountActive = false;
+      writeDb(db);
+    }
+    return fail(res, 402, apiKeyRec?.spendLimit > 0 ? '该密钥消费额度不足' : '账户余额接近用尽，API 已暂停，请充值后继续使用');
   }
 
   const upstreamReservation = inputReserve + outputBudget;
   const tokenReservation = upstreamReservation * rate;
   const amountReservation = estimatedCost(primary, inputReserve, outputBudget, model) * rate;
   if (availableBalance < amountReservation + safety) {
-    user.balance = 0;
-    user.accountActive = false;
-    writeDb(db);
-    return fail(res, 402, '账户余额接近用尽，API 已暂停，请充值后继续使用');
+    if (!apiKeyRec?.spendLimit) {
+      user.balance = 0;
+      user.accountActive = false;
+      writeDb(db);
+    }
+    return fail(res, 402, apiKeyRec?.spendLimit > 0 ? '该密钥消费额度不足' : '账户余额接近用尽，API 已暂停，请充值后继续使用');
   }
 
   user.reservedTokens = (user.reservedTokens || 0) + tokenReservation;
   user.reservedBalance = (user.reservedBalance || 0) + amountReservation;
+  if (apiKeyRec) {
+    apiKeyRec.reservedTokens = (apiKeyRec.reservedTokens || 0) + tokenReservation;
+    apiKeyRec.reservedSpend = (apiKeyRec.reservedSpend || 0) + amountReservation;
+  }
   writeDb(db);
 
   const started = Date.now();
@@ -407,7 +592,8 @@ async function chat(req, res, db, user) {
           tokenReservation,
           amountReservation,
           started,
-          inputReserve
+          inputReserve,
+          apiKeyRec
         });
       }
 
@@ -423,7 +609,7 @@ async function chat(req, res, db, user) {
       }
 
       const usage = result.usage || {};
-      settleUsage(db, user, provider, usage, rate, tokenReservation, amountReservation, started, result.model || model || provider.defaultModel);
+      settleUsage(db, user, provider, usage, rate, tokenReservation, amountReservation, started, result.model || model || provider.defaultModel, 'success', apiKeyRec);
       writeDb(db);
       return json(res, 200, result);
     } catch (err) {
@@ -433,13 +619,13 @@ async function chat(req, res, db, user) {
     }
   }
 
-  releaseReserve(user, tokenReservation, amountReservation);
+  releaseReserve(user, tokenReservation, amountReservation, apiKeyRec);
   writeDb(db);
   return fail(res, 502, '模型服务暂时不可用，请稍后重试');
 }
 
 async function streamChat(req, res, db, user, provider, upstream, ctx) {
-  const { model, rate, tokenReservation, amountReservation, started, inputReserve } = ctx;
+  const { model, rate, tokenReservation, amountReservation, started, inputReserve, apiKeyRec = null } = ctx;
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-store',
@@ -456,10 +642,11 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
     if (settled) return;
     settled = true;
     aborted = true;
-    releaseReserve(user, tokenReservation, amountReservation);
+    releaseReserve(user, tokenReservation, amountReservation, apiKeyRec);
     db.logs.unshift({
       id: id('log'),
       userId: user.id,
+      apiKeyId: apiKeyRec?.id || null,
       model,
       providerId: provider.id,
       tokens: 0,
@@ -555,7 +742,7 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
   }
 
   settled = true;
-  settleUsage(db, user, provider, usage, rate, tokenReservation, amountReservation, started, model);
+  settleUsage(db, user, provider, usage, rate, tokenReservation, amountReservation, started, model, 'success', apiKeyRec);
   writeDb(db);
   try { res.end(); } catch { /* ignore */ }
 }
@@ -617,6 +804,7 @@ const server = http.createServer(async (req, res) => {
     };
     if (inviter) { inviter.invited += 1; inviter.bonusBalance += 20; }
     db.users.push(user);
+    ensureUserKeys(user);
     const token = crypto.randomBytes(32).toString('hex');
     sessions.set(token, user.id);
     persistSession(db, token, user.id);
@@ -651,6 +839,79 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/me') {
     return user ? json(res, 200, { user: safeUser(user) }) : fail(res, 401, '未登录');
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/models') {
+    if (!user) return fail(res, 401, '未登录');
+    return json(res, 200, { models: catalogModels(db) });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/keys') {
+    if (!user) return fail(res, 401, '未登录');
+    ensureUserKeys(user);
+    writeDb(db);
+    return json(res, 200, { keys: user.apiKeys.map(publicApiKey) });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/keys') {
+    if (!user) return fail(res, 401, '未登录');
+    ensureUserKeys(user);
+    if (user.apiKeys.length >= MAX_USER_KEYS) return fail(res, 400, `每个账户最多 ${MAX_USER_KEYS} 个密钥`);
+    const p = await body(req);
+    if (!p || typeof p !== 'object') return fail(res, 400, '无效请求体');
+    const created = normalizeApiKey({
+      name: p.name,
+      models: p.models,
+      spendLimit: p.spendLimit,
+      tokenLimit: p.tokenLimit,
+      rpm: p.rpm,
+      tpm: p.tpm,
+      enabled: p.enabled !== false
+    });
+    user.apiKeys.push(created);
+    writeDb(db);
+    return json(res, 201, { key: publicApiKey(created) });
+  }
+
+  if ((req.method === 'PUT' || req.method === 'DELETE' || req.method === 'POST') && url.pathname.startsWith('/api/keys/')) {
+    if (!user) return fail(res, 401, '未登录');
+    ensureUserKeys(user);
+    const rest = decodeURIComponent(url.pathname.slice('/api/keys/'.length));
+    const [keyId, action] = rest.split('/');
+    const rec = user.apiKeys.find(k => k.id === keyId);
+    if (!rec) return fail(res, 404, '密钥不存在');
+    if (req.method === 'DELETE') {
+      if (user.apiKeys.length <= 1) return fail(res, 400, '至少保留一个密钥');
+      user.apiKeys = user.apiKeys.filter(k => k.id !== keyId);
+      if (user.apiKey === rec.key) user.apiKey = user.apiKeys[0].key;
+      writeDb(db);
+      return json(res, 200, { ok: true });
+    }
+    if (req.method === 'POST' && action === 'rotate') {
+      const wasPrimary = user.apiKey === rec.key;
+      rec.key = userKey();
+      if (wasPrimary) user.apiKey = rec.key;
+      writeDb(db);
+      return json(res, 200, { key: publicApiKey(rec) });
+    }
+    if (req.method === 'PUT') {
+      const p = await body(req);
+      if (!p || typeof p !== 'object') return fail(res, 400, '无效请求体');
+      const next = normalizeApiKey({
+        ...rec,
+        name: p.name ?? rec.name,
+        models: Array.isArray(p.models) ? p.models : rec.models,
+        spendLimit: p.spendLimit ?? rec.spendLimit,
+        tokenLimit: p.tokenLimit ?? rec.tokenLimit,
+        rpm: p.rpm ?? rec.rpm,
+        tpm: p.tpm ?? rec.tpm,
+        enabled: 'enabled' in p ? p.enabled !== false : rec.enabled
+      }, rec);
+      Object.assign(rec, next);
+      writeDb(db);
+      return json(res, 200, { key: publicApiKey(rec) });
+    }
+    return fail(res, 404, 'Not found');
   }
 
   if (req.method === 'GET' && url.pathname === '/api/dashboard') {
@@ -853,15 +1114,18 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/api/chat') {
     if (!user) return fail(res, 401, '请先登录');
     if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
-    return chat(req, res, db, user);
+    ensureUserKeys(user);
+    const keyId = url.searchParams.get('keyId');
+    const rec = (keyId && user.apiKeys.find(k => k.id === keyId)) || user.apiKeys.find(k => k.enabled !== false) || user.apiKeys[0] || null;
+    return chat(req, res, db, user, rec);
   }
 
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
     if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
     const apiKey = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-    const apiUser = db.users.find(x => x.apiKey === apiKey);
-    if (!apiUser) return fail(res, 401, '无效的 Relay API Key');
-    return chat(req, res, db, apiUser);
+    const found = findByApiSecret(db, apiKey);
+    if (!found) return fail(res, 401, '无效的 Relay API Key');
+    return chat(req, res, db, found.user, found.key);
   }
 
   if (req.method !== 'GET' && req.method !== 'HEAD') return fail(res, 405, 'Method not allowed');
@@ -891,6 +1155,7 @@ for (const user of initial.users) {
   user.accountActive ??= (user.balance || 0) > 0;
   user.role ??= user.email === ADMIN_EMAIL.toLowerCase() ? 'admin' : 'user';
   ensureUsername(user, initial);
+  ensureUserKeys(user);
 }
 for (const provider of initial.settings.providers) {
   provider.priority ??= 100;
@@ -918,28 +1183,7 @@ if (!initial.settings.providers.length && LEGACY_UPSTREAM.url && LEGACY_UPSTREAM
   });
 }
 initial.settings.defaultProviderId ??= initial.settings.providers[0]?.id ?? null;
-if (!initial.users.some(x => x.email === ADMIN_EMAIL.toLowerCase())) {
-  const adminUser = {
-    id: 'usr_admin',
-    email: ADMIN_EMAIL.toLowerCase(),
-    name: 'Admin',
-    password: hash(ADMIN_PASSWORD),
-    apiKey: userKey(),
-    balance: 0,
-    bonusBalance: 0,
-    quotaTokens: 0,
-    usedTokens: 0,
-    reservedTokens: 0,
-    reservedBalance: 0,
-    accountActive: false,
-    role: 'admin',
-    invited: 0,
-    inviteCode: 'ADMIN',
-    createdAt: new Date().toISOString()
-  };
-  ensureUsername(adminUser, initial);
-  initial.users.push(adminUser);
-}
+ensureAdminUser(initial);
 const envCodes = (process.env.RECHARGE_CODES || '').split(',').map(x => x.trim()).filter(Boolean);
 for (const item of envCodes) {
   const [code, amount, quotaTokens] = item.split(':');
