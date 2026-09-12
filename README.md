@@ -51,7 +51,7 @@ Content-Type: application/json
 
 ## 多渠道与实时定价
 
-使用 `ADMIN_USERNAME`（默认 `ashura`）或可选的 `ADMIN_EMAIL`，以及 `ADMIN_PASSWORD` 登录后，侧栏会显示“运营配置”。在这里可以实时切换 2x、3x、4x 计费倍率，并录入多个模型渠道。渠道配置按模型名称路由，每个渠道分别填写：
+使用 `ADMIN_USERNAME`（默认 `ashura`）或可选的 `ADMIN_EMAIL`，以及 `ADMIN_PASSWORD` 登录后，侧栏会显示“运营配置”。在这里可以实时切换 2x、3x、4x 计费倍率，并在「渠道」页用卡片配置上游：上游地址、支持的模型（芯片）、掩码 API 密钥（留空保留原密钥，接口不回显明文）、内部名称、启用、优先级与价格。渠道配置按模型名称路由，每个渠道分别填写：
 
 - `models`：该渠道负责的模型数组；例如 `gpt-4o-mini`
 - `inputPricePer1K`：该渠道输入每千 Token 实际成本

@@ -58,3 +58,7 @@
 .model-chip.on{background:#263326;border-color:#3d4f35;color:var(--lime)}
 .field-label{font-size:11px;color:var(--muted);margin:0 0 6px}
 .hint{display:block;color:#6c7688;font-size:10px;margin-top:4px}
+.channel-card{margin-bottom:14px}
+.model-chip-box{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:7px;padding:8px;background:#10131a;border:1px solid #303646;border-radius:8px}
+.model-chip button{border:0;background:none;color:#9aa6b8;cursor:pointer;padding:0 0 0 4px;font-size:13px}
+.chip-input{width:160px;height:32px;margin:0;padding:0 8px;font-size:11px}

@@ -398,6 +398,7 @@ function publicProvider(provider) {
   return {
     id: provider.id,
     name: provider.name,
+    url: provider.url || '',
     models: provider.models || [],
     defaultModel: provider.defaultModel || '',
     enabled: provider.enabled !== false,
@@ -999,6 +1000,9 @@ const server = http.createServer(async (req, res) => {
       const apiKey = item.apiKey || previous?.apiKey;
       if (!apiKey) return fail(res, 400, `渠道 ${item.name} 缺少 API Key`);
       const normalized = normalizeProvider({ ...item, apiKey }, previous);
+      if (normalized.enabled !== false && (!normalized.models || !normalized.models.length)) {
+        return fail(res, 400, `渠道 ${normalized.name} 已启用，必须至少配置一个模型`);
+      }
       next.push(normalized);
     }
     db.settings.providers = next;

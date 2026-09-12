@@ -44,7 +44,7 @@
 - 渠道字段：`priority`、`timeoutMs`、`maxRetries`、`health`、`modelPrices`
 - 上游尝试时更新 `provider.health`；管理员定价接口返回健康摘要（不含 apiKey）
 - 管理员实时设置计费倍率（1x–10x）
-- **管理员控制台**（运营配置页 Tabs）：倍率、渠道表单编辑器、用户管理、卡密生成、审计、订单
+- **管理员控制台**（运营配置页 Tabs）：倍率、渠道卡片（上游地址 / 模型芯片 / 掩码密钥，无 JSON 文本框）、用户管理、卡密生成、审计、订单
 - 审计日志 `db.auditLogs`（上限 5000）：倍率变更、渠道保存、用户更新、卡密生成
 - 轻量 IP 限流：`/api/auth/*` 60/min，`/v1/chat/completions` 与 `/api/chat` 120/min → 429
 - 服务条款 / 隐私政策 / 退款规则静态页
@@ -138,7 +138,7 @@ GET  /api/admin/audit            # 最近审计
 GET  /api/admin/orders           # 卡密兑换订单 stub
 ```
 
-保存渠道时，已有渠道的 `apiKey` 可传空字符串以保留旧密钥；新渠道必须提供 API Key。管理员 GET 不返回完整私钥，只返回 `apiKeyConfigured`。
+保存渠道时，已有渠道的 `apiKey` 可传空字符串以保留旧密钥；新渠道必须提供 API Key。已启用渠道必须至少有一个模型。管理员 GET 不返回完整私钥，只返回 `apiKeyConfigured` 与上游 `url`（仅管理员接口）。
 
 ## 余额与安全控制
 

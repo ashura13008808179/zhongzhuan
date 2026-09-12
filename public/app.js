@@ -177,33 +177,57 @@ function modelPricesEditorHtml(provider, idx) {
   return `<div class="model-prices" data-provider-mp="${idx}"><div class="model-price-head"><span>模型</span><span>输入价/1K</span><span>输出价/1K</span><span></span></div>${rows || '<p class="sub">暂无按模型价格，将使用渠道默认输入/输出价。</p>'}<button type="button" class="ghost-btn" data-add-mp="${idx}">+ 添加模型价格</button></div>`;
 }
 
+function providerHost(url) {
+  try { return new URL(url).host + (new URL(url).pathname !== '/' ? new URL(url).pathname : ''); }
+  catch { return url || '未填写上游地址'; }
+}
+
 function providerFormHtml(provider, idx) {
   const health = provider.health || {};
   const healthLabel = health.ok === false ? '异常' : '正常';
   const healthClass = health.ok === false ? 'tag danger' : 'tag success';
-  return `<article class="card provider-form" data-provider-idx="${idx}">
+  const models = provider.models || [];
+  const keyOn = Boolean(provider.apiKeyConfigured);
+  return `<article class="card provider-form channel-card" data-provider-idx="${idx}">
     <div class="card-head">
-      <div><p class="eyebrow">PROVIDER #${idx + 1}</p><h2>${esc(provider.name || '未命名渠道')}</h2></div>
+      <div>
+        <p class="eyebrow">渠道 #${idx + 1}</p>
+        <h2>${esc(provider.name || '未命名渠道')}</h2>
+        <p class="sub">${esc(providerHost(provider.url || ''))}</p>
+      </div>
       <div class="provider-head-actions">
+        <span class="tag ${provider.enabled !== false ? 'success' : 'danger'}">${provider.enabled !== false ? '启用' : '停用'}</span>
+        <span class="tag ${keyOn ? 'success' : 'danger'}">${keyOn ? '密钥已配置' : '密钥未配置'}</span>
         <span class="${healthClass}">${healthLabel}</span>
         <button type="button" class="ghost-btn danger" data-remove-provider="${idx}">删除</button>
       </div>
     </div>
+    <div class="model-chip-row static">${models.length ? models.map(m => `<span class="model-chip on">${esc(m)}</span>`).join('') : '<span class="sub">尚未添加模型</span>'}</div>
     <div class="form-grid">
-      <label>ID<input data-f="id" value="${esc(provider.id || '')}" ${provider.id ? 'readonly' : ''}></label>
-      <label>名称<input data-f="name" value="${esc(provider.name || '')}"></label>
-      <label class="span-2">上游 URL<input data-f="url" value="${esc(provider.url || '')}" placeholder="https://..."></label>
+      <label>内部名称<input data-f="name" value="${esc(provider.name || '')}" placeholder="仅管理员可见"></label>
+      <label>渠道 ID<input data-f="id" value="${esc(provider.id || '')}" ${provider.id ? 'readonly' : ''}></label>
+      <label class="span-2">上游地址<input data-f="url" value="${esc(provider.url || '')}" placeholder="https://api.example.com/v1/chat/completions"></label>
+      <label class="span-2">支持的模型
+        <div class="model-chip-box">
+          ${(models).map((m, mi) => `<span class="model-chip on" data-model-chip="${esc(m)}">${esc(m)}<button type="button" data-remove-model="${idx}:${mi}">×</button></span>`).join('')}
+          <input class="chip-input" data-add-model-input="${idx}" placeholder="输入模型名后回车">
+          <button type="button" class="ghost-btn" data-add-model="${idx}">添加</button>
+        </div>
+      </label>
+      <label class="span-2">API 密钥
+        <input data-f="apiKey" type="password" placeholder="${keyOn ? '•••• 已配置，留空则保留原密钥' : '新渠道必填'}" autocomplete="new-password">
+        <small class="hint">${keyOn ? '密钥已配置（不会回显明文）' : '尚未配置密钥'}</small>
+      </label>
       <label>默认模型<input data-f="defaultModel" value="${esc(provider.defaultModel || '')}"></label>
-      <label>模型列表（逗号分隔）<input data-f="models" value="${esc((provider.models || []).join(', '))}"></label>
+      <label>优先级（越小越高）<input data-f="priority" type="number" value="${esc(provider.priority ?? 100)}"></label>
       <label>输入价/1K<input data-f="inputPricePer1K" type="number" step="0.0001" min="0" value="${esc(provider.inputPricePer1K ?? 0)}"></label>
       <label>输出价/1K<input data-f="outputPricePer1K" type="number" step="0.0001" min="0" value="${esc(provider.outputPricePer1K ?? 0)}"></label>
-      <label>优先级（越小越高）<input data-f="priority" type="number" value="${esc(provider.priority ?? 100)}"></label>
       <label>超时 ms<input data-f="timeoutMs" type="number" min="1000" value="${esc(provider.timeoutMs ?? 60000)}"></label>
-      <label>API Key（留空保留原密钥）<input data-f="apiKey" type="password" placeholder="${provider.apiKeyConfigured ? '•••• 已配置，留空保留' : '新渠道必填'}" autocomplete="new-password"></label>
-      <label class="check-label"><input data-f="enabled" type="checkbox" ${provider.enabled !== false ? 'checked' : ''}> 启用渠道</label>
+      <label>重试次数<input data-f="maxRetries" type="number" min="0" max="5" value="${esc(provider.maxRetries ?? 0)}"></label>
+      <label class="check-label"><input data-f="enabled" type="checkbox" ${provider.enabled !== false ? 'checked' : ''}> 启用</label>
       <label class="check-label"><input data-f="isDefault" type="checkbox" ${adminDefaultProviderId === provider.id ? 'checked' : ''}> 设为默认渠道</label>
     </div>
-    <p class="eyebrow" style="margin-top:16px">MODEL PRICES</p>
+    <p class="eyebrow" style="margin-top:16px">按模型价格（可选）</p>
     ${modelPricesEditorHtml(provider, idx)}
     ${health.lastCheckedAt ? `<p class="sub" style="margin-top:10px">健康检查：${esc(new Date(health.lastCheckedAt).toLocaleString('zh-CN'))}${health.lastError ? ' · ' + esc(health.lastError) : ''}</p>` : ''}
   </article>`;
@@ -218,7 +242,7 @@ function collectProvidersFromDom() {
     const id = get('id')?.value.trim();
     const name = get('name')?.value.trim();
     const url = get('url')?.value.trim();
-    const models = (get('models')?.value || '').split(',').map(s => s.trim()).filter(Boolean);
+    const models = [...card.querySelectorAll('[data-model-chip]')].map(el => el.dataset.modelChip || el.textContent.replace('×', '').trim()).filter(Boolean);
     const modelPrices = {};
     card.querySelectorAll('.model-price-row').forEach(row => {
       const model = row.querySelector('[data-mp-field="model"]')?.value.trim();
@@ -231,6 +255,7 @@ function collectProvidersFromDom() {
     const apiKey = get('apiKey')?.value || '';
     const enabled = Boolean(get('enabled')?.checked);
     if (get('isDefault')?.checked) defaultProviderId = id;
+    const previous = adminProvidersCache.find(p => p.id === id);
     providers.push({
       id,
       name,
@@ -241,10 +266,12 @@ function collectProvidersFromDom() {
       outputPricePer1K: Number(get('outputPricePer1K')?.value || 0),
       priority: Number(get('priority')?.value || 100),
       timeoutMs: Number(get('timeoutMs')?.value || 60000),
+      maxRetries: Number(get('maxRetries')?.value || 0),
       enabled,
       apiKey,
       modelPrices,
-      apiKeyConfigured: Boolean(apiKey) || Boolean(adminProvidersCache.find(p => p.id === id)?.apiKeyConfigured)
+      apiKeyConfigured: Boolean(apiKey) || Boolean(previous?.apiKeyConfigured),
+      health: previous?.health || { ok: true, lastCheckedAt: null, lastError: null }
     });
   }
   return { providers, defaultProviderId };
@@ -274,7 +301,7 @@ async function renderOperations() {
           } catch (error) { $('#rateResult').textContent = error.message; $('#rateResult').className = 'inline-msg'; }
         });
       } else {
-        shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<div class="admin-actions-bar"><button class="primary-btn" id="addProvider">+ 添加渠道</button><button class="primary-btn" id="saveProviders">保存全部渠道</button><span id="providerResult" class="inline-msg"></span></div><div id="providersList">${adminProvidersCache.map((p, i) => providerFormHtml(p, i)).join('') || '<section class="card"><p class="sub">尚未配置渠道，请点击添加。</p></section>'}</div>`);
+        shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<div class="admin-actions-bar"><div><p class="eyebrow">CHANNEL POOL</p><h2 style="margin:0">渠道管理</h2><p class="sub">为每个上游填写地址、支持的模型和密钥。密钥不会回显明文。</p></div><button class="primary-btn" id="addProvider">+ 添加渠道</button><button class="primary-btn" id="saveProviders">保存全部渠道</button><span id="providerResult" class="inline-msg"></span></div><div id="providersList">${adminProvidersCache.map((p, i) => providerFormHtml(p, i)).join('') || '<section class="card"><p class="sub">尚未配置渠道，请点击添加。</p></section>'}</div>`);
         wireProviderEditor();
       }
     } else if (adminTab === 'users') {
@@ -370,6 +397,7 @@ function wireProviderEditor() {
       outputPricePer1K: 0,
       priority: 100,
       timeoutMs: 60000,
+      maxRetries: 0,
       enabled: true,
       apiKey: '',
       apiKeyConfigured: false,
@@ -383,6 +411,34 @@ function wireProviderEditor() {
     refreshFromDom();
     const idx = Number(btn.dataset.removeProvider);
     adminProvidersCache.splice(idx, 1);
+    renderOperations();
+  });
+
+  const addModelAt = (idx, value) => {
+    const name = String(value || '').trim();
+    if (!name) return;
+    refreshFromDom();
+    adminProvidersCache[idx].models = adminProvidersCache[idx].models || [];
+    if (!adminProvidersCache[idx].models.includes(name)) adminProvidersCache[idx].models.push(name);
+    renderOperations();
+  };
+  page.querySelectorAll('[data-add-model]').forEach(btn => btn.onclick = () => {
+    const idx = Number(btn.dataset.addModel);
+    const input = page.querySelector(`[data-add-model-input="${idx}"]`);
+    addModelAt(idx, input?.value);
+  });
+  page.querySelectorAll('[data-add-model-input]').forEach(input => {
+    input.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        addModelAt(Number(input.dataset.addModelInput), input.value);
+      }
+    });
+  });
+  page.querySelectorAll('[data-remove-model]').forEach(btn => btn.onclick = () => {
+    refreshFromDom();
+    const [pIdx, mIdx] = btn.dataset.removeModel.split(':').map(Number);
+    (adminProvidersCache[pIdx].models || []).splice(mIdx, 1);
     renderOperations();
   });
 
@@ -409,6 +465,10 @@ function wireProviderEditor() {
     try {
       const { providers, defaultProviderId } = collectProvidersFromDom();
       if (!providers.length) throw Error('至少保留一个渠道');
+      for (const p of providers) {
+        if (!p.name || !p.url || !/^https:\/\//.test(p.url)) throw Error('渠道内部名称和 HTTPS 上游地址不能为空');
+        if (p.enabled !== false && !(p.models || []).length) throw Error(`渠道 ${p.name} 已启用，必须至少配置一个模型`);
+      }
       await api('/api/admin/providers', { method: 'PUT', body: JSON.stringify({ providers, defaultProviderId }) });
       $('#providerResult').textContent = '已保存，后续请求将按新渠道配置路由。';
       $('#providerResult').className = 'inline-msg ok';
