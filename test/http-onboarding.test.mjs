@@ -120,6 +120,22 @@ try {
   const settings = await req('/api/admin/site-settings', { headers: auth });
   assert.equal(settings.status, 200);
   assert.equal(settings.body.trialBalance, undefined);
+  assert.equal(settings.body.recommendedModel, 'gpt-5.6-sol');
+
+  const cfg = await req('/api/config');
+  assert.equal(cfg.status, 200);
+  assert.equal(cfg.body.recommendedModel, 'gpt-5.6-sol');
+  assert.equal(cfg.body.trialBalance, undefined);
+
+  const updated = await req('/api/admin/site-settings', {
+    method: 'PUT',
+    headers: auth,
+    body: JSON.stringify({ recommendedModel: 'gpt-5.6-terra' })
+  });
+  assert.equal(updated.status, 200, JSON.stringify(updated.body));
+  assert.equal(updated.body.recommendedModel, 'gpt-5.6-terra');
+  const cfg2 = await req('/api/config');
+  assert.equal(cfg2.body.recommendedModel, 'gpt-5.6-terra');
 
   const validInvite = await req('/api/auth/register', {
     method: 'POST',

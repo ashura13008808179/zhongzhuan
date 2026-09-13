@@ -39,7 +39,10 @@ import {
   BEIBEIHAI_GROUP_HINTS,
   VIP1129_GROUP_HINTS,
   BEIBEIHAI_CHAT_URL,
-  VIP1129_CHAT_URL
+  VIP1129_CHAT_URL,
+  DEFAULT_RECOMMENDED_MODEL,
+  resolveRecommendedModel,
+  normalizeRecommendedModel
 } from './lib/relay-core.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -887,9 +890,9 @@ function allocateUsername(db, seed, exceptId) {
 
 const DEFAULT_MODEL_GROUPS = [
   { id: 'grp_deepseek', name: 'DeepSeek', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'deepseek-chat', models: [], priority: 10, billingMultiplier: 0.5 },
-  { id: 'grp_gpt_pro', name: 'GPT PRO', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: 'gpt-5.6', models: [], priority: 20, billingMultiplier: 0.2 },
-  { id: 'grp_gpt_plus', name: 'GPT-PLUS', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: 'gpt-5.6', models: [], priority: 30, billingMultiplier: 0.1 },
-  { id: 'grp_gpt_mix', name: 'GPT 混用', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: 'gpt-5.6', models: [], priority: 40, billingMultiplier: 0.05 },
+  { id: 'grp_gpt_pro', name: 'GPT PRO', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: DEFAULT_RECOMMENDED_MODEL, models: [], priority: 20, billingMultiplier: 0.2 },
+  { id: 'grp_gpt_plus', name: 'GPT-PLUS', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: DEFAULT_RECOMMENDED_MODEL, models: [], priority: 30, billingMultiplier: 0.1 },
+  { id: 'grp_gpt_mix', name: 'GPT 混用', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: DEFAULT_RECOMMENDED_MODEL, models: [], priority: 40, billingMultiplier: 0.05 },
   { id: 'grp_grok', name: 'Grok', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'grok-3', models: [], priority: 50, billingMultiplier: 0.5 },
   { id: 'grp_cc_max', name: 'CC-MAX', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-sonnet-4', models: [], priority: 60, billingMultiplier: 0.6 },
   { id: 'grp_claude_cursor', name: 'Claude-Cursor', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-sonnet-4', models: [], priority: 70, billingMultiplier: 0.6 },
@@ -1806,7 +1809,7 @@ const server = http.createServer(async (req, res) => {
   db.settings ??= {};
 
   if (req.method === 'GET' && url.pathname === '/api/config') {
-    return json(res, 200, { contactEmail: CONTACT_EMAIL, contactWechat: CONTACT_WECHAT, contactQq: CONTACT_QQ, contactQqGroup: CONTACT_QQ_GROUP, paymentQr: PAYMENT_QR, paymentPlans: paymentPlans(db), paymentMethods: PAYMENT_METHODS, paymentGateway: publicGatewayView(getPaymentGateway(db)), publicBaseUrl: resolvePublicBaseUrl(db, req), recommendedModel: String(db.settings?.recommendedModel || 'gpt-5.6'),
+    return json(res, 200, { contactEmail: CONTACT_EMAIL, contactWechat: CONTACT_WECHAT, contactQq: CONTACT_QQ, contactQqGroup: CONTACT_QQ_GROUP, paymentQr: PAYMENT_QR, paymentPlans: paymentPlans(db), paymentMethods: PAYMENT_METHODS, paymentGateway: publicGatewayView(getPaymentGateway(db)), publicBaseUrl: resolvePublicBaseUrl(db, req), recommendedModel: resolveRecommendedModel(db.settings),
       apiBaseUrl: `${resolvePublicBaseUrl(db, req)}/v1`, paymentQrMeta: (() => { const meta = paymentQrMeta(db); return { ...meta, wechat: paymentQrStatus(meta.wechatExpiresAt), alipay: paymentQrStatus(meta.alipayExpiresAt) }; })(), appName: 'Relay Station' });
   }
 
@@ -2390,23 +2393,37 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, {
       publicBaseUrl: db.settings.publicBaseUrl || PUBLIC_BASE_URL || '',
       resolvedBaseUrl: resolvePublicBaseUrl(db, req),
-      apiBaseUrl: `${resolvePublicBaseUrl(db, req)}/v1`
+      apiBaseUrl: `${resolvePublicBaseUrl(db, req)}/v1`,
+      recommendedModel: resolveRecommendedModel(db.settings)
     });
   }
 
   if (req.method === 'PUT' && url.pathname === '/api/admin/site-settings') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
     const p = await body(req);
-    const next = String(p?.publicBaseUrl || '').trim().replace(/\/$/, '');
-    db.settings.publicBaseUrl = next;
-    audit(db, { actorId: user.id, action: 'siteSettings.save', target: 'publicBaseUrl', detail: { publicBaseUrl: next } });
+    if (p?.publicBaseUrl != null) {
+      db.settings.publicBaseUrl = String(p.publicBaseUrl || '').trim().replace(/\/$/, '');
+    }
+    if (p?.recommendedModel != null) {
+      const parsed = normalizeRecommendedModel(p.recommendedModel);
+      if (!parsed.ok) return fail(res, 400, parsed.error);
+      db.settings.recommendedModel = parsed.model;
+    }
+    const next = String(db.settings.publicBaseUrl || '').trim().replace(/\/$/, '');
+    audit(db, {
+      actorId: user.id,
+      action: 'siteSettings.save',
+      target: 'siteSettings',
+      detail: { publicBaseUrl: next, recommendedModel: resolveRecommendedModel(db.settings) }
+    });
     writeDb(db);
     const resolved = resolvePublicBaseUrl(db, req);
     return json(res, 200, {
       publicBaseUrl: next,
       resolvedBaseUrl: resolved,
       apiBaseUrl: `${resolved}/v1`,
-      message: next ? '已保存站点网址' : '已清空，将自动使用当前访问域名'
+      recommendedModel: resolveRecommendedModel(db.settings),
+      message: next ? '已保存站点设置' : '已保存（站点网址留空则自动使用当前访问域名）'
     });
   }
 
@@ -2890,7 +2907,7 @@ initial.settings.paymentQrMeta ??= {
   note: '个人静态收款码一般长期有效；若扫码提示已过期/无法支付，请换另一种付款方式或联系客服更换收款码。'
 };
 initial.settings.publicBaseUrl ??= PUBLIC_BASE_URL || '';
-initial.settings.recommendedModel ??= 'gpt-5.6';
+initial.settings.recommendedModel = resolveRecommendedModel(initial.settings);
 initial.settings.upstreamBeibeihai ??= {
   enabled: true,
   baseUrl: BEIBEIHAI_BASE_URL || BEIBEIHAI_DEFAULT_BASE,

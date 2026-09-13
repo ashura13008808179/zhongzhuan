@@ -13,6 +13,9 @@ import {
   resolveProxyApiKey,
   validateInviteCode,
   insufficientBalanceMessage,
+  resolveRecommendedModel,
+  normalizeRecommendedModel,
+  DEFAULT_RECOMMENDED_MODEL,
   BEIBEIHAI_CHAT_URL,
   VIP1129_CHAT_URL
 } from '../lib/relay-core.js';
@@ -58,6 +61,7 @@ assert.equal(wired[0].upstreamSync, 'beibeihai');
 assert.equal(wired[0].url, BEIBEIHAI_CHAT_URL);
 assert.equal(wired[1].upstreamSync, 'vip1129');
 assert.equal(wired[1].url, VIP1129_CHAT_URL);
+assert.equal(applyProviderWiring({ id: 'grp_gpt_pro', url: VIP1129_CHAT_URL, defaultModel: 'gpt-5.6' }).defaultModel, 'gpt-5.6-sol');
 assert.equal(wired[2].upstreamSync, 'beibeihai');
 assert.equal(wired[3].maintenance, true);
 
@@ -125,5 +129,12 @@ assert.match(validateInviteCode(users, 'NOPE').error, /邀请码无效/);
 assert.equal(validateInviteCode(users, 'OLDCODE').ok, false);
 assert.match(validateInviteCode(users, 'OLDCODE').error, /过期/);
 assert.match(insufficientBalanceMessage(), /卡密充值/);
+
+assert.equal(DEFAULT_RECOMMENDED_MODEL, 'gpt-5.6-sol');
+assert.equal(resolveRecommendedModel({}), 'gpt-5.6-sol');
+assert.equal(resolveRecommendedModel({ recommendedModel: 'gpt-5.6' }), 'gpt-5.6-sol');
+assert.equal(resolveRecommendedModel({ recommendedModel: 'gpt-5.6-terra' }), 'gpt-5.6-terra');
+assert.equal(normalizeRecommendedModel('gpt-5.6-sol').ok, true);
+assert.equal(normalizeRecommendedModel('bad model!').ok, false);
 
 console.log('relay-fixes.test.mjs: all assertions passed');
