@@ -9,7 +9,7 @@ npm test
 node --check server.js
 ```
 
-`npm test` 覆盖：上游同步密钥解析、Beibeihai 分组自动匹配、注册试用余额、无效邀请码拒绝、`GET /api/admin/providers` 别名。不会连接真实上游，也不会写入密钥。
+`npm test` 覆盖：上游同步密钥解析、Beibeihai 分组自动匹配、无效邀请码拒绝、空邀请码注册（余额为 0）、`GET /api/admin/providers` 别名。不会连接真实上游，也不会写入密钥。
 
 ## 运行
 
@@ -130,8 +130,7 @@ GET  /api/admin/orders
 
 1. 给 GPT 组打上 `upstreamSync=vip1129`，给 DeepSeek / Grok / CC-MAX / Claude-Cursor 打上 `upstreamSync=beibeihai`，并把仍指向官方厂商的旧 URL 改到对应中转 `/v1/chat/completions`
 2. Cursor账号池保持维护中
-3. 把 `settings.trialBalance` 缺省为 `1`（已有值不覆盖）
-4. 登录上游成功后按分组名自动填 `groupMap`（仍可在「Beibeihai同步 / vip1129同步」里手改）
+3. 登录上游成功后按分组名自动填 `groupMap`（仍可在「Beibeihai同步 / vip1129同步」里手改）
 
 ```powershell
 cd C:\path\to\zhongzhuan

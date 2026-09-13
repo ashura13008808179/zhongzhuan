@@ -1010,18 +1010,16 @@ async function renderOperations() {
       <section class="card"><div class="card-head"><div><p class="eyebrow">SITE URL</p><h2>站点网址 / API 基础地址</h2>
         <p class="sub">给用户和客户端看的 Base URL。你上线域名后填这里；留空则自动用当前访问域名。上游中转地址（如 vip1129）在「渠道」里单独配置，不会展示给普通用户。</p></div></div>
         <label>公网站点网址<input id="publicBaseUrlInput" placeholder="https://api.your-domain.com" value="${esc(data.publicBaseUrl||'')}"></label>
-        <label style="margin-top:12px">新用户试用余额（元）<input id="trialBalanceInput" type="number" min="0" max="1000" step="0.01" value="${esc(data.trialBalance ?? 1)}"></label>
         <p class="sub" style="margin-top:10px">当前解析：<code>${esc(data.resolvedBaseUrl||'(未设置)')}</code></p>
         <p class="sub">用户 API Base URL：<code>${esc(data.apiBaseUrl||'')}</code></p>
-        <p class="sub">注册默认到账 ¥${esc(data.trialBalance ?? 1)}，避免余额为 0 时首次对话直接 402。设为 0 则仍需充值。</p>
-        <button class="primary-btn" type="button" id="saveSiteUrlBtn" style="margin-top:12px">保存站点设置</button>
+        <button class="primary-btn" type="button" id="saveSiteUrlBtn" style="margin-top:12px">保存站点网址</button>
         <div id="siteUrlMsg" class="inline-msg"></div>
       </section>`);
       $('#saveSiteUrlBtn')?.addEventListener('click', async () => {
         const msg = $('#siteUrlMsg');
         msg.textContent = '保存中…'; msg.className = 'inline-msg';
         try {
-          const j = await api('/api/admin/site-settings', { method: 'PUT', body: JSON.stringify({ publicBaseUrl: $('#publicBaseUrlInput').value.trim(), trialBalance: Number($('#trialBalanceInput').value) }) });
+          const j = await api('/api/admin/site-settings', { method: 'PUT', body: JSON.stringify({ publicBaseUrl: $('#publicBaseUrlInput').value.trim() }) });
           if (window.appConfig) {
             window.appConfig.publicBaseUrl = j.resolvedBaseUrl || j.publicBaseUrl || '';
             window.appConfig.apiBaseUrl = j.apiBaseUrl || '';

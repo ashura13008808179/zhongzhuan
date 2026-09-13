@@ -11,8 +11,6 @@ import {
   isUsableUpstreamSecret,
   findSyncedKeyRecord,
   resolveProxyApiKey,
-  trialBalanceFromSettings,
-  trialQuotaFromSettings,
   validateInviteCode,
   insufficientBalanceMessage,
   BEIBEIHAI_CHAT_URL,
@@ -113,13 +111,7 @@ assert.equal(resolveProxyApiKey({ ...gpt, apiKey: 'sk-channel' }, localRk, { use
 const found = findSyncedKeyRecord({ users: [user] }, gpt, localRk, user, detectors);
 assert.equal(found.key, 'sk-upstream-gpt');
 
-// --- trial / invite ---
-assert.equal(trialBalanceFromSettings({}), 1);
-assert.equal(trialBalanceFromSettings({ trialBalance: 0 }), 0);
-assert.equal(trialBalanceFromSettings({ trialBalance: 2.5 }), 2.5);
-assert.equal(trialQuotaFromSettings({}, 1), 10000);
-assert.equal(trialQuotaFromSettings({ trialQuotaTokens: 5000 }, 1), 5000);
-
+// --- invite / 402 copy ---
 const users = [
   { id: 'u1', inviteCode: 'ABCD1234' },
   { id: 'u2', inviteCode: 'OLDCODE', inviteExpiresAt: '2000-01-01T00:00:00.000Z' }

@@ -34,8 +34,6 @@ import {
   suggestGroupMap,
   wireAllProviders,
   resolveProxyApiKey as resolveProxyApiKeyPure,
-  trialBalanceFromSettings,
-  trialQuotaFromSettings,
   validateInviteCode,
   insufficientBalanceMessage,
   BEIBEIHAI_GROUP_HINTS,
@@ -1832,8 +1830,6 @@ const server = http.createServer(async (req, res) => {
     const invite = validateInviteCode(db.users, p?.inviteCode);
     if (!invite.ok) return fail(res, 400, invite.error, { code: invite.code });
     const inviter = invite.inviter;
-    const trial = trialBalanceFromSettings(db.settings, 1);
-    const trialQuota = trialQuotaFromSettings(db.settings, trial, (amount) => quotaForAmount(amount, db));
     const user = {
       id: id('usr'),
       email,
@@ -1842,14 +1838,14 @@ const server = http.createServer(async (req, res) => {
       password: hash(p.password),
       apiKey: null,
       apiKeys: [],
-      balance: trial,
+      balance: 0,
       bonusBalance: 0,
       invitedBy: inviter ? inviter.id : null,
-      quotaTokens: trialQuota,
+      quotaTokens: 0,
       usedTokens: 0,
       reservedTokens: 0,
       reservedBalance: 0,
-      accountActive: trial > 0,
+      accountActive: false,
       role: 'user',
       invited: 0,
       inviteCode: crypto.randomBytes(4).toString('hex').toUpperCase(),
@@ -2391,44 +2387,26 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/admin/site-settings') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
-    const trial = trialBalanceFromSettings(db.settings, 1);
     return json(res, 200, {
       publicBaseUrl: db.settings.publicBaseUrl || PUBLIC_BASE_URL || '',
       resolvedBaseUrl: resolvePublicBaseUrl(db, req),
-      apiBaseUrl: `${resolvePublicBaseUrl(db, req)}/v1`,
-      trialBalance: trial,
-      trialQuotaTokens: trialQuotaFromSettings(db.settings, trial, (amount) => quotaForAmount(amount, db))
+      apiBaseUrl: `${resolvePublicBaseUrl(db, req)}/v1`
     });
   }
 
   if (req.method === 'PUT' && url.pathname === '/api/admin/site-settings') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
     const p = await body(req);
-    if (p?.publicBaseUrl != null) {
-      db.settings.publicBaseUrl = String(p.publicBaseUrl || '').trim().replace(/\/$/, '');
-    }
-    if (p?.trialBalance != null && p.trialBalance !== '') {
-      const trial = Number(p.trialBalance);
-      if (!Number.isFinite(trial) || trial < 0 || trial > 1000) return fail(res, 400, '试用余额必须是 0–1000 的数字');
-      db.settings.trialBalance = trial;
-    }
-    if (p?.trialQuotaTokens != null && p.trialQuotaTokens !== '') {
-      const q = Number(p.trialQuotaTokens);
-      if (!Number.isInteger(q) || q < 0) return fail(res, 400, '试用 Token 配额必须为非负整数');
-      db.settings.trialQuotaTokens = q;
-    }
-    const next = String(db.settings.publicBaseUrl || '').trim().replace(/\/$/, '');
-    audit(db, { actorId: user.id, action: 'siteSettings.save', target: 'siteSettings', detail: { publicBaseUrl: next, trialBalance: db.settings.trialBalance ?? 1 } });
+    const next = String(p?.publicBaseUrl || '').trim().replace(/\/$/, '');
+    db.settings.publicBaseUrl = next;
+    audit(db, { actorId: user.id, action: 'siteSettings.save', target: 'publicBaseUrl', detail: { publicBaseUrl: next } });
     writeDb(db);
     const resolved = resolvePublicBaseUrl(db, req);
-    const trial = trialBalanceFromSettings(db.settings, 1);
     return json(res, 200, {
       publicBaseUrl: next,
       resolvedBaseUrl: resolved,
       apiBaseUrl: `${resolved}/v1`,
-      trialBalance: trial,
-      trialQuotaTokens: trialQuotaFromSettings(db.settings, trial, (amount) => quotaForAmount(amount, db)),
-      message: next ? '已保存站点设置' : '已保存（站点网址留空则自动使用当前访问域名）'
+      message: next ? '已保存站点网址' : '已清空，将自动使用当前访问域名'
     });
   }
 
@@ -2913,7 +2891,6 @@ initial.settings.paymentQrMeta ??= {
 };
 initial.settings.publicBaseUrl ??= PUBLIC_BASE_URL || '';
 initial.settings.recommendedModel ??= 'gpt-5.6';
-if (initial.settings.trialBalance == null) initial.settings.trialBalance = 1;
 initial.settings.upstreamBeibeihai ??= {
   enabled: true,
   baseUrl: BEIBEIHAI_BASE_URL || BEIBEIHAI_DEFAULT_BASE,

@@ -90,9 +90,8 @@ try {
     })
   });
   assert.equal(emptyInvite.status, 201, JSON.stringify(emptyInvite.body));
-  assert.equal(emptyInvite.body.user.balance, 1);
-  assert.ok(emptyInvite.body.user.accountActive);
-  assert.ok(emptyInvite.body.user.quotaTokens > 0);
+  assert.equal(emptyInvite.body.user.balance, 0);
+  assert.equal(emptyInvite.body.user.quotaTokens, 0);
 
   const adminLogin = await req('/api/auth/login', {
     method: 'POST',
@@ -120,7 +119,7 @@ try {
 
   const settings = await req('/api/admin/site-settings', { headers: auth });
   assert.equal(settings.status, 200);
-  assert.equal(settings.body.trialBalance, 1);
+  assert.equal(settings.body.trialBalance, undefined);
 
   const validInvite = await req('/api/auth/register', {
     method: 'POST',
@@ -133,6 +132,7 @@ try {
     })
   });
   assert.equal(validInvite.status, 201, JSON.stringify(validInvite.body));
+  assert.equal(validInvite.body.user.balance, 0);
 
   console.log('http-onboarding.test.mjs: all assertions passed');
 } finally {
