@@ -1442,7 +1442,7 @@ async function ensureProxyApiKey(db, user, provider, apiKeyRec = null) {
       return created.key;
     }
   }
-  return resolveProxyApiKey(provider, rec, db, null);
+  return '';
 }
 
 async function ensureUpstreamProbeKey(db, provider) {

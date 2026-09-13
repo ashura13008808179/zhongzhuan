@@ -99,8 +99,13 @@ const emptyUser = { id: 'usr_b', apiKeys: [localRk, otherGroup] };
 const otherUser = { id: 'usr_c', apiKeys: [syncedKey] };
 assert.equal(
   resolveProxyApiKey(gpt, localRk, { users: [emptyUser, otherUser] }, emptyUser, detectors),
+  '',
+  'live chat must not borrow another user\'s upstream key'
+);
+assert.equal(
+  resolveProxyApiKey(gpt, null, { users: [emptyUser, otherUser] }, null, detectors),
   'sk-upstream-gpt',
-  'health/chat may borrow another user\'s synced key for the same channel'
+  'health probes may reuse any synced sk- for the same channel'
 );
 assert.equal(resolveProxyApiKey(gpt, localRk, { users: [emptyUser] }, emptyUser, detectors), '');
 assert.equal(resolveProxyApiKey({ ...gpt, apiKey: 'sk-channel' }, localRk, { users: [emptyUser] }, emptyUser, detectors), 'sk-channel');
