@@ -109,7 +109,7 @@ test('claimCheckIn credits balance once per day and logs source', () => {
   assert.equal(db.checkIns.length, 1);
   assert.match(again.error, /今日已签到/);
 
-  const nextDay = claimCheckIn(db, user, { date: '2026-09-14', rng: () => 0.999 });
+  const nextDay = claimCheckIn(db, user, { date: '2026-09-14', rng: () => 1 });
   assert.equal(nextDay.ok, true);
   assert.equal(nextDay.amount, 0.5);
   assert.equal(user.balance, 1.75);
