@@ -120,8 +120,8 @@ export function defaultGroupMap() {
   return {
     grp_gpt_pro: 10,   // codex 混合池1
     grp_gpt_plus: 34,  // codex 混合池2
-    grp_gpt_mix: 65,   // codex 混合池3
-    grp_grok: 79       // Grok 分组
+    grp_gpt_mix: 65    // codex 混合池3
+    // Grok / DeepSeek / Claude 走 Beibeihai，不在此映射
   };
 }
 

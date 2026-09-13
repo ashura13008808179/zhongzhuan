@@ -84,33 +84,43 @@ export async function runDiagnosticSuite(ctx) {
   {
     const cfg = getVip1129Config(db);
     const locals = (db.settings?.providers || []).filter(p => isVip1129Provider(p) && !isMaintenanceProvider(p));
+    const mapped = locals.filter(p => cfg.groupMap?.[p.id] != null && cfg.groupMap?.[p.id] !== '');
     const missing = locals.filter(p => cfg.groupMap?.[p.id] == null || cfg.groupMap?.[p.id] === '');
     if (!locals.length) {
-      push({ id: 'vip1129_map', name: 'vip1129 分组映射', ok: true, level: 'warn', message: '没有指向 vip1129 的本地渠道' });
+      push({ id: 'vip1129_map', name: 'vip1129 分组映射', ok: true, level: 'warn', message: '没有指向 vip1129 的本地渠道（请给 GPT 组设置 upstreamSync=vip1129 或 vip1129.cc URL）' });
     } else if (missing.length) {
       push({
         id: 'vip1129_map', name: 'vip1129 分组映射', ok: false,
-        message: `未映射：${missing.map(p => p.name).join('、')}`,
+        message: `已映射 ${mapped.length} 个，未映射：${missing.map(p => p.name).join('、')}`,
         fix: tipsForCode('no_group_map')
       });
     } else {
-      push({ id: 'vip1129_map', name: 'vip1129 分组映射', ok: true, message: `已映射 ${locals.length} 个渠道` });
+      push({ id: 'vip1129_map', name: 'vip1129 分组映射', ok: true, message: `已映射 ${mapped.length} 个渠道` });
     }
   }
   {
     const cfg = getBeibeihaiConfig(db);
     const locals = (db.settings?.providers || []).filter(p => isBeibeihaiProvider(p) && !isMaintenanceProvider(p));
+    const mapped = locals.filter(p => cfg.groupMap?.[p.id] != null && cfg.groupMap?.[p.id] !== '');
     const missing = locals.filter(p => cfg.groupMap?.[p.id] == null || cfg.groupMap?.[p.id] === '');
     if (!locals.length) {
-      push({ id: 'beibeihai_map', name: 'Beibeihai 分组映射', ok: true, level: 'warn', message: '没有指向 Beibeihai 的本地渠道' });
+      push({
+        id: 'beibeihai_map', name: 'Beibeihai 分组映射', ok: false,
+        message: '没有指向 Beibeihai 的本地渠道（DeepSeek/Grok/CC-MAX/Claude-Cursor 需 upstreamSync=beibeihai）',
+        fix: tipsForCode('no_group_map')
+      });
     } else if (missing.length) {
       push({
         id: 'beibeihai_map', name: 'Beibeihai 分组映射', ok: false,
-        message: `未映射：${missing.map(p => p.name).join('、')}`,
-        fix: tipsForCode('no_group_map')
+        message: `已映射 ${mapped.length} 个，未映射：${missing.map(p => p.name).join('、')}`,
+        fix: [
+          ...tipsForCode('no_group_map'),
+          '打开「Beibeihai同步」，保存登录后会按分组名称自动匹配 ID',
+          '若列表为空，先确认 BEIBEIHAI_EMAIL / BEIBEIHAI_PASSWORD 能登录 sub.beibeihai.xyz'
+        ]
       });
     } else {
-      push({ id: 'beibeihai_map', name: 'Beibeihai 分组映射', ok: true, message: `已映射 ${locals.length} 个渠道` });
+      push({ id: 'beibeihai_map', name: 'Beibeihai 分组映射', ok: true, message: `已映射 ${mapped.length} 个渠道` });
     }
   }
 
@@ -132,31 +142,7 @@ export async function runDiagnosticSuite(ctx) {
       push({ id: `channel_${provider.id}`, name: `渠道 ${provider.name}`, ok: true, level: 'warn', message: '已停用' });
       continue;
     }
-    // synced upstreams: empty channel apiKey is OK if sync ready
-    if ((isVip1129Provider(provider) || isBeibeihaiProvider(provider)) && !provider.apiKey) {
-      const syncOk = isVip1129Provider(provider)
-        ? (getVip1129Config(db).email && (getVip1129Config(db).password || getVip1129Config(db).accessToken) && getVip1129Config(db).groupMap?.[provider.id] != null)
-        : (getBeibeihaiConfig(db).email && (getBeibeihaiConfig(db).password || getBeibeihaiConfig(db).accessToken) && getBeibeihaiConfig(db).groupMap?.[provider.id] != null);
-      if (syncOk) {
-        push({
-          id: `channel_${provider.id}`,
-          name: `渠道 ${provider.name}`,
-          ok: true,
-          message: '使用上游同步密钥（渠道级 Key 可为空）',
-          detail: provider.url
-        });
-      } else {
-        push({
-          id: `channel_${provider.id}`,
-          name: `渠道 ${provider.name}`,
-          ok: false,
-          message: '同步未就绪且渠道未填 API Key，无法转发',
-          detail: provider.url,
-          fix: tipsForCode('channel_no_key')
-        });
-      }
-      continue;
-    }
+    // Channel-level apiKey may be empty for vip1129/beibeihai: probe injects a synced sk-.
     const probed = await probeProviderHealth(db, provider);
     if (probed.ok) {
       push({

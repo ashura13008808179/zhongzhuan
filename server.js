@@ -28,11 +28,27 @@ import {
 } from './upstream/beibeihai.js';
 import { ensureSiteErrors, recordSiteError, clearSiteErrors, tipsForCode, failPayload, SITE_ERROR_CAP } from './diagnostics/site-errors.js';
 import { runDiagnosticSuite } from './diagnostics/run-suite.js';
+import {
+  compactGroupMap,
+  normalizeAvailableGroups,
+  suggestGroupMap,
+  wireAllProviders,
+  resolveProxyApiKey as resolveProxyApiKeyPure,
+  trialBalanceFromSettings,
+  trialQuotaFromSettings,
+  validateInviteCode,
+  insufficientBalanceMessage,
+  BEIBEIHAI_GROUP_HINTS,
+  VIP1129_GROUP_HINTS,
+  BEIBEIHAI_CHAT_URL,
+  VIP1129_CHAT_URL
+} from './lib/relay-core.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, 'public');
-const dataDir = path.join(__dirname, 'data');
-const dbFile = path.join(dataDir, 'db.json');
+const dataDir = process.env.RELAY_DATA_DIR || path.join(__dirname, 'data');
+const dbFile = process.env.RELAY_DB_FILE || path.join(dataDir, 'db.json');
+const SKIP_BOOT_JOBS = process.env.RELAY_SKIP_BOOT_JOBS === '1';
 const PORT = Number(process.env.PORT || 8787);
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || process.env.SITE_URL || '').trim().replace(/\/$/, '');
 const VIP1129_EMAIL = String(process.env.VIP1129_EMAIL || '').trim();
@@ -369,7 +385,8 @@ function getBeibeihaiConfig(db) {
   const raw = db.settings.upstreamBeibeihai && typeof db.settings.upstreamBeibeihai === 'object'
     ? db.settings.upstreamBeibeihai
     : {};
-  const groupMap = { ...beibeihaiDefaultGroupMap(), ...(raw.groupMap || {}) };
+  // Drop stored nulls so they cannot wipe later auto-filled IDs.
+  const groupMap = { ...compactGroupMap(beibeihaiDefaultGroupMap()), ...compactGroupMap(raw.groupMap) };
   return {
     enabled: raw.enabled !== false,
     baseUrl: beibeihaiNormalizeBase(raw.baseUrl || BEIBEIHAI_BASE_URL || BEIBEIHAI_DEFAULT_BASE),
@@ -391,7 +408,7 @@ function saveBeibeihaiConfig(db, cfg) {
     password: String(cfg.password || ''),
     accessToken: String(cfg.accessToken || '').trim(),
     tokenExpiresAt: Number(cfg.tokenExpiresAt || 0) || 0,
-    groupMap: { ...(cfg.groupMap || beibeihaiDefaultGroupMap()) },
+    groupMap: compactGroupMap(cfg.groupMap || beibeihaiDefaultGroupMap()),
     lastError: cfg.lastError || null
   };
   return db.settings.upstreamBeibeihai;
@@ -405,7 +422,7 @@ function publicBeibeihaiView(cfg) {
     hasPassword: !!cfg.password,
     hasToken: !!cfg.accessToken,
     tokenExpiresAt: cfg.tokenExpiresAt || null,
-    groupMap: cfg.groupMap || {},
+    groupMap: compactGroupMap(cfg.groupMap),
     lastError: cfg.lastError || null,
     ready: !!(cfg.enabled !== false && cfg.email && (cfg.password || cfg.accessToken))
   };
@@ -447,6 +464,58 @@ function providerNeedsBeibeihaiSync(db, groupId) {
   if (!provider || provider.enabled === false || isMaintenanceProvider(provider)) return false;
   if (!isBeibeihaiProvider(provider)) return false;
   return resolveBeibeihaiGroupId(db, groupId) != null;
+}
+
+function localBeibeihaiGroupIds(db) {
+  return (db.settings?.providers || [])
+    .filter(p => isBeibeihaiProvider(p) && !isMaintenanceProvider(p))
+    .map(p => p.id);
+}
+
+function localVip1129GroupIds(db) {
+  return (db.settings?.providers || [])
+    .filter(p => isVip1129Provider(p) && !isMaintenanceProvider(p))
+    .map(p => p.id);
+}
+
+async function autofillBeibeihaiGroupMap(db, token = null) {
+  const cfg = getBeibeihaiConfig(db);
+  if (!cfg.enabled) return cfg;
+  let authToken = token;
+  if (!authToken) {
+    const auth = await ensureBeibeihaiToken(db);
+    if (!auth.ok) return getBeibeihaiConfig(db);
+    authToken = auth.token;
+  }
+  const listed = await beibeihaiListGroups(cfg.baseUrl, authToken);
+  if (!listed.ok) return cfg;
+  const groups = normalizeAvailableGroups(listed.data);
+  const nextMap = suggestGroupMap(cfg.groupMap, groups, localBeibeihaiGroupIds(db), BEIBEIHAI_GROUP_HINTS);
+  if (JSON.stringify(nextMap) !== JSON.stringify(compactGroupMap(cfg.groupMap))) {
+    cfg.groupMap = nextMap;
+    saveBeibeihaiConfig(db, cfg);
+  }
+  return cfg;
+}
+
+async function autofillVip1129GroupMap(db, token = null) {
+  const cfg = getVip1129Config(db);
+  if (!cfg.enabled) return cfg;
+  let authToken = token;
+  if (!authToken) {
+    const auth = await ensureVip1129Token(db);
+    if (!auth.ok) return getVip1129Config(db);
+    authToken = auth.token;
+  }
+  const listed = await vip1129ListGroups(cfg.baseUrl, authToken);
+  if (!listed.ok) return cfg;
+  const groups = normalizeAvailableGroups(listed.data);
+  const nextMap = suggestGroupMap(cfg.groupMap, groups, localVip1129GroupIds(db), VIP1129_GROUP_HINTS);
+  if (JSON.stringify(nextMap) !== JSON.stringify(compactGroupMap(cfg.groupMap))) {
+    cfg.groupMap = nextMap;
+    saveVip1129Config(db, cfg);
+  }
+  return cfg;
 }
 
 async function syncCreateBeibeihaiKey(db, user, localKey) {
@@ -492,7 +561,7 @@ function getVip1129Config(db) {
   const raw = db.settings.upstreamVip1129 && typeof db.settings.upstreamVip1129 === 'object'
     ? db.settings.upstreamVip1129
     : {};
-  const groupMap = { ...vip1129DefaultGroupMap(), ...(raw.groupMap || {}) };
+  const groupMap = { ...compactGroupMap(vip1129DefaultGroupMap()), ...compactGroupMap(raw.groupMap) };
   return {
     enabled: raw.enabled !== false,
     baseUrl: vip1129NormalizeBase(raw.baseUrl || VIP1129_BASE_URL || VIP1129_DEFAULT_BASE),
@@ -514,7 +583,7 @@ function saveVip1129Config(db, cfg) {
     password: String(cfg.password || ''),
     accessToken: String(cfg.accessToken || '').trim(),
     tokenExpiresAt: Number(cfg.tokenExpiresAt || 0) || 0,
-    groupMap: { ...(cfg.groupMap || vip1129DefaultGroupMap()) },
+    groupMap: compactGroupMap(cfg.groupMap || vip1129DefaultGroupMap()),
     lastError: cfg.lastError || null
   };
   return db.settings.upstreamVip1129;
@@ -528,7 +597,7 @@ function publicVip1129View(cfg) {
     hasPassword: !!cfg.password,
     hasToken: !!cfg.accessToken,
     tokenExpiresAt: cfg.tokenExpiresAt || null,
-    groupMap: cfg.groupMap || {},
+    groupMap: compactGroupMap(cfg.groupMap),
     lastError: cfg.lastError || null,
     ready: !!(cfg.enabled !== false && cfg.email && (cfg.password || cfg.accessToken))
   };
@@ -819,14 +888,14 @@ function allocateUsername(db, seed, exceptId) {
 
 
 const DEFAULT_MODEL_GROUPS = [
-  { id: 'grp_deepseek', name: 'DeepSeek', url: 'https://api.deepseek.com/v1/chat/completions', defaultModel: 'deepseek-chat', models: [], priority: 10, billingMultiplier: 0.5 },
-  { id: 'grp_gpt_pro', name: 'GPT PRO', url: 'https://api.vip1129.cc/v1/chat/completions', defaultModel: 'gpt-5.6', models: [], priority: 20, billingMultiplier: 0.2 },
-  { id: 'grp_gpt_plus', name: 'GPT-PLUS', url: 'https://api.vip1129.cc/v1/chat/completions', defaultModel: 'gpt-5.6', models: [], priority: 30, billingMultiplier: 0.1 },
-  { id: 'grp_gpt_mix', name: 'GPT 混用', url: 'https://api.vip1129.cc/v1/chat/completions', defaultModel: 'gpt-5.6', models: [], priority: 40, billingMultiplier: 0.05 },
-  { id: 'grp_grok', name: 'Grok', url: 'https://api.x.ai/v1/chat/completions', defaultModel: 'grok-3', models: [], priority: 50, billingMultiplier: 0.5 },
-  { id: 'grp_cc_max', name: 'CC-MAX', url: 'https://api.anthropic.com/v1/messages', defaultModel: 'claude-sonnet-4', models: [], priority: 60, billingMultiplier: 0.6 },
-  { id: 'grp_claude_cursor', name: 'Claude-Cursor', url: 'https://api.anthropic.com/v1/messages', defaultModel: 'claude-sonnet-4', models: [], priority: 70, billingMultiplier: 0.6 },
-  { id: 'grp_cursor_pool', name: 'Cursor账号池', url: 'https://api2.cursor.sh/v1/chat/completions', defaultModel: 'claude-sonnet-4', models: [], priority: 80, billingMultiplier: 0.1 }
+  { id: 'grp_deepseek', name: 'DeepSeek', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'deepseek-chat', models: [], priority: 10, billingMultiplier: 0.5 },
+  { id: 'grp_gpt_pro', name: 'GPT PRO', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: 'gpt-5.6', models: [], priority: 20, billingMultiplier: 0.2 },
+  { id: 'grp_gpt_plus', name: 'GPT-PLUS', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: 'gpt-5.6', models: [], priority: 30, billingMultiplier: 0.1 },
+  { id: 'grp_gpt_mix', name: 'GPT 混用', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: 'gpt-5.6', models: [], priority: 40, billingMultiplier: 0.05 },
+  { id: 'grp_grok', name: 'Grok', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'grok-3', models: [], priority: 50, billingMultiplier: 0.5 },
+  { id: 'grp_cc_max', name: 'CC-MAX', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-sonnet-4', models: [], priority: 60, billingMultiplier: 0.6 },
+  { id: 'grp_claude_cursor', name: 'Claude-Cursor', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-sonnet-4', models: [], priority: 70, billingMultiplier: 0.6 },
+  { id: 'grp_cursor_pool', name: 'Cursor账号池', url: 'https://api2.cursor.sh/v1/chat/completions', defaultModel: 'claude-sonnet-4', models: [], priority: 80, billingMultiplier: 0.1, maintenance: true, maintenanceMessage: '请联系站长购买' }
 ];
 
 function seedDefaultProviders(db) {
@@ -838,6 +907,7 @@ function seedDefaultProviders(db) {
     name: g.name,
     url: g.url,
     apiKey: '',
+    upstreamSync: g.upstreamSync || null,
     defaultModel: g.defaultModel,
     models: [...g.models],
     inputPricePer1K: 0.01,
@@ -848,6 +918,8 @@ function seedDefaultProviders(db) {
     timeoutMs: 60000,
     maxRetries: 1,
     modelPrices: {},
+    maintenance: !!g.maintenance,
+    maintenanceMessage: g.maintenanceMessage || null,
     health: { ok: true, lastCheckedAt: null, lastError: null }
   }));
   db.settings.defaultProviderId = DEFAULT_MODEL_GROUPS[0].id;
@@ -974,11 +1046,13 @@ function normalizeProvider(item, previous = null) {
       outputPricePer1K: Math.max(0, Number(price.outputPricePer1K || 0))
     };
   }
+  const upstreamSync = item.upstreamSync || previous?.upstreamSync || null;
   return {
     id: String(item.id),
     name: String(item.name),
     url: String(item.url),
     apiKey: String(item.apiKey || previous?.apiKey || ''),
+    upstreamSync: upstreamSync === 'vip1129' || upstreamSync === 'beibeihai' ? upstreamSync : null,
     defaultModel: String(item.defaultModel || previous?.defaultModel || ''),
     models: Array.isArray(item.models) ? item.models.map(String) : (previous?.models || []),
     inputPricePer1K: Math.max(0, Number(item.inputPricePer1K ?? previous?.inputPricePer1K ?? 0)),
@@ -992,6 +1066,9 @@ function normalizeProvider(item, previous = null) {
     timeoutMs: Math.max(1000, Number(item.timeoutMs ?? previous?.timeoutMs ?? 60000) || 60000),
     maxRetries: Math.max(0, Math.min(5, Number(item.maxRetries ?? previous?.maxRetries ?? 0) || 0)),
     modelPrices,
+    maintenance: !!(item.maintenance ?? previous?.maintenance),
+    maintenanceMessage: item.maintenanceMessage || previous?.maintenanceMessage || null,
+    status: item.status || previous?.status || null,
     health: previous?.health || { ok: true, lastCheckedAt: null, lastError: null }
   };
 }
@@ -1007,8 +1084,9 @@ function modelsEndpointFromChatUrl(url) {
   return `${raw}/models`;
 }
 
-async function fetchUpstreamModels(provider) {
-  if (!provider?.url || !provider?.apiKey) {
+async function fetchUpstreamModels(provider, overrideApiKey = null) {
+  const apiKey = String(overrideApiKey || provider?.apiKey || '').trim();
+  if (!provider?.url || !apiKey) {
     const err = new Error('请先填写上游 HTTPS 地址和 API Key');
     err.status = 400;
     throw err;
@@ -1025,7 +1103,7 @@ async function fetchUpstreamModels(provider) {
     const upstream = await fetch(endpoint, {
       method: 'GET',
       headers: {
-        Authorization: `Bearer ${provider.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json'
       },
       signal: controller.signal
@@ -1072,7 +1150,9 @@ async function syncAllUpstreamModels(db, { onlyStaleMs = 0, ids = null } = {}) {
   const list = db.settings.providers.filter(p => {
     if (ids?.length && !ids.includes(p.id)) return false;
     if (p.enabled === false) return false;
-    if (!p.url || !p.apiKey) return false;
+    if (isMaintenanceProvider(p)) return false;
+    if (!p.url) return false;
+    if (!p.apiKey && !isVip1129Provider(p) && !isBeibeihaiProvider(p)) return false;
     if (onlyStaleMs > 0 && p.modelsSyncedAt) {
       const age = now - new Date(p.modelsSyncedAt).getTime();
       if (Number.isFinite(age) && age < onlyStaleMs) return false;
@@ -1081,7 +1161,8 @@ async function syncAllUpstreamModels(db, { onlyStaleMs = 0, ids = null } = {}) {
   });
   for (const provider of list) {
     try {
-      const { endpoint, models } = await fetchUpstreamModels(provider);
+      const bearer = await ensureUpstreamProbeKey(db, provider);
+      const { endpoint, models } = await fetchUpstreamModels(provider, bearer);
       provider.models = models;
       if (!provider.defaultModel || !models.includes(provider.defaultModel)) {
         provider.defaultModel = models[0];
@@ -1157,7 +1238,11 @@ function publicProvider(provider) {
     maxRetries: Number(provider.maxRetries ?? 0),
     modelPrices: provider.modelPrices || {},
     health: provider.health || { ok: true, lastCheckedAt: null, lastError: null },
-    apiKeyConfigured: Boolean(provider.apiKey)
+    apiKeyConfigured: Boolean(provider.apiKey),
+    upstreamSync: provider.upstreamSync || null,
+    usesPerKeyUpstream: isVip1129Provider(provider) || isBeibeihaiProvider(provider),
+    maintenance: isMaintenanceProvider(provider),
+    maintenanceMessage: provider.maintenanceMessage || null
   };
 }
 function audit(db, { actorId, action, target, detail }) {
@@ -1203,18 +1288,26 @@ async function probeProviderHealth(db, provider) {
     updateProviderHealth(db, provider.id, false, '缺少上游地址');
     return { id: provider.id, name: provider.name, ok: false, error: '缺少上游地址', fix: tipsForCode('channel_down') };
   }
-  if (!provider.apiKey && (isVip1129Provider(provider) || isBeibeihaiProvider(provider))) {
-    updateProviderHealth(db, provider.id, true, null);
-    provider.health.skipped = true;
-    provider.health.note = 'per_user_upstream_key';
-    return { id: provider.id, name: provider.name, ok: true, skipped: true, reason: 'per_user_upstream_key' };
-  }
-  if (!provider.apiKey) {
+  // Per-key upstream sync: channel apiKey is allowed to be empty. Health must
+  // still inject a synced sk- (user key or a dedicated probe key).
+  if (!provider.apiKey && !isVip1129Provider(provider) && !isBeibeihaiProvider(provider)) {
     updateProviderHealth(db, provider.id, false, '缺少上游地址或 API Key');
     return { id: provider.id, name: provider.name, ok: false, error: '缺少渠道 API Key', fix: tipsForCode('channel_no_key') };
   }
   try {
-    const { endpoint, models } = await fetchUpstreamModels(provider);
+    const bearer = await ensureUpstreamProbeKey(db, provider);
+    if (!bearer) {
+      const syncName = isVip1129Provider(provider) ? 'vip1129' : (isBeibeihaiProvider(provider) ? 'Beibeihai' : '上游');
+      const mapped = isVip1129Provider(provider)
+        ? resolveVip1129GroupId(db, provider.id) != null
+        : (isBeibeihaiProvider(provider) ? resolveBeibeihaiGroupId(db, provider.id) != null : true);
+      const error = mapped
+        ? `${syncName} 已映射但还没有可用的同步密钥，无法探测`
+        : `${syncName} 未映射分组，无法探测（渠道级 Key 可为空，请在同步页选择上游分组）`;
+      updateProviderHealth(db, provider.id, false, error);
+      return { id: provider.id, name: provider.name, ok: false, error, fix: tipsForCode(mapped ? 'channel_no_key' : 'no_group_map') };
+    }
+    const { endpoint, models } = await fetchUpstreamModels(provider, bearer);
     updateProviderHealth(db, provider.id, true);
     provider.health.probe = 'models';
     provider.health.endpoint = endpoint;
@@ -1300,11 +1393,101 @@ function estimateTokensFromText(text) {
   if (!text) return 0;
   return Math.max(1, Math.ceil(String(text).length / 4));
 }
-function resolveProxyApiKey(provider, apiKeyRec) {
-  if (apiKeyRec?.upstream?.provider === 'vip1129' && apiKeyRec.key) return apiKeyRec.key;
-  if (apiKeyRec?.upstream?.provider === 'beibeihai' && apiKeyRec.key) return apiKeyRec.key;
-  if ((isVip1129Provider(provider) || isBeibeihaiProvider(provider)) && apiKeyRec?.key && String(apiKeyRec.key).startsWith('sk-')) return apiKeyRec.key;
-  return provider.apiKey;
+function proxyDetectors() {
+  return { isVip1129: isVip1129Provider, isBeibeihai: isBeibeihaiProvider };
+}
+
+/**
+ * Inject the upstream sk- used for live chat AND health probes.
+ * Designed path: channel-level apiKey stays empty; each local key is synced
+ * to vip1129/beibeihai and that sk- is the Bearer we forward.
+ */
+function resolveProxyApiKey(provider, apiKeyRec, db = null, user = null) {
+  return resolveProxyApiKeyPure(provider, apiKeyRec, db, user, proxyDetectors());
+}
+
+async function createUpstreamKeyForProvider(db, user, provider, localKey) {
+  if (isVip1129Provider(provider) && resolveVip1129GroupId(db, provider.id) != null) {
+    return syncCreateVip1129Key(db, user, localKey);
+  }
+  if (isBeibeihaiProvider(provider) && resolveBeibeihaiGroupId(db, provider.id) != null) {
+    return syncCreateBeibeihaiKey(db, user, localKey);
+  }
+  return { ok: false, error: 'no_group_map' };
+}
+
+async function ensureProxyApiKey(db, user, provider, apiKeyRec = null) {
+  const existing = resolveProxyApiKey(provider, apiKeyRec, db, user);
+  if (existing) return existing;
+  if (!isVip1129Provider(provider) && !isBeibeihaiProvider(provider)) {
+    return String(provider?.apiKey || '').trim();
+  }
+  if (!user) return '';
+
+  let rec = apiKeyRec && (!apiKeyRec.groupId || apiKeyRec.groupId === provider.id) ? apiKeyRec : null;
+  if (!rec) {
+    rec = (user.apiKeys || []).find(k => k.enabled !== false && k.groupId === provider.id) || null;
+  }
+  if (rec && !rec.upstream) {
+    const synced = await createUpstreamKeyForProvider(db, user, provider, rec);
+    if (synced.ok && rec.key) return rec.key;
+  }
+  if (!rec && (isUnlimited(user) || (user.apiKeys || []).some(k => k.groupId === provider.id))) {
+    const created = normalizeApiKey({ name: `auto-${provider.id}`, groupId: provider.id }, null, db);
+    const synced = await createUpstreamKeyForProvider(db, user, provider, created);
+    if (synced.ok && created.key) {
+      user.apiKeys ??= [];
+      user.apiKeys.push(created);
+      if (!user.apiKey) user.apiKey = created.key;
+      return created.key;
+    }
+  }
+  return resolveProxyApiKey(provider, rec, db, null);
+}
+
+async function ensureUpstreamProbeKey(db, provider) {
+  const fromUsers = resolveProxyApiKey(provider, null, db, null);
+  if (fromUsers) return fromUsers;
+  db.settings ??= {};
+  db.settings.upstreamProbeKeys ??= {};
+  const cached = db.settings.upstreamProbeKeys[provider.id];
+  if (cached?.key) return cached.key;
+
+  const persist = (secret) => {
+    if (!secret?.key) return '';
+    db.settings.upstreamProbeKeys[provider.id] = {
+      key: secret.key,
+      id: secret.id || null,
+      createdAt: new Date().toISOString()
+    };
+    return secret.key;
+  };
+
+  if (isVip1129Provider(provider)) {
+    const groupId = resolveVip1129GroupId(db, provider.id);
+    if (groupId == null) return '';
+    const auth = await ensureVip1129Token(db);
+    if (!auth.ok) return '';
+    const created = await vip1129CreateKey(auth.cfg.baseUrl, auth.token, {
+      name: `relay-probe-${provider.id}`.slice(0, 60),
+      group_id: groupId
+    });
+    if (created.ok) return persist(vip1129ExtractSecret(created.data));
+    return '';
+  }
+  if (isBeibeihaiProvider(provider)) {
+    const groupId = resolveBeibeihaiGroupId(db, provider.id);
+    if (groupId == null) return '';
+    const auth = await ensureBeibeihaiToken(db);
+    if (!auth.ok) return '';
+    const created = await beibeihaiCreateKey(auth.cfg.baseUrl, auth.token, {
+      name: `relay-probe-${provider.id}`.slice(0, 60),
+      group_id: groupId
+    });
+    if (created.ok) return persist(beibeihaiExtractSecret(created.data));
+    return '';
+  }
+  return String(provider?.apiKey || '').trim();
 }
 
 async function fetchUpstream(provider, payload, outputBudget, model, overrideApiKey = null) {
@@ -1333,7 +1516,7 @@ async function chat(req, res, db, user, apiKeyRec = null) {
   if (apiKeyRec && Array.isArray(apiKeyRec.models) && apiKeyRec.models.length && requestedModel && !apiKeyRec.models.includes(requestedModel)) {
     return fail(res, 400, '该密钥无权调用此模型');
   }
-  if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, '账户余额不足，API 已暂停，请充值后继续使用');
+  if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
 
   const candidates = providersForModel(payload, db);
   if (!candidates.length) return fail(res, 503, '模型服务暂不可用，请稍后重试');
@@ -1382,7 +1565,7 @@ async function chat(req, res, db, user, apiKeyRec = null) {
         user.accountActive = false;
         writeDb(db);
       }
-      return fail(res, 402, apiKeyRec?.spendLimit > 0 ? '该密钥消费额度不足' : '账户余额接近用尽，API 已暂停，请充值后继续使用');
+      return fail(res, 402, apiKeyRec?.spendLimit > 0 ? '该密钥消费额度不足' : insufficientBalanceMessage());
     }
 
     const upstreamReservation = inputReserve + outputBudget;
@@ -1394,7 +1577,7 @@ async function chat(req, res, db, user, apiKeyRec = null) {
         user.accountActive = false;
         writeDb(db);
       }
-      return fail(res, 402, apiKeyRec?.spendLimit > 0 ? '该密钥消费额度不足' : '账户余额接近用尽，API 已暂停，请充值后继续使用');
+      return fail(res, 402, apiKeyRec?.spendLimit > 0 ? '该密钥消费额度不足' : insufficientBalanceMessage());
     }
 
     user.reservedTokens = (user.reservedTokens || 0) + tokenReservation;
@@ -1413,7 +1596,22 @@ async function chat(req, res, db, user, apiKeyRec = null) {
   for (const provider of candidates) {
     try {
       const upstreamPayload = { ...payload, stream: wantStream };
-      const upstream = await fetchUpstream(provider, upstreamPayload, outputBudget, model || provider.defaultModel, resolveProxyApiKey(provider, apiKeyRec));
+      const proxyKey = await ensureProxyApiKey(db, user, provider, apiKeyRec);
+      if (!proxyKey) {
+        updateProviderHealth(db, provider.id, false, '缺少可用的上游同步密钥');
+        recordSiteError(db, {
+          source: 'chat',
+          code: 'channel_no_key',
+          message: `无法解析 ${provider.name} 的上游同步密钥`,
+          detail: 'channel apiKey 为空且没有匹配的已同步 sk-',
+          fix: tipsForCode('channel_no_key'),
+          context: { providerId: provider.id, userId: user.id }
+        });
+        writeDb(db);
+        lastError = new Error('missing_proxy_key');
+        continue;
+      }
+      const upstream = await fetchUpstream(provider, upstreamPayload, outputBudget, model || provider.defaultModel, proxyKey);
       if (!upstream.ok) {
         const errText = await upstream.text().catch(() => '');
         updateProviderHealth(db, provider.id, false, `HTTP ${upstream.status}: ${errText.slice(0, 120)}`);
@@ -1631,7 +1829,11 @@ const server = http.createServer(async (req, res) => {
       username = allocateUsername(db, p.name || email.split('@')[0] || 'user');
       if (isReservedUsername(username)) username = allocateUsername(db, 'user');
     }
-    const inviter = p.inviteCode ? db.users.find(x => x.inviteCode === p.inviteCode) : null;
+    const invite = validateInviteCode(db.users, p?.inviteCode);
+    if (!invite.ok) return fail(res, 400, invite.error, { code: invite.code });
+    const inviter = invite.inviter;
+    const trial = trialBalanceFromSettings(db.settings, 1);
+    const trialQuota = trialQuotaFromSettings(db.settings, trial, (amount) => quotaForAmount(amount, db));
     const user = {
       id: id('usr'),
       email,
@@ -1640,14 +1842,14 @@ const server = http.createServer(async (req, res) => {
       password: hash(p.password),
       apiKey: null,
       apiKeys: [],
-      balance: 0,
+      balance: trial,
       bonusBalance: 0,
       invitedBy: inviter ? inviter.id : null,
-      quotaTokens: 0,
+      quotaTokens: trialQuota,
       usedTokens: 0,
       reservedTokens: 0,
       reservedBalance: 0,
-      accountActive: false,
+      accountActive: trial > 0,
       role: 'user',
       invited: 0,
       inviteCode: crypto.randomBytes(4).toString('hex').toUpperCase(),
@@ -1762,6 +1964,7 @@ const server = http.createServer(async (req, res) => {
     if (!rec) return fail(res, 404, '密钥不存在');
     if (req.method === 'DELETE') {
       await syncDeleteVip1129Key(db, rec);
+      await syncDeleteBeibeihaiKey(db, rec);
       user.apiKeys = user.apiKeys.filter(k => k.id !== keyId);
       user.apiKey = user.apiKeys[0]?.key || null;
       writeDb(db);
@@ -2095,10 +2298,9 @@ const server = http.createServer(async (req, res) => {
       const auth = await ensureBeibeihaiToken(db);
       if (auth.ok) {
         const listed = await beibeihaiListGroups(auth.cfg.baseUrl, auth.token);
-        if (listed.ok) {
-          const arr = listed.data?.data || listed.data || [];
-          if (Array.isArray(arr)) groups = arr.map(g => ({ id: g.id, name: g.name, platform: g.platform, rate: g.rate_multiplier, status: g.status }));
-        }
+        if (listed.ok) groups = normalizeAvailableGroups(listed.data);
+        await autofillBeibeihaiGroupMap(db, auth.token);
+        writeDb(db);
       }
     }
     const localGroups = (db.settings?.providers || []).filter(p => isBeibeihaiProvider(p) && !isMaintenanceProvider(p)).map(p => ({ id: p.id, name: p.name, url: p.url }));
@@ -2131,6 +2333,7 @@ const server = http.createServer(async (req, res) => {
     if (cur.enabled && cur.email && cur.password) {
       const auth = await ensureBeibeihaiToken(db);
       probe = { ok: auth.ok, error: auth.ok ? null : auth.error };
+      if (auth.ok) await autofillBeibeihaiGroupMap(db, auth.token);
       writeDb(db);
     }
     return json(res, 200, { upstream: publicBeibeihaiView(getBeibeihaiConfig(db)), probe });
@@ -2144,13 +2347,12 @@ const server = http.createServer(async (req, res) => {
       const auth = await ensureVip1129Token(db);
       if (auth.ok) {
         const listed = await vip1129ListGroups(auth.cfg.baseUrl, auth.token);
-        if (listed.ok) {
-          const arr = listed.data?.data || listed.data || [];
-          if (Array.isArray(arr)) groups = arr.map(g => ({ id: g.id, name: g.name, platform: g.platform, rate: g.rate_multiplier, status: g.status }));
-        }
+        if (listed.ok) groups = normalizeAvailableGroups(listed.data);
+        await autofillVip1129GroupMap(db, auth.token);
+        writeDb(db);
       }
     }
-    const localGroups = (db.settings?.providers || []).filter(p => isVip1129Provider(p)).map(p => ({ id: p.id, name: p.name, url: p.url }));
+    const localGroups = (db.settings?.providers || []).filter(p => isVip1129Provider(p) && !isMaintenanceProvider(p)).map(p => ({ id: p.id, name: p.name, url: p.url }));
     return json(res, 200, { upstream: publicVip1129View(getVip1129Config(db)), groups, localGroups });
   }
 
@@ -2181,6 +2383,7 @@ const server = http.createServer(async (req, res) => {
     if (cur.enabled && cur.email && cur.password) {
       const auth = await ensureVip1129Token(db);
       probe = { ok: auth.ok, error: auth.ok ? null : auth.error };
+      if (auth.ok) await autofillVip1129GroupMap(db, auth.token);
       writeDb(db);
     }
     return json(res, 200, { upstream: publicVip1129View(getVip1129Config(db)), probe });
@@ -2188,26 +2391,44 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/admin/site-settings') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const trial = trialBalanceFromSettings(db.settings, 1);
     return json(res, 200, {
       publicBaseUrl: db.settings.publicBaseUrl || PUBLIC_BASE_URL || '',
       resolvedBaseUrl: resolvePublicBaseUrl(db, req),
-      apiBaseUrl: `${resolvePublicBaseUrl(db, req)}/v1`
+      apiBaseUrl: `${resolvePublicBaseUrl(db, req)}/v1`,
+      trialBalance: trial,
+      trialQuotaTokens: trialQuotaFromSettings(db.settings, trial, (amount) => quotaForAmount(amount, db))
     });
   }
 
   if (req.method === 'PUT' && url.pathname === '/api/admin/site-settings') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
     const p = await body(req);
-    const next = String(p?.publicBaseUrl || '').trim().replace(/\/$/, '');
-    db.settings.publicBaseUrl = next;
-    audit(db, { actorId: user.id, action: 'siteSettings.save', target: 'publicBaseUrl', detail: { publicBaseUrl: next } });
+    if (p?.publicBaseUrl != null) {
+      db.settings.publicBaseUrl = String(p.publicBaseUrl || '').trim().replace(/\/$/, '');
+    }
+    if (p?.trialBalance != null && p.trialBalance !== '') {
+      const trial = Number(p.trialBalance);
+      if (!Number.isFinite(trial) || trial < 0 || trial > 1000) return fail(res, 400, '试用余额必须是 0–1000 的数字');
+      db.settings.trialBalance = trial;
+    }
+    if (p?.trialQuotaTokens != null && p.trialQuotaTokens !== '') {
+      const q = Number(p.trialQuotaTokens);
+      if (!Number.isInteger(q) || q < 0) return fail(res, 400, '试用 Token 配额必须为非负整数');
+      db.settings.trialQuotaTokens = q;
+    }
+    const next = String(db.settings.publicBaseUrl || '').trim().replace(/\/$/, '');
+    audit(db, { actorId: user.id, action: 'siteSettings.save', target: 'siteSettings', detail: { publicBaseUrl: next, trialBalance: db.settings.trialBalance ?? 1 } });
     writeDb(db);
     const resolved = resolvePublicBaseUrl(db, req);
+    const trial = trialBalanceFromSettings(db.settings, 1);
     return json(res, 200, {
       publicBaseUrl: next,
       resolvedBaseUrl: resolved,
       apiBaseUrl: `${resolved}/v1`,
-      message: next ? '已保存站点网址' : '已清空，将自动使用当前访问域名'
+      trialBalance: trial,
+      trialQuotaTokens: trialQuotaFromSettings(db.settings, trial, (amount) => quotaForAmount(amount, db)),
+      message: next ? '已保存站点设置' : '已保存（站点网址留空则自动使用当前访问域名）'
     });
   }
 
@@ -2430,7 +2651,7 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  if (req.method === 'GET' && url.pathname === '/api/admin/pricing') {
+  if (req.method === 'GET' && (url.pathname === '/api/admin/pricing' || url.pathname === '/api/admin/providers')) {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
     return json(res, 200, {
       multiplier: multiplier(db),
@@ -2505,7 +2726,7 @@ const server = http.createServer(async (req, res) => {
       }
       const previous = existing.get(item.id);
       const apiKey = item.apiKey || previous?.apiKey || '';
-      // apiKey 可为空：模型组可先上线，上游配好后再填 Key（无 Key 时不会参与实际转发）
+      // apiKey 可为空：vip1129/beibeihai 走 per-key 同步 sk-，对话和健康检查会注入，不必强制渠道级 Key
       const normalized = normalizeProvider({ ...item, apiKey }, previous);
       // 模型列表以上游 /v1/models 为准，允许先保存渠道再同步
       if (normalized.enabled !== false && (!normalized.models || !normalized.models.length)) {
@@ -2637,7 +2858,7 @@ const server = http.createServer(async (req, res) => {
     ensureUserKeys(user);
     const keyId = url.searchParams.get('keyId');
     const rec = (keyId && user.apiKeys.find(k => k.id === keyId)) || user.apiKeys.find(k => k.enabled !== false) || user.apiKeys[0] || null;
-    if (!rec) return fail(res, 400, '请先在控制台创建 API 密钥');
+    if (!rec && !isUnlimited(user)) return fail(res, 400, '请先在控制台创建 API 密钥');
     return chat(req, res, db, user, rec);
   }
 
@@ -2692,6 +2913,7 @@ initial.settings.paymentQrMeta ??= {
 };
 initial.settings.publicBaseUrl ??= PUBLIC_BASE_URL || '';
 initial.settings.recommendedModel ??= 'gpt-5.6';
+if (initial.settings.trialBalance == null) initial.settings.trialBalance = 1;
 initial.settings.upstreamBeibeihai ??= {
   enabled: true,
   baseUrl: BEIBEIHAI_BASE_URL || BEIBEIHAI_DEFAULT_BASE,
@@ -2724,6 +2946,18 @@ initial.settings.paymentGateway ??= {
 
 initial.settings.providers ??= [];
 if (seedDefaultProviders(initial)) writeDb(initial);
+initial.settings.providers = wireAllProviders(initial.settings.providers, {
+  beibeihaiBase: BEIBEIHAI_BASE_URL || BEIBEIHAI_DEFAULT_BASE,
+  vip1129Base: VIP1129_BASE_URL || VIP1129_DEFAULT_BASE
+});
+{
+  const bb = getBeibeihaiConfig(initial);
+  bb.groupMap = compactGroupMap(bb.groupMap);
+  saveBeibeihaiConfig(initial, bb);
+  const vip = getVip1129Config(initial);
+  vip.groupMap = { ...compactGroupMap(vip1129DefaultGroupMap()), ...compactGroupMap(vip.groupMap) };
+  saveVip1129Config(initial, vip);
+}
 
 for (const user of initial.users) {
   user.quotaTokens ??= 0;
@@ -2776,56 +3010,64 @@ for (const [token, session] of Object.entries(initial.sessions || {})) {
   if (session?.userId) sessions.set(token, session.userId);
 }
 writeDb(initial);
-server.on('error', (err) => {
-  if (err && err.code === 'EADDRINUSE') {
-    console.error(`[启动失败] 端口 ${PORT} 已被占用（EADDRINUSE）。`);
-    console.error('解决办法：');
-    console.error(`  1) 关掉已在运行的中转站进程（任务管理器结束 node，或执行: Get-NetTCPConnection -LocalPort ${PORT} | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }）`);
-    console.error('  2) 或换端口启动: $env:PORT="8788"; npm start');
-    process.exit(1);
-  }
-  console.error('[启动失败]', err);
-  process.exit(1);
-});
-server.listen(PORT, () => console.log(`Relay Station running at http://localhost:${PORT}`));
-
-setImmediate(async () => {
-  try {
-    const bootDb = readDb();
-    const added = topUpCodePools(bootDb, CODE_POOL_TARGET);
-    let poolChanged = added > 0;
-    if (added) console.log(`Code pool topped up: +${added} (target ${CODE_POOL_TARGET}/amount)`);
-    else console.log(`Code pool ready (target ${CODE_POOL_TARGET}/amount)`);
-    const healthResults = await probeAllProviderHealth(bootDb);
-    writeDb(bootDb);
-    const ok = healthResults.filter(r => r.ok && !r.skipped).length;
-    const bad = healthResults.filter(r => !r.ok);
-    console.log(`Channel health probe: ${ok} ok, ${bad.length} down (of ${healthResults.length})`);
-    for (const r of bad) console.warn(`  channel down ${r.name}: ${r.error}`);
-  } catch (err) {
-    console.error('Boot pool/model sync failed:', err);
-  }
-});
-
-setInterval(async () => {
-  try {
-    const dbx = readDb();
-    let changed = false;
-    const added = topUpCodePools(dbx, CODE_POOL_TARGET);
-    if (added) {
-      changed = true;
-      console.log(`[pool] periodic refill +${added}`);
+if (process.env.RELAY_TEST_NO_LISTEN !== '1') {
+  server.on('error', (err) => {
+    if (err && err.code === 'EADDRINUSE') {
+      console.error(`[启动失败] 端口 ${PORT} 已被占用（EADDRINUSE）。`);
+      console.error('解决办法：');
+      console.error(`  1) 关掉已在运行的中转站进程（任务管理器结束 node，或执行: Get-NetTCPConnection -LocalPort ${PORT} | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }）`);
+      console.error('  2) 或换端口启动: $env:PORT="8788"; npm start');
+      process.exit(1);
     }
-    // 每小时探测渠道是否可用（并顺带刷新上游模型列表）
-    const healthResults = await probeAllProviderHealth(dbx);
-    changed = true;
-    const ok = healthResults.filter(r => r.ok && !r.skipped).length;
-    const bad = healthResults.filter(r => !r.ok);
-    console.log(`[health] hourly probe: ${ok} ok, ${bad.length} down`);
-    for (const r of bad) console.warn(`[health] down ${r.name}: ${r.error}`);
-    if (changed) writeDb(dbx);
-  } catch (err) {
-    console.error('[pool/models] periodic job failed:', err);
+    console.error('[启动失败]', err);
+    process.exit(1);
+  });
+  server.listen(PORT, () => console.log(`Relay Station running at http://localhost:${PORT}`));
+
+  if (!SKIP_BOOT_JOBS) {
+    setImmediate(async () => {
+      try {
+        const bootDb = readDb();
+        const added = topUpCodePools(bootDb, CODE_POOL_TARGET);
+        if (added) console.log(`Code pool topped up: +${added} (target ${CODE_POOL_TARGET}/amount)`);
+        else console.log(`Code pool ready (target ${CODE_POOL_TARGET}/amount)`);
+        try {
+          await autofillBeibeihaiGroupMap(bootDb);
+          await autofillVip1129GroupMap(bootDb);
+        } catch (err) {
+          console.warn('Boot upstream group autofill skipped:', err.message || err);
+        }
+        const healthResults = await probeAllProviderHealth(bootDb);
+        writeDb(bootDb);
+        const ok = healthResults.filter(r => r.ok && !r.skipped).length;
+        const bad = healthResults.filter(r => !r.ok);
+        console.log(`Channel health probe: ${ok} ok, ${bad.length} down (of ${healthResults.length})`);
+        for (const r of bad) console.warn(`  channel down ${r.name}: ${r.error}`);
+      } catch (err) {
+        console.error('Boot pool/model sync failed:', err);
+      }
+    });
+
+    setInterval(async () => {
+      try {
+        const dbx = readDb();
+        let changed = false;
+        const added = topUpCodePools(dbx, CODE_POOL_TARGET);
+        if (added) {
+          changed = true;
+          console.log(`[pool] periodic refill +${added}`);
+        }
+        const healthResults = await probeAllProviderHealth(dbx);
+        changed = true;
+        const ok = healthResults.filter(r => r.ok && !r.skipped).length;
+        const bad = healthResults.filter(r => !r.ok);
+        console.log(`[health] hourly probe: ${ok} ok, ${bad.length} down`);
+        for (const r of bad) console.warn(`[health] down ${r.name}: ${r.error}`);
+        if (changed) writeDb(dbx);
+      } catch (err) {
+        console.error('[pool/models] periodic job failed:', err);
+      }
+    }, 60 * 60 * 1000);
   }
-}, 60 * 60 * 1000);
+}
 

@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "test": "node test/relay-fixes.test.mjs && node test/http-onboarding.test.mjs"
   }
 }
