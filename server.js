@@ -28,10 +28,11 @@ import {
 } from './upstream/beibeihai.js';
 import { ensureSiteErrors, recordSiteError, clearSiteErrors, tipsForCode, failPayload, SITE_ERROR_CAP } from './diagnostics/site-errors.js';
 import { runDiagnosticSuite } from './diagnostics/run-suite.js';
+import { claimCheckIn, checkInStatus, checkInAdminStats, CHECKIN_LOG_STATUS } from './lib/checkin.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, 'public');
-const dataDir = path.join(__dirname, 'data');
+const dataDir = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
 const dbFile = path.join(dataDir, 'db.json');
 const PORT = Number(process.env.PORT || 8787);
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || process.env.SITE_URL || '').trim().replace(/\/$/, '');
@@ -278,7 +279,7 @@ function poolStats(db) {
   let requestCountToday = 0;
   for (const log of db.logs || []) {
     if (!log?.createdAt || localDay(new Date(log.createdAt)) !== day) continue;
-    if (log.status === 'referral_rebate') continue;
+    if (log.status === 'referral_rebate' || log.status === CHECKIN_LOG_STATUS) continue;
     requestCountToday += 1;
     const up = Number(log.upstreamCost || 0);
     const charged = Number(log.chargedAmount || 0);
@@ -323,7 +324,7 @@ const RATE_WINDOW_MS = 60_000;
 const AUDIT_CAP = 5000;
 
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-if (!fs.existsSync(dbFile)) fs.writeFileSync(dbFile, JSON.stringify({ users: [], rechargeCodes: [], logs: [], auditLogs: [], sessions: {}, settings: {} }, null, 2));
+if (!fs.existsSync(dbFile)) fs.writeFileSync(dbFile, JSON.stringify({ users: [], rechargeCodes: [], logs: [], auditLogs: [], sessions: {}, settings: {}, checkIns: [] }, null, 2));
 
 function readDb() { return JSON.parse(fs.readFileSync(dbFile, 'utf8')); }
 function writeDb(db) { fs.writeFileSync(dbFile, JSON.stringify(db, null, 2)); }
@@ -927,6 +928,7 @@ function safeUser(user) {
     apiKey: user.apiKey,
     balance: user.balance || 0,
     bonusBalance: user.bonusBalance || 0,
+    checkInBonus: user.checkInBonus || 0,
     quotaTokens: user.quotaTokens || 0,
     usedTokens: user.usedTokens || 0,
     availableTokens: availableTokens(user),
@@ -1642,6 +1644,7 @@ const server = http.createServer(async (req, res) => {
       apiKeys: [],
       balance: 0,
       bonusBalance: 0,
+      checkInBonus: 0,
       invitedBy: inviter ? inviter.id : null,
       quotaTokens: 0,
       usedTokens: 0,
@@ -1798,7 +1801,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/dashboard') {
     if (!user) return fail(res, 401, '未登录');
-    const logs = db.logs.filter(x => x.userId === user.id && x.status !== 'referral_rebate');
+    const logs = db.logs.filter(x => x.userId === user.id && x.status !== 'referral_rebate' && x.status !== CHECKIN_LOG_STATUS);
     const totalTokens = logs.reduce((sum, x) => sum + (x.billedTokens ?? x.tokens * (x.multiplier || DEFAULT_MULTIPLIER)), 0);
     const avgLatency = logs.length ? Math.round(logs.reduce((sum, x) => sum + x.latency, 0) / logs.length) : 0;
     const displayLogs = logs.slice(0, 30).map(x => ({
@@ -1821,6 +1824,51 @@ const server = http.createServer(async (req, res) => {
       inviteCode: user.inviteCode,
       inviteCount: user.invited
     });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/checkin') {
+    if (!user) return fail(res, 401, '未登录');
+    if (!rateLimit(req, res, 30, 'checkin')) return;
+    db.checkIns ??= [];
+    const result = claimCheckIn(db, user);
+    if (!result.ok) {
+      return json(res, result.status || 409, {
+        error: result.error,
+        alreadyCheckedIn: result.alreadyCheckedIn === true,
+        date: result.date,
+        amount: result.amount,
+        balance: result.balance
+      });
+    }
+    audit(db, { actorId: user.id, action: 'checkin.claim', target: user.id, detail: { date: result.date, amount: result.amount } });
+    writeDb(db);
+    return json(res, 200, {
+      amount: result.amount,
+      balance: result.balance,
+      alreadyCheckedIn: false,
+      date: result.date
+    });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/checkin/status') {
+    if (!user) return fail(res, 401, '未登录');
+    db.checkIns ??= [];
+    const status = checkInStatus(db, user);
+    return json(res, 200, {
+      checkedInToday: status.checkedInToday,
+      todayAmount: status.todayAmount,
+      streak: status.streak,
+      date: status.date,
+      timezone: status.timezone,
+      checkInBonus: status.checkInBonus,
+      recent: status.recent
+    });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/admin/checkin') {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    db.checkIns ??= [];
+    return json(res, 200, checkInAdminStats(db));
   }
 
 
@@ -2680,6 +2728,7 @@ initial.settings ??= {};
 initial.auditLogs ??= [];
 initial.sessions ??= {};
 initial.paymentOrders ??= [];
+initial.checkIns ??= [];
 initial.siteErrors ??= [];
 ensureSiteErrors(initial);
 initial.settings.billingMultiplier ??= DEFAULT_MULTIPLIER;
@@ -2731,6 +2780,7 @@ for (const user of initial.users) {
   user.reservedTokens ??= 0;
   user.reservedBalance ??= 0;
   user.accountActive ??= (user.balance || 0) > 0;
+  user.checkInBonus ??= 0;
   user.role ??= (ADMIN_EMAIL && user.email === ADMIN_EMAIL) ? 'admin' : 'user';
   ensureUsername(user, initial);
   ensureUserKeys(user);
@@ -2776,6 +2826,7 @@ for (const [token, session] of Object.entries(initial.sessions || {})) {
   if (session?.userId) sessions.set(token, session.userId);
 }
 writeDb(initial);
+const skipBootJobs = String(process.env.SKIP_BOOT_JOBS || '') === '1';
 server.on('error', (err) => {
   if (err && err.code === 'EADDRINUSE') {
     console.error(`[启动失败] 端口 ${PORT} 已被占用（EADDRINUSE）。`);
@@ -2787,9 +2838,13 @@ server.on('error', (err) => {
   console.error('[启动失败]', err);
   process.exit(1);
 });
-server.listen(PORT, () => console.log(`Relay Station running at http://localhost:${PORT}`));
+server.listen(PORT, () => {
+  const addr = server.address();
+  const actual = typeof addr === 'object' && addr ? addr.port : PORT;
+  console.log(`Relay Station running at http://localhost:${actual}`);
+});
 
-setImmediate(async () => {
+if (!skipBootJobs) setImmediate(async () => {
   try {
     const bootDb = readDb();
     const added = topUpCodePools(bootDb, CODE_POOL_TARGET);
@@ -2807,7 +2862,7 @@ setImmediate(async () => {
   }
 });
 
-setInterval(async () => {
+if (!skipBootJobs) setInterval(async () => {
   try {
     const dbx = readDb();
     let changed = false;

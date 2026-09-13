@@ -172,3 +172,10 @@ a.ghost-btn.cc-btn{border:1px solid #43503a;background:#1a201c;color:var(--lime)
 .fix-list li{margin:2px 0}
 .tag.warn{background:rgba(245,158,11,.15);color:#f59e0b}
 .tag.danger{background:rgba(239,68,68,.15);color:#ef4444}
+
+.checkin-card{max-width:760px}
+.checkin-hero{display:flex;justify-content:space-between;align-items:center;gap:16px}
+.checkin-btn{width:100%;margin-top:20px}
+.primary-btn:disabled{opacity:.55;cursor:not-allowed;filter:grayscale(.15)}
+.checkin-card .ref-stats{margin-top:18px}
+@media(max-width:600px){.checkin-hero{flex-direction:column;align-items:flex-start}.checkin-hero .reward{font-size:24px}}

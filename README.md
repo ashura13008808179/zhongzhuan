@@ -86,6 +86,24 @@ GET  /api/admin/orders
 
 认证限流约 60 次/分钟/IP，聊天接口约 120 次/分钟/IP。`POST /api/auth/logout` 可清除会话。
 
+## 每日签到
+
+登录用户每天可签到一次，按 **Asia/Shanghai（北京时间）** 的 `YYYY-MM-DD` 自然日计算，不可重复领取。奖励金额在 ¥0.05–¥0.50（含两端，两位小数）之间按逆幂加权抽样：高额更少见，离散分布的理论均值约为 ¥0.10。奖励直接计入用户 `balance`，来源写入 `db.checkIns` 与账单日志 `checkin_bonus`；累计签到额记在 `checkInBonus`，**不会**写入邀请返利的 `bonusBalance`。
+
+```text
+POST /api/checkin            # 领取今日奖励 → { amount, balance, alreadyCheckedIn, date }
+GET  /api/checkin/status     # { checkedInToday, todayAmount?, streak, recent }
+GET  /api/admin/checkin      # 管理员：今日人数/金额与最近记录
+```
+
+同一自然日再次领取返回 HTTP 409，中文提示「今日已签到，请明天再来」。
+
+```powershell
+npm test
+```
+
+`npm test` 会验证抽样均值并跑一轮签到 API（独立临时目录，不写生产 `data/db.json`）。
+
 
 ## 聚合支付（易支付兼容）
 

@@ -1,4 +1,4 @@
-const $=s=>document.querySelector(s);let token=localStorage.getItem('relay_token'),me=null,data=null;
+const $=s=>document.querySelector(s);let token=localStorage.getItem('relay_token'),me=null,data=null,checkin=null;
 const authView=$('#authView'),dash=$('#dashboard'),page=$('#page');
 function esc(x=''){return String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{})}});const j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.error||'请求失败');return j}
@@ -19,11 +19,13 @@ setAuthMode('login');
 $('#loginForm').onsubmit=async e=>{e.preventDefault();try{const j=await api('/api/auth/login',{method:'POST',body:JSON.stringify({login:$('#loginIdentifier').value.trim(),password:$('#loginPassword').value})});token=j.token;localStorage.setItem('relay_token',token);await boot()}catch(err){msg(err.message)}};
 $('#registerForm').onsubmit=async e=>{e.preventDefault();try{const j=await api('/api/auth/register',{method:'POST',body:JSON.stringify({email:$('#regEmail').value.trim(),username:$('#regUsername').value.trim(),name:$('#regName').value.trim(),password:$('#regPassword').value,inviteCode:$('#regInvite').value.trim()})});token=j.token;localStorage.setItem('relay_token',token);await boot()}catch(err){msg(err.message)}};
 $('#logoutBtn').onclick=async()=>{try{if(token)await api('/api/auth/logout',{method:'POST'});}catch{}localStorage.removeItem('relay_token');location.reload()};
-async function boot(){try{data=await api('/api/dashboard');me=data.user;authView.hidden=true;dash.hidden=false;$('#sideName').textContent=me.name;$('#sideEmail').textContent=me.username?`@${me.username}`:me.email;$('#sideAvatar').textContent=(me.name||me.username||'?')[0].toUpperCase();$('#topAvatar').textContent=(me.name||me.username||'?')[0].toUpperCase();render('overview')}catch{localStorage.removeItem('relay_token');token=null}}
+async function boot(){try{data=await api('/api/dashboard');me=data.user;try{checkin=await api('/api/checkin/status')}catch{checkin=null}authView.hidden=true;dash.hidden=false;$('#sideName').textContent=me.name;$('#sideEmail').textContent=me.username?`@${me.username}`:me.email;$('#sideAvatar').textContent=(me.name||me.username||'?')[0].toUpperCase();$('#topAvatar').textContent=(me.name||me.username||'?')[0].toUpperCase();render('overview')}catch{localStorage.removeItem('relay_token');token=null}}
 function shell(title,kicker,html){$('#pageTitle').textContent=title;page.innerHTML=`<div class="page-head"><div><p class="eyebrow">${kicker}</p><h1>${title}</h1><p class="sub">管理你的 Relay Station 账户与 API 服务</p></div></div>${html}`}
 function render(name){
   document.querySelectorAll('[data-page]').forEach(a=>a.classList.toggle('active',a.dataset.page===name));
-  if(name==='overview')shell('数据概览','ACCOUNT OVERVIEW',`<div class="metric-grid"><article><small>账户余额</small><strong>${me.unlimited||me.isAdmin?'无限':('¥'+Number(me.balance||0).toFixed(2))}</strong><span class="green">${me.unlimited||me.isAdmin?'管理员不扣本地余额':'可用于 API 调用'}</span></article><article><small>累计请求</small><strong>${data.stats.requests.toLocaleString()}</strong><span>成功率 ${data.stats.requests?Math.round(data.stats.success/data.stats.requests*100):100}%</span></article><article><small>剩余 API 配额</small><strong>${data.stats.availableTokens.toLocaleString()}</strong><span>已使用 ${data.stats.usedTokens.toLocaleString()} / ${data.stats.quotaTokens.toLocaleString()}</span></article><article><small>邀请奖励</small><strong>¥${me.bonusBalance.toFixed(2)}</strong><span>已邀请 ${data.inviteCount} 位用户</span></article></div><div class="content-grid"><section class="card"><div class="card-head"><div><p class="eyebrow">RECENT REQUESTS</p><h2>最近请求</h2></div><button class="link-btn" data-page="logs">查看全部 →</button></div><table><thead><tr><th>模型</th><th>Token</th><th>延迟</th><th>状态</th><th>时间</th></tr></thead><tbody>${data.logs.slice(0,8).map(l=>`<tr><td>${esc(l.model)}</td><td>${l.tokens}</td><td>${l.latency}ms</td><td><span class="tag success">成功</span></td><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无请求记录</td></tr>'}</tbody></table></section><section class="card balance-card"><p class="eyebrow">QUICK ACTIONS</p><h2>快捷操作</h2><button class="action" data-page="api"><span>◈</span><div><b>查看 API 接入</b><small>复制你的专属调用密钥</small></div><i>→</i></button><button class="action" data-page="billing"><span>◇</span><div><b>卡密充值</b><small>充值后立即到账</small></div><i>→</i></button><button class="action" data-page="referral"><span>♧</span><div><b>邀请好友</b><small>好友付费后返利 10%</small></div><i>→</i></button></section></div>`);
+  if(name==='overview')shell('数据概览','ACCOUNT OVERVIEW',`<div class="metric-grid"><article><small>账户余额</small><strong>${me.unlimited||me.isAdmin?'无限':('¥'+Number(me.balance||0).toFixed(2))}</strong><span class="green">${me.unlimited||me.isAdmin?'管理员不扣本地余额':'可用于 API 调用'}</span></article><article><small>累计请求</small><strong>${data.stats.requests.toLocaleString()}</strong><span>成功率 ${data.stats.requests?Math.round(data.stats.success/data.stats.requests*100):100}%</span></article><article><small>剩余 API 配额</small><strong>${data.stats.availableTokens.toLocaleString()}</strong><span>已使用 ${data.stats.usedTokens.toLocaleString()} / ${data.stats.quotaTokens.toLocaleString()}</span></article><article><small>邀请奖励</small><strong>¥${me.bonusBalance.toFixed(2)}</strong><span>已邀请 ${data.inviteCount} 位用户</span></article></div><div class="content-grid"><section class="card"><div class="card-head"><div><p class="eyebrow">RECENT REQUESTS</p><h2>最近请求</h2></div><button class="link-btn" data-page="logs">查看全部 →</button></div><table><thead><tr><th>模型</th><th>Token</th><th>延迟</th><th>状态</th><th>时间</th></tr></thead><tbody>${data.logs.slice(0,8).map(l=>`<tr><td>${esc(l.model)}</td><td>${l.tokens}</td><td>${l.latency}ms</td><td><span class="tag success">成功</span></td><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无请求记录</td></tr>'}</tbody></table></section><section class="card balance-card"><p class="eyebrow">QUICK ACTIONS</p><h2>快捷操作</h2><button class="action" data-page="checkin"><span>✦</span><div><b>每日签到</b><small>${checkin?.checkedInToday?`今日已领 ¥${Number(checkin.todayAmount||0).toFixed(2)}`:'随机领取 ¥0.05–¥0.50'}</small></div><i>→</i></button><button class="action" data-page="api"><span>◈</span><div><b>查看 API 接入</b><small>复制你的专属调用密钥</small></div><i>→</i></button><button class="action" data-page="billing"><span>◇</span><div><b>卡密充值</b><small>充值后立即到账</small></div><i>→</i></button><button class="action" data-page="referral"><span>♧</span><div><b>邀请好友</b><small>好友付费后返利 10%</small></div><i>→</i></button></section></div>`);
+  if(name==='checkin'){renderCheckIn();return;}
+  if(name==='operations'){renderOperations();return;}
   if(name==='api'){renderApiKeys();return;}
   if(name==='logs')shell('使用日志','REQUEST LOGS',`<section class="card"><div class="card-head"><div><p class="eyebrow">AUDIT TRAIL</p><h2>全部请求记录</h2></div><span class="sub">最近 30 条</span></div><table><thead><tr><th>时间</th><th>模型</th><th>Token</th><th>延迟</th><th>状态</th></tr></thead><tbody>${data.logs.map(l=>`<tr><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td><td>${esc(l.model)}</td><td>${l.tokens}</td><td>${l.latency}ms</td><td><span class="tag success">成功</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无日志</td></tr>'}</tbody></table></section>`);
   if(name==='billing'){
@@ -291,6 +293,60 @@ function render(name){
   document.querySelectorAll('[data-page]').forEach(a=>a.onclick=()=>render(a.dataset.page));
 }
 
+async function renderCheckIn(){
+  shell('每日签到','DAILY CHECK-IN','<section class="card"><p class="sub">正在加载签到状态…</p></section>');
+  try{
+    checkin=await api('/api/checkin/status');
+  }catch(err){
+    shell('每日签到','DAILY CHECK-IN',`<section class="card"><h2>无法加载签到</h2><p class="sub">${esc(err.message||'请求失败')}</p></section>`);
+    return;
+  }
+  const done=!!checkin.checkedInToday;
+  const todayAmt=done?Number(checkin.todayAmount||0).toFixed(2):null;
+  const streak=Number(checkin.streak||0);
+  const bonus=Number(checkin.checkInBonus||me.checkInBonus||0).toFixed(2);
+  const recent=checkin.recent||[];
+  const rows=recent.map(r=>`<tr><td>${esc(r.date)}</td><td>¥${Number(r.amount||0).toFixed(2)}</td><td>${r.at?new Date(r.at).toLocaleString('zh-CN'):'-'}</td></tr>`).join('')||'<tr><td colspan="3" class="empty">暂无签到记录</td></tr>';
+  shell('每日签到','DAILY CHECK-IN',`<section class="card checkin-card">
+    <div class="checkin-hero">
+      <div>
+        <p class="eyebrow">${done?'CHECKED IN':'READY TO CLAIM'}</p>
+        <h2>${done?'今日已签到':'领取今日奖励'}</h2>
+        <p class="sub">每个北京时间自然日（Asia/Shanghai）可签到一次，随机获得 ¥0.05–¥0.50 余额。高额更少见，长期日均约 ¥0.10。奖励计入账户余额，与邀请返利分开统计。</p>
+      </div>
+      <div class="reward">${done?('¥'+todayAmt):'¥0.05+'}</div>
+    </div>
+    <button class="primary-btn checkin-btn" id="checkinBtn" ${done?'disabled':''} type="button">${done?'今日已领取':'立即签到 ↗'}</button>
+    <div id="checkinMsg" class="inline-msg${done?' ok':''}">${done?`今日奖励 ¥${todayAmt} 已到账`:'签到后立即到账，可用于 API 调用'}</div>
+    <div class="ref-stats">
+      <div><b>${streak}</b><span>连续签到（天）</span></div>
+      <div><b>¥${bonus}</b><span>累计签到奖励</span></div>
+      <div><b>${esc(checkin.date||'')}</b><span>今日日期 · 北京时间</span></div>
+    </div>
+  </section>
+  <section class="card" style="margin-top:16px">
+    <div class="card-head"><div><p class="eyebrow">HISTORY</p><h2>最近签到</h2></div><span class="sub">最近 ${recent.length} 条</span></div>
+    <table><thead><tr><th>日期</th><th>金额</th><th>时间</th></tr></thead><tbody>${rows}</tbody></table>
+  </section>`);
+  $('#checkinBtn')?.addEventListener('click',async()=>{
+    const btn=$('#checkinBtn');
+    const msg=$('#checkinMsg');
+    if(!btn||btn.disabled)return;
+    btn.disabled=true;
+    if(msg){msg.textContent='正在签到…';msg.className='inline-msg';}
+    try{
+      const j=await api('/api/checkin',{method:'POST',body:'{}'});
+      if(me){me.balance=j.balance;me.checkInBonus=Number((me.checkInBonus||0)+j.amount);}
+      if(data?.user){data.user.balance=j.balance;}
+      checkin={...checkin,checkedInToday:true,todayAmount:j.amount,streak:(checkin.streak||0)+((checkin.checkedInToday)?0:1),checkInBonus:Number(me?.checkInBonus||0),recent:[{date:j.date,amount:j.amount,at:new Date().toISOString()},...(checkin.recent||[])]};
+      renderCheckIn();
+    }catch(err){
+      if(msg){msg.textContent=err.message||'签到失败';msg.className='inline-msg';}
+      btn.disabled=false;
+    }
+  });
+}
+
 function keyLimitLabel(key){
   return key.spendLimit>0
     ? `额度 ¥${Number(key.spendUsed||0).toFixed(2)} / ${Number(key.spendLimit).toFixed(2)}`
@@ -533,7 +589,8 @@ function adminTabsHtml() {
     ['beibeihai', 'Beibeihai同步'],
     ['errors', '网站错误'],
     ['diag', '诊断测试'],
-    ['pool', '今日财务']
+    ['pool', '今日财务'],
+    ['checkin', '签到']
   ];
   return `<div class="admin-tabs">${tabs.map(([id, label]) => `<button class="admin-tab ${adminTab===id?'active':''}" data-admin-tab="${id}">${label}</button>`).join('')}</div>`;
 }
@@ -1103,6 +1160,19 @@ async function renderOperations() {
           }catch(err){alert(err.message||'拒绝失败');}
         };
       });
+    } else if (adminTab === 'checkin') {
+      const stats = await api('/api/admin/checkin');
+      const recent = stats.recent || [];
+      const rows = recent.map(r => `<tr><td>${esc(r.date)}</td><td>@${esc(r.username||'-')}</td><td>${esc(r.email||'-')}</td><td>¥${Number(r.amount||0).toFixed(2)}</td><td>${r.at?new Date(r.at).toLocaleString('zh-CN'):'-'}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">暂无签到记录</td></tr>';
+      shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}
+      <div class="metric-grid admin-finance">
+        <article><small>今日签到人数</small><strong>${Number(stats.today?.users||0)}</strong><span class="green">${esc(stats.today?.date||'')} · 北京时间</span></article>
+        <article><small>今日发放</small><strong>¥${Number(stats.today?.amount||0).toFixed(2)}</strong><span>签到奖励合计</span></article>
+        <article><small>累计记录</small><strong>${Number(stats.totals?.records||0)}</strong><span>${Number(stats.totals?.users||0)} 位用户</span></article>
+        <article><small>累计发放</small><strong>¥${Number(stats.totals?.amount||0).toFixed(2)}</strong><span>全部签到奖励</span></article>
+      </div>
+      <section class="card"><div class="card-head"><div><p class="eyebrow">CHECK-IN LOG</p><h2>最近签到</h2><p class="sub">日期按 Asia/Shanghai 自然日计算，奖励计入用户余额（不计入邀请返利）。</p></div><span class="sub">${recent.length} 条</span></div>
+      <table class="admin-table"><thead><tr><th>日期</th><th>用户名</th><th>邮箱</th><th>金额</th><th>时间</th></tr></thead><tbody>${rows}</tbody></table></section>`);
     } else if (adminTab === 'orders') {
       const { orders } = await api('/api/admin/orders');
       shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><div class="card-head"><div><p class="eyebrow">ORDERS</p><h2>兑换订单</h2></div><span class="sub">${orders.length} 笔</span></div><table class="admin-table"><thead><tr><th>订单 ID</th><th>卡密</th><th>金额</th><th>配额</th><th>用户</th><th>兑换时间</th></tr></thead><tbody>${orders.map(o=>`<tr><td>${esc(o.id)}</td><td><code>${esc(o.code)}</code></td><td>¥${Number(o.amount).toFixed(2)}</td><td>${Number(o.quotaTokens).toLocaleString()}</td><td>${esc(o.userId||'-')}</td><td>${o.redeemedAt?new Date(o.redeemedAt).toLocaleString('zh-CN'):'-'}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">暂无订单</td></tr>'}</tbody></table></section>`);
