@@ -312,7 +312,7 @@ async function renderCheckIn(){
       <div>
         <p class="eyebrow">${done?'CHECKED IN':'READY TO CLAIM'}</p>
         <h2>${done?'今日已签到':'领取今日奖励'}</h2>
-        <p class="sub">每个北京时间自然日（Asia/Shanghai）可签到一次，随机获得 ¥0.05–¥0.50 余额。高额更少见，长期日均约 ¥0.10。奖励计入账户余额，与邀请返利分开统计。</p>
+        <p class="sub">每个北京时间自然日（Asia/Shanghai）可签到一次，随机获得 ¥0.05–¥0.50 余额。奖励计入账户余额，与邀请返利分开统计。</p>
       </div>
       <div class="reward">${done?('¥'+todayAmt):'¥0.05+'}</div>
     </div>
