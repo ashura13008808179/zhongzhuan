@@ -182,7 +182,7 @@ a.ghost-btn.cc-btn{border:1px solid #43503a;background:#1a201c;color:var(--lime)
 
 /* Mobile layout: auth + dashboard drawer */
 html{overflow-x:hidden}
-body{overflow-x:hidden;max-width:100%}
+body{overflow-x:hidden;max-width:100%;font-family:'Space Grotesk','PingFang SC','Hiragino Sans GB','Noto Sans SC','WenQuanYi Micro Hei',Arial,sans-serif}
 body.nav-lock{overflow:hidden}
 .auth-view,.auth-card,.topbar-left,.crumbs,.profile>div,.workspace div,.key-box code,.invite-box code{min-width:0}
 .topbar-left{display:flex;align-items:center;gap:10px;min-width:0}
