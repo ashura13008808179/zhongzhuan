@@ -17,6 +17,7 @@
 主要文件：
 
 - `server.js`：认证、计费、渠道路由、用户 API、管理员 API、静态资源服务
+- `lib/checkin.js`：每日签到日期、逆幂抽样、领取与统计
 - `public/index.html`：登录和用户控制台入口
 - `public/app.js`：用户控制台与管理员运营配置页
 - `public/styles.css`：页面样式
@@ -35,7 +36,8 @@
 - OpenAI Chat Completions 兼容入口：`POST /v1/chat/completions`
 - 网页测试入口：`POST /api/chat`
 - **流式响应**：`stream: true` 时转发上游 SSE；结束时按 usage 或估算结算并释放预留；客户端中断时释放预留
-- 用户余额、Token 配额、调用日志、卡密兑换、邀请返利
+- 用户余额、Token 配额、调用日志、卡密兑换、邀请返利（好友充值后邀请人得 **5%**，计入 `bonusBalance` + `balance`）
+- **每日签到**：`POST /api/checkin`、`GET /api/checkin/status`、`GET /api/admin/checkin`。按 Asia/Shanghai 自然日每天一次；奖励 ¥0.05–¥0.50（逆幂加权，理论日均 ≈ 0.10）计入 `balance`，记录在 `db.checkIns`，累计 `checkInBonus`，不改邀请 `bonusBalance`
 - 请求前配额与金额预留，避免并发超额
 - 余额安全阈值：接近耗尽时主动停用账户并拒绝后续请求
 - 多渠道按模型名称路由，并按 `priority`（越小越高）排序
@@ -192,6 +194,7 @@ $env:BALANCE_SAFETY_BUFFER="0.01"
 ```powershell
 node --check server.js
 node --check public/app.js
+npm test
 npm start
 ```
 

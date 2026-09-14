@@ -54,6 +54,13 @@ export async function listAvailableGroups(baseUrl, token) {
   return readJson(res);
 }
 
+export async function listKeys(baseUrl, token, query = 'page=1&page_size=50') {
+  const base = normalizeBase(baseUrl);
+  const q = query ? (query.startsWith('?') ? query : `?${query}`) : '';
+  const res = await fetch(`${base}/api/v1/keys${q}`, { headers: authHeaders(token) });
+  return readJson(res);
+}
+
 export async function createKey(baseUrl, token, body = {}) {
   const base = normalizeBase(baseUrl);
   const payload = { name: String(body.name || 'relay').slice(0, 64) };
@@ -97,14 +104,14 @@ export function isBeibeihaiProvider(provider) {
   return url.includes('beibeihai.xyz') || provider?.upstreamSync === 'beibeihai';
 }
 
-/** Default local→upstream group map filled after login (ids vary per account). */
+/**
+ * Default local→upstream group map.
+ * IDs differ per Beibeihai account, so defaults stay empty (not null placeholders).
+ * After login we call listAvailableGroups and fill via suggestGroupMap().
+ * Null/empty values must NOT count as mapped channels.
+ */
 export function defaultGroupMap() {
-  return {
-    grp_deepseek: null,
-    grp_grok: null,
-    grp_cc_max: null,
-    grp_claude_cursor: null
-  };
+  return {};
 }
 
 export { DEFAULT_BASE };

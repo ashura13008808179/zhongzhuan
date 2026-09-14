@@ -2,6 +2,15 @@
 
 这是一个可直接上传服务器运行的 Node.js 全栈版本。用户前端只看到自己的账号信息、专属 Relay API Key、请求日志、数据概览、卡密充值、邀请返利和客服联系信息；上游模型密钥只存在服务端环境变量中。
 
+## 验证
+
+```powershell
+npm test
+node --check server.js
+```
+
+`npm test` 覆盖：上游同步密钥解析、Beibeihai 分组自动匹配、无效邀请码拒绝、空邀请码注册（余额为 0）、`GET /api/admin/providers` 别名。不会连接真实上游，也不会写入密钥。
+
 ## 运行
 
 ```powershell
@@ -72,6 +81,7 @@ Content-Type: application/json
 
 ```text
 GET  /api/admin/pricing
+GET  /api/admin/providers   # 与 pricing 相同（兼容旧引用）
 PUT  /api/admin/pricing
 PUT  /api/admin/providers
 GET  /api/admin/users
@@ -85,6 +95,24 @@ GET  /api/admin/orders
 管理员登录后侧栏「运营配置」提供倍率、渠道表单、用户、卡密、审计、订单 Tab。渠道密钥不会返回给普通用户接口。数据仍使用 `data/db.json`（MySQL 暂缓）。
 
 认证限流约 60 次/分钟/IP，聊天接口约 120 次/分钟/IP。`POST /api/auth/logout` 可清除会话。
+
+## 每日签到
+
+登录用户每天可签到一次，按 **Asia/Shanghai（北京时间）** 的 `YYYY-MM-DD` 自然日计算，不可重复领取。奖励金额在 ¥0.05–¥0.50（含两端，两位小数）之间按逆幂加权抽样：高额更少见，离散分布的理论均值约为 ¥0.10。奖励直接计入用户 `balance`，来源写入 `db.checkIns` 与账单日志 `checkin_bonus`；累计签到额记在 `checkInBonus`，**不会**写入邀请返利的 `bonusBalance`。
+
+```text
+POST /api/checkin            # 领取今日奖励 → { amount, balance, alreadyCheckedIn, date }
+GET  /api/checkin/status     # { checkedInToday, todayAmount?, streak, recent }
+GET  /api/admin/checkin      # 管理员：今日人数/金额与最近记录
+```
+
+同一自然日再次领取返回 HTTP 409，中文提示「今日已签到，请明天再来」。
+
+```powershell
+npm test
+```
+
+`npm test` 会验证抽样均值并跑一轮签到 API（独立临时目录，不写生产 `data/db.json`）。
 
 
 ## 聚合支付（易支付兼容）
@@ -113,3 +141,23 @@ GET  /api/admin/orders
 完整对话：`https://你的域名/v1/chat/completions`
 
 上游渠道（如 Codex 直连 vip1129）只配在管理后台「渠道」，不对用户展示。
+
+## Windows ECS 部署（已有 VIP1129_* / BEIBEIHAI_*）
+
+代码更新后在服务器上拉最新并重启 Node 即可。启动时会：
+
+1. 给 GPT 组打上 `upstreamSync=vip1129`，给 DeepSeek / Grok / CC-MAX / Claude-Cursor 打上 `upstreamSync=beibeihai`，并把仍指向官方厂商的旧 URL 改到对应中转 `/v1/chat/completions`
+2. Cursor账号池保持维护中
+3. 登录上游成功后按分组名自动填 `groupMap`（仍可在「Beibeihai同步 / vip1129同步」里手改）
+
+```powershell
+cd C:\path\to\zhongzhuan
+git pull
+# 环境变量保持原样，例如：
+# $env:VIP1129_EMAIL / $env:VIP1129_PASSWORD / $env:VIP1129_BASE_URL
+# $env:BEIBEIHAI_EMAIL / $env:BEIBEIHAI_PASSWORD / $env:BEIBEIHAI_BASE_URL
+# 若用 NSSM / 任务计划 / start-local.ps1 托管，重启该进程
+npm start
+```
+
+重启后打开运营配置 → 诊断测试。GPT 健康检查应注入已同步的 `sk-`，不再因渠道级 Key 为空而报 `API_KEY_REQUIRED`。Beibeihai 映射数应大于 0；若仍提示未映射，到同步页保存一次登录，让 `listAvailableGroups` 自动匹配。
