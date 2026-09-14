@@ -1,5 +1,31 @@
 const $=s=>document.querySelector(s);let token=localStorage.getItem('relay_token'),me=null,data=null,checkin=null;
 const authView=$('#authView'),dash=$('#dashboard'),page=$('#page');
+function isMobileNav(){ return window.matchMedia('(max-width: 600px)').matches; }
+function setMobileNav(open){
+  if(!dash) return;
+  dash.classList.toggle('nav-open', !!open);
+  document.body.classList.toggle('nav-lock', !!open);
+  const btn=$('#menuBtn'), backdrop=$('#sidebarBackdrop'), side=$('#appSidebar');
+  if(btn){
+    btn.setAttribute('aria-expanded', open?'true':'false');
+    btn.setAttribute('aria-label', open?'关闭菜单':'打开菜单');
+  }
+  if(backdrop) backdrop.hidden=!open;
+  if(side){
+    if(isMobileNav()) side.setAttribute('aria-hidden', open?'false':'true');
+    else side.removeAttribute('aria-hidden');
+  }
+}
+function closeMobileNav(){ setMobileNav(false); }
+function toggleMobileNav(){ setMobileNav(!dash?.classList.contains('nav-open')); }
+$('#menuBtn')?.addEventListener('click', e=>{ e.stopPropagation(); toggleMobileNav(); });
+$('#sidebarBackdrop')?.addEventListener('click', closeMobileNav);
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeMobileNav(); });
+window.matchMedia('(max-width: 600px)').addEventListener('change', e=>{
+  if(!e.matches) closeMobileNav();
+  else setMobileNav(false);
+});
+
 function esc(x=''){return String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{})}});const j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.error||'请求失败');return j}
 function msg(t,ok=false){const e=$('#authMessage');e.textContent=t;e.className=`auth-message ${ok?'ok':''}`}
@@ -12,6 +38,7 @@ function setAuthMode(mode){
   const login=$('#loginForm'), reg=$('#registerForm');
   if(login){ login.hidden = mode!=='login'; login.style.display = mode==='login' ? '' : 'none'; }
   if(reg){ reg.hidden = mode!=='register'; reg.style.display = mode==='register' ? '' : 'none'; }
+  $('#authCard')?.classList.toggle('is-register', mode==='register');
   msg('');
 }
 document.querySelectorAll('[data-auth]').forEach(b=>b.onclick=()=>setAuthMode(b.dataset.auth));
@@ -568,7 +595,10 @@ const r = await client.chat.completions.create({
 fetch('/api/config').then(r=>r.json()).then(c=>window.appConfig=c);
 
 const baseRender = render;
-render = function(name) { return name === 'operations' ? renderOperations() : baseRender(name); };
+render = function(name) {
+  closeMobileNav();
+  return name === 'operations' ? renderOperations() : baseRender(name);
+};
 
 let adminTab = 'rates';
 let adminProvidersCache = [];

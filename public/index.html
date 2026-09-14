@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <title>Relay Station · AI API 服务中心</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -66,7 +66,8 @@
     </div>
   </div>
   <div class="dashboard" id="dashboard" hidden>
-    <aside class="sidebar">
+    <div class="sidebar-backdrop" id="sidebarBackdrop" hidden></div>
+    <aside class="sidebar" id="appSidebar">
       <div class="brand">
         <div class="brand-mark"><i></i><i></i><i></i></div>
         <b>relay<span>station</span></b>
@@ -101,10 +102,15 @@
     </aside>
     <main class="main">
       <header class="topbar">
-        <div>
-          <span class="crumb-muted">工作台</span>
-          <b>/</b>
-          <strong id="pageTitle">数据概览</strong>
+        <div class="topbar-left">
+          <button class="menu-btn" id="menuBtn" type="button" aria-label="打开菜单" aria-expanded="false" aria-controls="appSidebar">
+            <span></span><span></span><span></span>
+          </button>
+          <div class="crumbs">
+            <span class="crumb-muted">工作台</span>
+            <b>/</b>
+            <strong id="pageTitle">数据概览</strong>
+          </div>
         </div>
         <div class="top-right">
           <div class="status"><span class="pulse"></span> 服务运行正常</div>
