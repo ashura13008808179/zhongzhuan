@@ -112,8 +112,65 @@ window.matchMedia('(max-width: 600px)').addEventListener('change', e=>{
   else setMobileNav(false);
 });
 
+function fmtRate(n){
+  const x=Number(n);
+  if(!Number.isFinite(x)) return '1';
+  return String(Math.round(x*10000)/10000);
+}
+function groupRateSuffix(g){
+  const n=Number(g?.displayMultiplier);
+  if(!Number.isFinite(n)) return '';
+  return `（${fmtRate(n)}x）`;
+}
+function groupOptionLabel(g){
+  const maint=g?.maintenance?`（${g.maintenanceMessage||'请联系站长购买'}）`:'';
+  return `${g?.name||''}${groupRateSuffix(g)}${maint}`;
+}
+function rateEquals(a,b){ return Math.abs(Number(a)-Number(b))<1e-8; }
 function esc(x=''){return String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{})}});const j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.error||'请求失败');return j}
+function diagTag(r){
+  if(!r.ok) return {tag:'失败', cls:'danger'};
+  if(r.level==='warn') return {tag:'警告', cls:'warn'};
+  return {tag:'通过', cls:'success'};
+}
+function fmtDiagRate(n){
+  const x=Number(n);
+  if(!Number.isFinite(x)) return '—';
+  return `${Math.round(x*10000)/10000}x`;
+}
+function diagReportHtml(report){
+  if(!report) return '<p class="sub">尚未运行过诊断。</p>';
+  const s=report.summary||{};
+  const list=report.results||[];
+  if(!list.length){
+    return `<p class="sub">上次：${esc((report.at||'').replace('T',' ').slice(0,19))} · 通过 ${s.passed??'-'} / 警告 ${s.warned??'-'} / 失败 ${s.failed??'-'}。明细未保存，请再点一次「运行全部测试」。</p>`;
+  }
+  const rows=list.map(r=>{
+    const {tag,cls}=diagTag(r);
+    const latency=(r.latencyMs==null||r.latencyMs==='')?'—':`${r.latencyMs}ms`;
+    const rate=(r.billingMultiplier!=null||r.displayMultiplier!=null)
+      ? `扣 ${fmtDiagRate(r.billingMultiplier)} / 展 ${fmtDiagRate(r.displayMultiplier)}`
+      : '—';
+    const showFix=Array.isArray(r.fix)&&r.fix.length&&(!r.ok||r.level==='warn');
+    return `<tr>
+      <td><span class="tag ${cls}">${tag}</span></td>
+      <td>${esc(r.name)}</td>
+      <td>${esc(latency)}</td>
+      <td>${esc(rate)}</td>
+      <td>
+        <div>${esc(r.message||'')}</div>
+        ${r.detail?`<div class="sub">${esc(r.detail)}</div>`:''}
+        ${showFix?`<ol class="fix-list">${r.fix.map(f=>`<li>${esc(f)}</li>`).join('')}</ol>`:''}
+      </td>
+    </tr>`;
+  }).join('');
+  const when=report.at?esc(String(report.at).replace('T',' ').slice(0,19)):'';
+  return `
+    <p class="sub" style="margin:8px 0">${when?`时间 ${when} · `:''}通过 ${s.passed||0} · 警告 ${s.warned||0} · 失败 ${s.failed||0}</p>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>结果</th><th>项目</th><th>延迟</th><th>倍率</th><th>说明 / 报错 / 解决办法</th></tr></thead><tbody>${rows}</tbody></table></div>
+    ${s.failed?`<p class="sub">失败项已写入「网站错误」栏。</p>`:''}`;
+}
 function msg(t,ok=false){const e=$('#authMessage');e.textContent=t;e.className=`auth-message ${ok?'ok':''}`}
 function setAuthMode(mode){
   document.querySelectorAll('[data-auth]').forEach(x=>{
@@ -494,7 +551,7 @@ function keyFormFields(prefix, key, options){
       <p class="field-label">模型组</p>
       <select data-kf="${prefix}-group" required>
         <option value="" ${!groupId?'selected':''} disabled>请选择模型组</option>
-        ${groups.map(g=>`<option value="${esc(g.id)}" ${groupId===g.id?'selected':''} ${g.maintenance?'disabled':''}>${esc(g.name)}${g.maintenance?`（${esc(g.maintenanceMessage||'请联系站长购买')}）`:`（${esc(g.multiplier)}x）`}</option>`).join('')}
+        ${groups.map(g=>`<option value="${esc(g.id)}" ${groupId===g.id?'selected':''} ${g.maintenance?'disabled':''}>${esc(groupOptionLabel(g))}</option>`).join('')}
       </select>
     </div>
     <label class="span-2">额度限额（元）<input data-kf="${prefix}-spend" type="number" min="0" step="0.01" value="${esc(spendVal)}" placeholder="留空或 0 表示不限"><small class="hint">空白或 0 = 不限制，仍受账户余额约束</small></label>
@@ -534,7 +591,10 @@ async function renderApiKeys(){
     const origin=(configured||location.origin).replace(/\/$/,'');
     const baseUrl=window.appConfig?.apiBaseUrl || `${origin}/v1`;
     const chatUrl=`${baseUrl.replace(/\/$/,'')}/chat/completions`;
-    const groupName=id=>(options.groups||[]).find(g=>g.id===id)?.name||id;
+    const groupName=id=>{
+      const g=(options.groups||[]).find(x=>x.id===id);
+      return g?`${g.name}${groupRateSuffix(g)}`:id;
+    };
     const ccLink=(app)=>{
       const p=new URLSearchParams({
         resource:'provider',
@@ -780,7 +840,8 @@ function providerFormHtml(provider, idx) {
       </label>
       <label>默认模型<input data-f="defaultModel" value="${esc(provider.defaultModel || '')}" placeholder="同步后自动填第一个"></label>
       <label>优先级（越小越高）<input data-f="priority" type="number" value="${esc(provider.priority ?? 100)}"></label>
-      <label>计费倍率<input data-f="billingMultiplier" type="number" step="0.01" min="0.01" max="10" value="${esc(provider.billingMultiplier ?? 1)}"></label>
+      <label>计费倍率<input data-f="billingMultiplier" type="number" step="0.01" min="0.01" max="10" value="${esc(fmtRate(provider.billingMultiplier ?? 2.5))}"><small class="hint">真实扣费倍率，仅管理员可见。默认 2.5x。</small></label>
+      <label>展示倍率<input data-f="displayMultiplier" type="number" step="0.01" min="0.01" max="10" value="${esc(fmtRate(provider.displayMultiplier ?? 0.2))}"><small class="hint">写在用户端模型组名称后面，仅展示，不参与扣费。</small></label>
       <label>输入价/1K<input data-f="inputPricePer1K" type="number" step="0.0001" min="0" value="${esc(provider.inputPricePer1K ?? 0)}"></label>
       <label>输出价/1K<input data-f="outputPricePer1K" type="number" step="0.0001" min="0" value="${esc(provider.outputPricePer1K ?? 0)}"></label>
       <label>超时 ms<input data-f="timeoutMs" type="number" min="1000" value="${esc(provider.timeoutMs ?? 60000)}"></label>
@@ -827,7 +888,8 @@ function collectProvidersFromDom() {
       inputPricePer1K: Number(get('inputPricePer1K')?.value || 0),
       outputPricePer1K: Number(get('outputPricePer1K')?.value || 0),
       priority: Number(get('priority')?.value || 100),
-      billingMultiplier: Number(get('billingMultiplier')?.value || 1),
+      billingMultiplier: Number(get('billingMultiplier')?.value || 2.5),
+      displayMultiplier: Number(get('displayMultiplier')?.value || 0.2),
       timeoutMs: Number(get('timeoutMs')?.value || 60000),
       maxRetries: Number(get('maxRetries')?.value || 0),
       enabled,
@@ -858,7 +920,7 @@ async function renderOperations() {
       adminProvidersCache = settings.providers || [];
       adminDefaultProviderId = settings.defaultProviderId;
       if (adminTab === 'rates') {
-        shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><p class="eyebrow">REAL-TIME PRICING</p><h2>客户计费倍率</h2><p class="sub">新请求将立即按所选倍率计算 Token 和金额；正在进行的请求保持发起时的价格。</p><div class="rate-buttons">${[2,3,4].map(rate=>`<button class="rate-btn ${settings.multiplier===rate?'selected':''}" data-rate="${rate}">${rate}x <small>成本倍率</small></button>`).join('')}</div><p class="sub">也可自定义 1–10：</p><div class="inline-form"><input id="customRate" type="number" min="1" max="10" step="0.1" value="${settings.multiplier}"><button class="primary-btn" id="saveCustomRate">保存倍率</button></div><p id="rateResult" class="inline-msg"></p><div class="health-summary">${(settings.healthSummary||[]).map(h=>`<div class="account-row"><span>${esc(h.name)}</span><b class="${h.health?.ok===false?'bad':'ok-text'}">${h.enabled===false?'已停用':(h.health?.ok===false?'异常':'正常')}</b></div>`).join('')||'<p class="sub">暂无渠道健康信息。</p>'}</div></section>`);
+        shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><p class="eyebrow">REAL-TIME PRICING</p><h2>客户计费倍率</h2><p class="sub">这是<strong>真实扣费倍率</strong>，只在后台可见。默认 <b>2.5x</b>。用户端模型组名称后的数字是<strong>展示倍率</strong>，只给人看，不参与扣费。</p><p class="sub">当前全局倍率 <b>${esc(fmtRate(settings.multiplier))}x</b></p><div class="inline-form"><input id="customRate" type="number" min="0.01" max="10" step="0.01" value="${esc(fmtRate(settings.multiplier))}"><button class="primary-btn" id="saveCustomRate">保存倍率</button></div><p class="sub">快捷选择：</p><div class="rate-buttons">${[1,1.5,2,2.5,3,4].map(rate=>`<button class="rate-btn ${rateEquals(settings.multiplier,rate)?'selected':''}" data-rate="${rate}">${fmtRate(rate)}x <small>成本倍率</small></button>`).join('')}</div><p id="rateResult" class="inline-msg"></p><div class="health-summary">${(settings.providers||[]).map(p=>`<div class="account-row"><span>${esc(p.name)}</span><b>扣费 ${esc(fmtRate(p.billingMultiplier))}x · 展示 ${esc(fmtRate(p.displayMultiplier))}x</b></div>`).join('')||'<p class="sub">暂无渠道。</p>'}</div></section>`);
         page.querySelectorAll('[data-rate]').forEach(button => button.onclick = async () => {
           try {
             await api('/api/admin/pricing', { method: 'PUT', body: JSON.stringify({ multiplier: Number(button.dataset.rate) }) });
@@ -873,6 +935,7 @@ async function renderOperations() {
             renderOperations();
           } catch (error) { $('#rateResult').textContent = error.message; $('#rateResult').className = 'inline-msg'; }
         });
+        $('#customRate')?.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); $('#saveCustomRate')?.click(); } });
       } else {
         shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<div class="admin-actions-bar"><div><p class="eyebrow">CHANNEL POOL</p><h2 style="margin:0">渠道管理</h2><p class="sub">填写上游地址和 API Key 后会自动同步模型；后台每小时自动探测渠道是否可用。</p></div><button class="primary-btn" id="addProvider">+ 添加渠道</button><button class="ghost-btn" id="probeHealth">立即探测渠道</button><button class="ghost-btn" id="syncAllModels">同步全部上游模型</button><button class="primary-btn" id="saveProviders">保存全部渠道</button><span id="providerResult" class="inline-msg"></span></div><div id="providersList">${adminProvidersCache.map((p, i) => providerFormHtml(p, i)).join('') || '<section class="card"><p class="sub">尚未配置渠道，请点击添加。</p></section>'}</div>`);
         wireProviderEditor();
@@ -972,39 +1035,27 @@ async function renderOperations() {
       const last = (await api('/api/admin/diagnostics/last').catch(()=>({}))).last;
       shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}
       <section class="card"><div class="card-head"><div><p class="eyebrow">DIAGNOSTICS</p><h2>诊断测试</h2>
-        <p class="sub">一键检测数据库、上游登录、分组映射、各渠道、站点网址、支付配置。失败项会写明原因和解决步骤，并记入「网站错误」。</p></div>
+        <p class="sub">一键测数据库、上游登录、分组映射、每个渠道能否对话（延迟 / 报错）、扣费与展示倍率、卡密库存与兑换拦截、收款码与支付。不会真的兑换卡密，也不会改用户余额。全部渠道对话大约需要几分钟。</p></div>
         <button class="primary-btn" type="button" id="runDiagBtn">运行全部测试</button></div>
-        <div id="diagOut">${last?`<p class="sub">上次：${esc((last.at||'').replace('T',' ').slice(0,19))} · 通过 ${last.summary?.passed??'-'} / 警告 ${last.summary?.warned??'-'} / 失败 ${last.summary?.failed??'-'}</p>`:'<p class="sub">尚未运行过诊断。</p>'}</div>
+        <div id="diagOut">${diagReportHtml(last)}</div>
       </section>`);
       $('#runDiagBtn')?.addEventListener('click', async () => {
-        $('#runDiagBtn').disabled = true;
-        $('#diagOut').innerHTML = '<p class="sub">测试进行中…</p>';
+        const btn = $('#runDiagBtn');
+        btn.disabled = true;
+        const prev = btn.textContent;
+        btn.textContent = '测试进行中…';
+        $('#diagOut').innerHTML = '<p class="sub">正在探测各渠道对话、延迟、倍率与充值逻辑，大约需要几分钟，请勿关闭页面…</p>';
         try {
           const report = await api('/api/admin/diagnostics/run', { method: 'POST', body: '{}' });
           const s = report.summary || {};
-          const rows = (report.results||[]).map(r => {
-            const tag = r.ok ? (r.level==='warn'?'警告':'通过') : '失败';
-            const cls = r.ok ? (r.level==='warn'?'warn':'success') : 'danger';
-            return `<tr>
-              <td><span class="tag ${cls}">${tag}</span></td>
-              <td>${esc(r.name)}</td>
-              <td>
-                <div>${esc(r.message||'')}</div>
-                ${r.detail?`<div class="sub">${esc(r.detail)}</div>`:''}
-                ${(!r.ok && r.fix&&r.fix.length)?`<ol class="fix-list">${r.fix.map(f=>`<li>${esc(f)}</li>`).join('')}</ol>`:''}
-              </td>
-            </tr>`;
-          }).join('');
-          $('#diagOut').innerHTML = `
-            <p class="sub" style="margin:8px 0">完成：通过 ${s.passed||0} · 警告 ${s.warned||0} · 失败 ${s.failed||0}</p>
-            <div class="table-wrap"><table class="data-table"><thead><tr><th>结果</th><th>项目</th><th>说明 / 解决办法</th></tr></thead><tbody>${rows}</tbody></table></div>
-            ${s.failed?`<p class="sub">失败项已写入「网站错误」栏。</p>`:''}`;
-          toast(s.failed ? `诊断完成：${s.failed} 项失败` : '诊断全部通过');
+          $('#diagOut').innerHTML = diagReportHtml(report);
+          toast(s.failed ? `诊断完成：${s.failed} 项失败` : (s.warned ? `诊断完成：${s.warned} 项警告` : '诊断全部通过'));
         } catch (err) {
           $('#diagOut').innerHTML = `<p class="sub">诊断请求失败：${esc(err.message||String(err))}</p>`;
           toast('诊断失败');
         } finally {
-          $('#runDiagBtn').disabled = false;
+          btn.disabled = false;
+          btn.textContent = prev || '运行全部测试';
         }
       });
     
@@ -1024,7 +1075,7 @@ async function renderOperations() {
       }).join('') || '<p class="sub">暂无指向 Beibeihai 的本地渠道</p>';
       shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}
       <section class="card"><div class="card-head"><div><p class="eyebrow">BEIBEIHAI SYNC</p><h2>Beibeihai 上游密钥同步</h2>
-        <p class="sub">Grok / DeepSeek / CC-MAX / Claude-Cursor 等渠道：用户建钥时同步到 Beibeihai，并把 sk- 发给用户。Cursor 账号池为维护中，不参与同步。</p></div>
+        <p class="sub">Grok / DeepSeek / CC-MAX 等渠道：用户建钥时同步到 Beibeihai，并把 sk- 发给用户。Cursor 账号池为维护中，不参与同步。</p></div>
         <span class="tag ${u.ready?'success':''}">${u.ready?'已就绪':'未就绪'}</span></div>
         <div class="pay-meta-grid">
           <label>启用同步
@@ -1343,7 +1394,8 @@ function wireProviderEditor() {
       inputPricePer1K: 0,
       outputPricePer1K: 0,
       priority: 100,
-      billingMultiplier: 1,
+      billingMultiplier: 2.5,
+      displayMultiplier: 0.2,
       timeoutMs: 60000,
       maxRetries: 0,
       enabled: true,

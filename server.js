@@ -49,7 +49,11 @@ import {
   normalizeRecommendedModel,
   AVATAR_IDS,
   DEFAULT_AVATAR,
-  normalizeAvatar
+  normalizeAvatar,
+  normalizeBillingMultiplier,
+  DEFAULT_BILLING_MULTIPLIER,
+  defaultDisplayMultiplier,
+  resolveDisplayMultiplier
 } from './lib/relay-core.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -337,7 +341,7 @@ function poolStats(db) {
 }
 
 const DEFAULT_MAX_TOKENS = Number(process.env.DEFAULT_MAX_TOKENS || 1024);
-const DEFAULT_MULTIPLIER = Number(process.env.BILLING_MULTIPLIER || 2);
+const DEFAULT_MULTIPLIER = Number(process.env.BILLING_MULTIPLIER || DEFAULT_BILLING_MULTIPLIER);
 const BALANCE_SAFETY_BUFFER = Number(process.env.BALANCE_SAFETY_BUFFER || 0);
 const LEGACY_UPSTREAM = { url: process.env.UPSTREAM_URL || '', apiKey: process.env.UPSTREAM_API_KEY || '', model: process.env.UPSTREAM_MODEL || 'gpt-4o-mini', price: Number(process.env.UPSTREAM_PRICE_PER_1K || 0.01) };
 const sessions = new Map();
@@ -748,8 +752,8 @@ function keyOptionsPayload(db) {
     .map(p => ({
       id: p.id,
       name: p.name,
+      displayMultiplier: resolveDisplayMultiplier(p),
       models: [...new Set((p.models || []).map(String))],
-      multiplier: providerMultiplier(p, db),
       maintenance: isMaintenanceProvider(p),
       maintenanceMessage: p.maintenanceMessage || (isMaintenanceProvider(p) ? '维护中' : null)
     }));
@@ -897,14 +901,25 @@ function allocateUsername(db, seed, exceptId) {
 
 
 const DEFAULT_MODEL_GROUPS = [
-  { id: 'grp_deepseek', name: 'DeepSeek', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'deepseek-chat', models: [], priority: 10, billingMultiplier: 0.5 },
-  { id: 'grp_gpt_pro', name: 'GPT PRO', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: DEFAULT_RECOMMENDED_MODEL, models: [], priority: 20, billingMultiplier: 0.2 },
-  { id: 'grp_gpt_plus', name: 'GPT-PLUS', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: DEFAULT_RECOMMENDED_MODEL, models: [], priority: 30, billingMultiplier: 0.1 },
-  { id: 'grp_gpt_mix', name: 'GPT 混用', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: DEFAULT_RECOMMENDED_MODEL, models: [], priority: 40, billingMultiplier: 0.05 },
-  { id: 'grp_grok', name: 'Grok', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'grok-3', models: [], priority: 50, billingMultiplier: 0.5 },
-  { id: 'grp_cc_max', name: 'CC-MAX', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-sonnet-4', models: [], priority: 60, billingMultiplier: 0.6 },
-  { id: 'grp_claude_cursor', name: 'Claude-Cursor', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-sonnet-4', models: [], priority: 70, billingMultiplier: 0.6 },
-  { id: 'grp_cursor_pool', name: 'Cursor账号池', url: 'https://api2.cursor.sh/v1/chat/completions', defaultModel: 'claude-sonnet-4', models: [], priority: 80, billingMultiplier: 0.1, maintenance: true, maintenanceMessage: '请联系站长购买' }
+  { id: 'grp_deepseek', name: 'DeepSeek', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'deepseek-chat', models: [], priority: 10, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_deepseek') },
+  { id: 'grp_gpt_pro', name: 'GPT PRO', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: DEFAULT_RECOMMENDED_MODEL, models: [], priority: 20, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_gpt_pro') },
+  { id: 'grp_gpt_plus', name: 'GPT-PLUS', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: DEFAULT_RECOMMENDED_MODEL, models: [], priority: 30, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_gpt_plus') },
+  { id: 'grp_gpt_mix', name: 'GPT 混用', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: DEFAULT_RECOMMENDED_MODEL, models: [], priority: 40, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_gpt_mix') },
+  { id: 'grp_grok', name: 'Grok', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'grok-3', models: [], priority: 50, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_grok') },
+  { id: 'grp_cc_max', name: 'CC-MAX', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-sonnet-4', models: [], priority: 60, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_cc_max') },
+  { id: 'grp_cursor_pool', name: 'Cursor账号池', url: 'https://api2.cursor.sh/v1/chat/completions', defaultModel: 'claude-sonnet-4', models: [], priority: 80, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_cursor_pool'), maintenance: true, maintenanceMessage: '请联系站长购买' },
+  { id: 'grp_glm', name: '智普 GLM', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'glm-5.1', models: [], priority: 90, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_glm') },
+  { id: 'grp_kimi', name: 'Kimi', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'kimi-k2.6', models: [], priority: 100, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_kimi') },
+  { id: 'grp_gemini', name: 'Gemini', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'gemini-2.5-flash', models: [], priority: 110, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_gemini') },
+  { id: 'grp_grok_heavy', name: 'Grok Heavy', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'composer-2.5', models: [], priority: 120, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_grok_heavy'), timeoutMs: 90000 },
+  { id: 'grp_claude_kiro', name: 'Claude-Kiro', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-haiku-4-5-20251001', models: [], priority: 130, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_claude_kiro') },
+  { id: 'grp_claude_kiro_welfare', name: 'Claude-Kiro 福利', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-fable-5', models: [], priority: 140, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_claude_kiro_welfare') },
+  { id: 'grp_aws_cc', name: 'AWS-CC', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: 'claude-fable-5', models: [], priority: 210, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_aws_cc') },
+  { id: 'grp_grok_vip', name: 'Grok VIP', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: 'grok-4.5', models: [], priority: 220, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_grok_vip'), timeoutMs: 90000 },
+  { id: 'grp_cn_models', name: '国产模型', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'glm-5.2', models: [], priority: 230, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_cn_models') },
+  { id: 'grp_nano_banana', name: 'nano banana 2', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'gemini-3.1-flash-image', models: [], priority: 250, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_nano_banana') },
+  { id: 'grp_nano_banana_pro', name: 'nano banana Pro', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'gemini-3-pro-image', models: [], priority: 260, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_nano_banana_pro') },
+  { id: 'grp_grok_image', name: 'Grok 生图', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'grok-imagine-image', models: [], priority: 270, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_grok_image') }
 ];
 
 function seedDefaultProviders(db) {
@@ -923,8 +938,9 @@ function seedDefaultProviders(db) {
     outputPricePer1K: 0.03,
     enabled: true,
     priority: g.priority,
-    billingMultiplier: Number(g.billingMultiplier) || 1,
-    timeoutMs: 60000,
+    billingMultiplier: Number(g.billingMultiplier) || DEFAULT_BILLING_MULTIPLIER,
+    displayMultiplier: resolveDisplayMultiplier(g),
+    timeoutMs: Number(g.timeoutMs) || 60000,
     maxRetries: 1,
     modelPrices: {},
     maintenance: !!g.maintenance,
@@ -933,6 +949,108 @@ function seedDefaultProviders(db) {
   }));
   db.settings.defaultProviderId = DEFAULT_MODEL_GROUPS[0].id;
   return true;
+}
+
+function ensureDefaultModelGroups(db) {
+  db.settings ??= {};
+  db.settings.providers ??= [];
+  const have = new Set(db.settings.providers.map(p => String(p.id)));
+  let added = false;
+  for (const g of DEFAULT_MODEL_GROUPS) {
+    if (have.has(g.id)) continue;
+    db.settings.providers.push({
+      id: g.id,
+      name: g.name,
+      url: g.url,
+      apiKey: '',
+      upstreamSync: g.upstreamSync || null,
+      defaultModel: g.defaultModel,
+      models: [...g.models],
+      inputPricePer1K: 0.01,
+      outputPricePer1K: 0.03,
+      enabled: true,
+      priority: g.priority,
+      billingMultiplier: Number(g.billingMultiplier) || DEFAULT_BILLING_MULTIPLIER,
+      displayMultiplier: resolveDisplayMultiplier(g),
+      timeoutMs: Number(g.timeoutMs) || 60000,
+      maxRetries: 1,
+      modelPrices: {},
+      maintenance: !!g.maintenance,
+      maintenanceMessage: g.maintenanceMessage || null,
+      health: { ok: true, lastCheckedAt: null, lastError: null }
+    });
+    added = true;
+  }
+  return added;
+}
+
+function modelFamilyToken(name) {
+  return String(name || '').toLowerCase().split(/[-_./]/)[0];
+}
+
+function repairSeededDefaultModels(db) {
+  let changed = false;
+  const providers = db.settings?.providers || [];
+  for (const g of DEFAULT_MODEL_GROUPS) {
+    const p = providers.find(x => x && x.id === g.id);
+    if (!p || !g.defaultModel) continue;
+    const current = String(p.defaultModel || '').trim();
+    const seed = String(g.defaultModel).trim();
+    const curTok = modelFamilyToken(current);
+    const seedTok = modelFamilyToken(seed);
+    if (!current || (curTok && seedTok && curTok !== seedTok)) {
+      p.defaultModel = seed;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+const RETIRED_MODEL_GROUP_IDS = [
+  'grp_claude_cursor',
+  'grp_gpt_ent',
+  'grp_gpt_pro_bb',
+  'grp_gpt_plus_bb',
+  'grp_gpt_pro_mixplus',
+  'grp_gpt_pro_welfare',
+  'grp_gpt_bomb',
+  'grp_gpt_image'
+];
+
+function pruneRetiredModelGroups(db) {
+  db.settings ??= {};
+  db.settings.providers ??= [];
+  const before = db.settings.providers.length;
+  db.settings.providers = db.settings.providers.filter(p => !RETIRED_MODEL_GROUP_IDS.includes(String(p.id)));
+  let changed = db.settings.providers.length !== before;
+  for (const key of ['upstreamBeibeihai', 'upstreamVip1129']) {
+    const map = db.settings[key]?.groupMap;
+    if (!map || typeof map !== 'object') continue;
+    for (const id of RETIRED_MODEL_GROUP_IDS) {
+      if (id in map) {
+        delete map[id];
+        changed = true;
+      }
+    }
+  }
+  const probes = db.settings.upstreamProbeKeys;
+  if (probes && typeof probes === 'object') {
+    for (const id of RETIRED_MODEL_GROUP_IDS) {
+      if (id in probes) {
+        delete probes[id];
+        changed = true;
+      }
+    }
+  }
+  for (const user of db.users || []) {
+    for (const k of user.apiKeys || []) {
+      if (RETIRED_MODEL_GROUP_IDS.includes(String(k.groupId || ''))) {
+        k.groupId = null;
+        changed = true;
+      }
+    }
+  }
+  return changed;
 }
 
 function ensureUsername(user, db) {
@@ -1039,12 +1157,12 @@ function adminUserView(user) {
   };
 }
 function multiplier(db) {
-  const value = Number(db.settings?.billingMultiplier ?? DEFAULT_MULTIPLIER);
-  return Number.isFinite(value) && value > 0 && value <= 10 ? value : DEFAULT_MULTIPLIER;
+  const parsed = normalizeBillingMultiplier(db.settings?.billingMultiplier ?? DEFAULT_MULTIPLIER);
+  return parsed.ok ? parsed.value : DEFAULT_BILLING_MULTIPLIER;
 }
 function providerMultiplier(provider, db) {
-  const value = Number(provider?.billingMultiplier);
-  if (Number.isFinite(value) && value > 0 && value <= 10) return value;
+  const parsed = normalizeBillingMultiplier(provider?.billingMultiplier);
+  if (parsed.ok) return parsed.value;
   return multiplier(db);
 }
 function normalizeProvider(item, previous = null) {
@@ -1071,9 +1189,13 @@ function normalizeProvider(item, previous = null) {
     enabled: item.enabled !== false,
     priority: Number.isFinite(Number(item.priority)) ? Number(item.priority) : (Number(previous?.priority) || 100),
     billingMultiplier: (() => {
-      const v = Number(item.billingMultiplier ?? previous?.billingMultiplier ?? 1);
-      return Number.isFinite(v) && v > 0 && v <= 10 ? v : 1;
+      const parsed = normalizeBillingMultiplier(item.billingMultiplier ?? previous?.billingMultiplier ?? DEFAULT_MULTIPLIER);
+      return parsed.ok ? parsed.value : DEFAULT_BILLING_MULTIPLIER;
     })(),
+    displayMultiplier: resolveDisplayMultiplier({
+      id: String(item.id || previous?.id || ''),
+      displayMultiplier: item.displayMultiplier ?? previous?.displayMultiplier
+    }),
     timeoutMs: Math.max(1000, Number(item.timeoutMs ?? previous?.timeoutMs ?? 60000) || 60000),
     maxRetries: Math.max(0, Math.min(5, Number(item.maxRetries ?? previous?.maxRetries ?? 0) || 0)),
     modelPrices,
@@ -1244,7 +1366,11 @@ function publicProvider(provider) {
     inputPricePer1K: Number(provider.inputPricePer1K ?? provider.pricePer1K ?? 0),
     outputPricePer1K: Number(provider.outputPricePer1K ?? provider.pricePer1K ?? 0),
     priority: Number(provider.priority ?? 100),
-    billingMultiplier: Number(provider.billingMultiplier) > 0 ? Number(provider.billingMultiplier) : 1,
+    billingMultiplier: (() => {
+      const parsed = normalizeBillingMultiplier(provider.billingMultiplier);
+      return parsed.ok ? parsed.value : DEFAULT_BILLING_MULTIPLIER;
+    })(),
+    displayMultiplier: resolveDisplayMultiplier(provider),
     timeoutMs: Number(provider.timeoutMs ?? 60000),
     maxRetries: Number(provider.maxRetries ?? 0),
     modelPrices: provider.modelPrices || {},
@@ -1325,7 +1451,7 @@ async function probeProviderHealth(db, provider) {
     provider.health.modelCount = models.length;
     // 探测成功时顺带刷新模型列表，保持与上游一致
     provider.models = models;
-    if (!provider.defaultModel || !models.includes(provider.defaultModel)) provider.defaultModel = models[0];
+    if (!provider.defaultModel) provider.defaultModel = models[0];
     provider.modelsSyncedAt = new Date().toISOString();
     provider.modelsSource = endpoint;
     return { id: provider.id, name: provider.name, ok: true, count: models.length, endpoint };
@@ -1342,6 +1468,62 @@ async function probeAllProviderHealth(db) {
     results.push(await probeProviderHealth(db, provider));
   }
   return results;
+}
+
+function pickChatProbeModel(provider) {
+  const seeded = DEFAULT_MODEL_GROUPS.find(g => g.id === provider?.id);
+  const seed = String(seeded?.defaultModel || '').trim();
+  const current = String(provider?.defaultModel || '').trim();
+  const intended = (seed && current && modelFamilyToken(current) !== modelFamilyToken(seed))
+    ? seed
+    : (current || seed);
+  const models = Array.isArray(provider?.models) ? provider.models.map(m => String(m || '').trim()).filter(Boolean) : [];
+  if (intended && models.includes(intended)) return intended;
+  const token = modelFamilyToken(intended);
+  if (token && models.length) {
+    const hit = models.find(m => m.toLowerCase().includes(token));
+    if (hit) return hit;
+  }
+  if (intended) return intended;
+  return models[0] || '';
+}
+
+async function probeProviderChat(db, provider) {
+  const started = Date.now();
+  const model = pickChatProbeModel(provider);
+  if (!model) return { ok: false, error: '无可用模型', ms: Date.now() - started };
+  try {
+    const bearer = await ensureUpstreamProbeKey(db, provider);
+    if (!bearer) return { ok: false, error: '缺少上游同步密钥', ms: Date.now() - started, model };
+    const probeProvider = { ...provider, timeoutMs: Math.min(Number(provider.timeoutMs) || 20000, 20000) };
+    const upstream = await fetchUpstream(probeProvider, {
+      messages: [{ role: 'user', content: 'Reply with the single word PONG.' }],
+      model,
+      max_tokens: 8
+    }, 8, model, bearer);
+    const text = await upstream.text().catch(() => '');
+    const ms = Date.now() - started;
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch { body = null; }
+    if (!upstream.ok) {
+      const err = body?.error?.message || body?.error || body?.message || text.slice(0, 180) || `HTTP ${upstream.status}`;
+      return {
+        ok: false,
+        error: typeof err === 'string' ? err : JSON.stringify(err).slice(0, 180),
+        ms,
+        status: upstream.status,
+        model
+      };
+    }
+    return { ok: true, ms, status: upstream.status, model, usage: body?.usage || null };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err?.name === 'AbortError' ? '对话超时' : (err?.message || String(err)),
+      ms: Date.now() - started,
+      model
+    };
+  }
 }
 
 function settleUsage(db, user, provider, usage, rate, tokenReservation, amountReservation, started, model, status = 'success', apiKeyRec = null) {
@@ -2026,12 +2208,15 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/api/dashboard') {
     if (!user) return fail(res, 401, '未登录');
     const logs = db.logs.filter(x => x.userId === user.id && x.status !== 'referral_rebate' && x.status !== CHECKIN_LOG_STATUS);
-    const totalTokens = logs.reduce((sum, x) => sum + (x.billedTokens ?? x.tokens * (x.multiplier || DEFAULT_MULTIPLIER)), 0);
+    const totalTokens = logs.reduce((sum, x) => sum + Number(x.tokens || 0), 0);
     const avgLatency = logs.length ? Math.round(logs.reduce((sum, x) => sum + x.latency, 0) / logs.length) : 0;
     const displayLogs = logs.slice(0, 30).map(x => ({
-      ...x,
-      tokens: x.billedTokens ?? x.tokens * (x.multiplier || DEFAULT_MULTIPLIER),
-      chargedAmount: x.chargedAmount ?? 0
+      id: x.id,
+      model: x.model,
+      tokens: Number(x.tokens || 0),
+      latency: x.latency,
+      status: x.status,
+      createdAt: x.createdAt
     }));
     return json(res, 200, {
       user: safeUser(user),
@@ -2041,7 +2226,7 @@ const server = http.createServer(async (req, res) => {
         avgLatency,
         success: logs.filter(x => x.status === 'success').length,
         quotaTokens: user.quotaTokens || 0,
-        usedTokens: user.usedTokens || 0,
+        usedTokens: totalTokens,
         availableTokens: availableTokens(user)
       },
       logs: displayLogs,
@@ -2328,6 +2513,13 @@ const server = http.createServer(async (req, res) => {
       isBeibeihaiProvider,
       isMaintenanceProvider,
       probeProviderHealth,
+      probeProviderChat,
+      providerMultiplier,
+      resolveDisplayMultiplier,
+      poolStats,
+      codeAvailable,
+      PAYMENT_AMOUNTS,
+      REFERRAL_REBATE_RATE,
       gatewayReady,
       getPaymentGateway,
       paymentQrMeta,
@@ -2349,7 +2541,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
     db.settings ??= {};
-    db.settings.lastDiagnostics = { at: report.at, summary: report.summary };
+    db.settings.lastDiagnostics = { at: report.at, summary: report.summary, results: report.results };
     writeDb(db);
     return json(res, 200, report);
   }
@@ -2734,8 +2926,9 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'PUT' && url.pathname === '/api/admin/pricing') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
     const p = await body(req);
-    const value = Number(p?.multiplier);
-    if (!Number.isFinite(value) || value <= 0 || value > 10) return fail(res, 400, '倍率必须在 0 到 10 之间（不含 0）');
+    const parsed = normalizeBillingMultiplier(p?.multiplier);
+    if (!parsed.ok) return fail(res, 400, parsed.error);
+    const value = parsed.value;
     const prev = db.settings.billingMultiplier;
     db.settings.billingMultiplier = value;
     audit(db, { actorId: user.id, action: 'pricing.change', target: 'billingMultiplier', detail: { from: prev, to: value } });
@@ -3011,13 +3204,16 @@ initial.settings.paymentGateway ??= {
 
 initial.settings.providers ??= [];
 if (seedDefaultProviders(initial)) writeDb(initial);
+ensureDefaultModelGroups(initial);
+repairSeededDefaultModels(initial);
+pruneRetiredModelGroups(initial);
 initial.settings.providers = wireAllProviders(initial.settings.providers, {
   beibeihaiBase: BEIBEIHAI_BASE_URL || BEIBEIHAI_DEFAULT_BASE,
   vip1129Base: VIP1129_BASE_URL || VIP1129_DEFAULT_BASE
 });
 {
   const bb = getBeibeihaiConfig(initial);
-  bb.groupMap = compactGroupMap(bb.groupMap);
+  bb.groupMap = { ...compactGroupMap(beibeihaiDefaultGroupMap()), ...compactGroupMap(bb.groupMap) };
   saveBeibeihaiConfig(initial, bb);
   const vip = getVip1129Config(initial);
   vip.groupMap = { ...compactGroupMap(vip1129DefaultGroupMap()), ...compactGroupMap(vip.groupMap) };
@@ -3045,6 +3241,7 @@ for (const provider of initial.settings.providers) {
   provider.maxRetries ??= 0;
   provider.modelPrices ??= {};
   provider.health ??= { ok: true, lastCheckedAt: null, lastError: null };
+  provider.displayMultiplier = resolveDisplayMultiplier(provider);
 }
 if (!initial.settings.providers.length && LEGACY_UPSTREAM.url && LEGACY_UPSTREAM.apiKey) {
   initial.settings.providers.push({

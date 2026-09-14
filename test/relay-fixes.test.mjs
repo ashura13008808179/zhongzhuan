@@ -22,7 +22,12 @@ import {
   VIP1129_CHAT_URL,
   AVATAR_IDS,
   DEFAULT_AVATAR,
-  normalizeAvatar
+  normalizeAvatar,
+  normalizeBillingMultiplier,
+  formatBillingMultiplier,
+  DEFAULT_BILLING_MULTIPLIER,
+  defaultDisplayMultiplier,
+  resolveDisplayMultiplier
 } from '../lib/relay-core.js';
 
 const isVip1129 = (p) => p?.upstreamSync === 'vip1129' || String(p?.url || '').includes('vip1129.cc');
@@ -45,7 +50,7 @@ assert.equal(groups.length, 4);
 assert.equal(matchUpstreamGroupId('grp_deepseek', groups), 4);
 assert.equal(matchUpstreamGroupId('grp_grok', groups), 8);
 assert.equal(matchUpstreamGroupId('grp_cc_max', groups), 15);
-assert.equal(matchUpstreamGroupId('grp_claude_cursor', groups), 21);
+assert.equal(matchUpstreamGroupId('grp_claude_cursor', groups), null);
 
 const suggested = suggestGroupMap({ grp_deepseek: null }, groups, ['grp_deepseek', 'grp_grok']);
 assert.equal(suggested.grp_deepseek, 4);
@@ -55,6 +60,9 @@ assert.equal(suggested.grp_grok, 8);
 assert.equal(intendedUpstreamSync({ id: 'grp_gpt_pro' }), 'vip1129');
 assert.equal(intendedUpstreamSync({ id: 'grp_deepseek' }), 'beibeihai');
 assert.equal(intendedUpstreamSync({ id: 'grp_cursor_pool' }), null);
+assert.equal(intendedUpstreamSync({ id: 'grp_glm' }), 'beibeihai');
+assert.equal(intendedUpstreamSync({ id: 'grp_aws_cc' }), 'vip1129');
+assert.equal(intendedUpstreamSync({ id: 'grp_gemini' }), 'beibeihai');
 
 const wired = wireAllProviders([
   { id: 'grp_deepseek', name: 'DeepSeek', url: 'https://api.deepseek.com/v1/chat/completions', apiKey: '' },
@@ -163,5 +171,22 @@ assert.equal(normalizeAvatar('mint').ok, true);
 assert.equal(normalizeAvatar('mint').avatar, 'mint');
 assert.equal(normalizeAvatar('').avatar, 'letter');
 assert.equal(normalizeAvatar('nope').ok, false);
+
+assert.equal(DEFAULT_BILLING_MULTIPLIER, 2.5);
+assert.equal(normalizeBillingMultiplier(1.1).ok, true);
+assert.equal(normalizeBillingMultiplier(1.1).value, 1.1);
+assert.equal(normalizeBillingMultiplier(1.4).value, 1.4);
+assert.equal(normalizeBillingMultiplier('1.40').value, 1.4);
+assert.equal(normalizeBillingMultiplier(0).ok, false);
+assert.equal(normalizeBillingMultiplier(11).ok, false);
+assert.equal(formatBillingMultiplier(1.4), '1.4');
+
+assert.equal(defaultDisplayMultiplier('grp_gemini'), 0.2);
+assert.equal(defaultDisplayMultiplier('grp_aws_cc'), 0.5);
+assert.equal(defaultDisplayMultiplier('grp_deepseek'), 0.5);
+assert.equal(defaultDisplayMultiplier('grp_gpt_mix'), 0.05);
+assert.equal(resolveDisplayMultiplier({ id: 'grp_gpt_pro' }), 0.2);
+assert.equal(resolveDisplayMultiplier({ id: 'grp_gpt_pro', displayMultiplier: 0.2, billingMultiplier: 2.5 }), 0.2);
+assert.equal(resolveDisplayMultiplier({ id: 'grp_gpt_pro', displayMultiplier: 0.8 }), 0.8);
 
 console.log('relay-fixes.test.mjs: all assertions passed');

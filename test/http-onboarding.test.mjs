@@ -108,7 +108,7 @@ try {
   assert.equal(byId.grp_deepseek?.upstreamSync, 'beibeihai');
   assert.equal(byId.grp_grok?.upstreamSync, 'beibeihai');
   assert.equal(byId.grp_cc_max?.upstreamSync, 'beibeihai');
-  assert.equal(byId.grp_claude_cursor?.upstreamSync, 'beibeihai');
+  assert.equal(byId.grp_claude_cursor, undefined);
   assert.equal(byId.grp_gpt_pro?.upstreamSync, 'vip1129');
   assert.equal(byId.grp_cursor_pool?.maintenance, true);
   assert.match(String(byId.grp_deepseek?.url || ''), /beibeihai\.xyz/);
@@ -116,6 +116,7 @@ try {
   const pricing = await req('/api/admin/pricing', { headers: auth });
   assert.equal(pricing.status, 200);
   assert.equal(pricing.body.providers.length, alias.body.providers.length);
+  assert.equal(pricing.body.multiplier, 2.5);
 
   const settings = await req('/api/admin/site-settings', { headers: auth });
   assert.equal(settings.status, 200);
@@ -153,6 +154,27 @@ try {
     body: JSON.stringify({ avatar: 'not-a-face' })
   });
   assert.equal(avBad.status, 400);
+
+  const rate14 = await req('/api/admin/pricing', {
+    method: 'PUT',
+    headers: auth,
+    body: JSON.stringify({ multiplier: 1.4 })
+  });
+  assert.equal(rate14.status, 200, JSON.stringify(rate14.body));
+  assert.equal(rate14.body.multiplier, 1.4);
+  const rate11 = await req('/api/admin/pricing', {
+    method: 'PUT',
+    headers: auth,
+    body: JSON.stringify({ multiplier: 1.1 })
+  });
+  assert.equal(rate11.status, 200);
+  assert.equal(rate11.body.multiplier, 1.1);
+  const rateBad = await req('/api/admin/pricing', {
+    method: 'PUT',
+    headers: auth,
+    body: JSON.stringify({ multiplier: 0 })
+  });
+  assert.equal(rateBad.status, 400);
 
   const validInvite = await req('/api/auth/register', {
     method: 'POST',
