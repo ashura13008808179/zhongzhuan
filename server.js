@@ -32,7 +32,7 @@ import {
 } from './upstream/beibeihai.js';
 import { ensureSiteErrors, recordSiteError, clearSiteErrors, tipsForCode, failPayload, SITE_ERROR_CAP } from './diagnostics/site-errors.js';
 import { runDiagnosticSuite } from './diagnostics/run-suite.js';
-import { claimCheckIn, checkInStatus, checkInAdminStats, CHECKIN_LOG_STATUS } from './lib/checkin.js';
+import { claimCheckIn, checkInStatus, checkInAdminStats, CHECKIN_LOG_STATUS, money2 } from './lib/checkin.js';
 import { buildMobileInbox, parseUpstreamAccount } from './lib/admin-mobile.js';
 import {
   compactGroupMap,
@@ -287,7 +287,29 @@ function quotaForAmount(amount, db) {
 }
 
 function codeAvailable(c) {
-  return c && !c.usedAt && !c.issuedAt;
+  return c && !c.usedAt && !c.issuedAt && !c.issuedTo;
+}
+
+const REDEEM_FAIL = '卡密无效、已使用或无权兑换';
+const REDEEM_RATE_LIMIT = 12;
+
+function normalizeRedeemCode(raw) {
+  return String(raw || '').trim().toUpperCase();
+}
+
+function findCodeRecord(db, raw) {
+  const needle = normalizeRedeemCode(raw);
+  if (!needle || needle.length < 6) return null;
+  return (db.rechargeCodes || []).find(x => normalizeRedeemCode(x.code) === needle) || null;
+}
+
+function redeemAccess(codeRec, userId) {
+  if (!codeRec || codeRec.usedAt) return { ok: false, reason: 'used_or_missing' };
+  if (codeRec.issuedTo) {
+    return codeRec.issuedTo === userId ? { ok: true } : { ok: false, reason: 'not_owner' };
+  }
+  if (codeRec.source === 'manual') return { ok: true, reason: 'manual' };
+  return { ok: false, reason: 'unissued_stock' };
 }
 
 function topUpCodePools(db, target = CODE_POOL_TARGET) {
@@ -306,6 +328,7 @@ function topUpCodePools(db, target = CODE_POOL_TARGET) {
         userId: null,
         issuedAt: null,
         issuedTo: null,
+        source: 'pool',
         createdAt: new Date().toISOString(),
         source: 'pool'
       });
@@ -882,8 +905,8 @@ function clientIp(req) {
   if (typeof fwd === 'string' && fwd.trim()) return fwd.split(',')[0].trim();
   return req.socket?.remoteAddress || 'unknown';
 }
-function rateLimit(req, res, limit, bucketName) {
-  const key = `${clientIp(req)}:${bucketName || 'default'}`;
+function rateLimit(req, res, limit, bucketName, extra = '') {
+  const key = `${clientIp(req)}:${bucketName || 'default'}:${extra}`;
   const now = Date.now();
   let bucket = rateBuckets.get(key);
   if (!bucket || now - bucket.windowStart >= RATE_WINDOW_MS) {
@@ -942,9 +965,23 @@ function slugifyUsername(raw) {
 }
 
 function usernameTaken(db, username, exceptId) {
-  const lower = String(username || '').toLowerCase();
+  const lower = String(username || '').trim().toLowerCase();
   if (!lower) return false;
   return db.users.some(u => u.id !== exceptId && (u.username || '').toLowerCase() === lower);
+}
+
+function displayNameTaken(db, name, exceptId) {
+  const lower = String(name || '').trim().toLowerCase();
+  if (!lower) return false;
+  return db.users.some(u => u.id !== exceptId && String(u.name || '').trim().toLowerCase() === lower);
+}
+
+function userLabelTaken(db, label, exceptId) {
+  return usernameTaken(db, label, exceptId) || displayNameTaken(db, label, exceptId);
+}
+
+function isBanned(user) {
+  return !!(user && user.banned && user.role !== 'admin');
 }
 
 function allocateUsername(db, seed, exceptId) {
@@ -1119,6 +1156,27 @@ function ensureUsername(user, db) {
   user.username = allocateUsername(db, seed, user.id);
 }
 
+function ensureUniqueDisplayNames(db) {
+  const used = new Map();
+  for (const user of db.users) {
+    const uname = (user.username || '').toLowerCase();
+    if (uname) used.set(uname, user.id);
+  }
+  for (const user of db.users) {
+    let name = String(user.name || '').trim() || user.username || 'user';
+    let lower = name.toLowerCase();
+    let n = 0;
+    const seed = name;
+    while (used.has(lower) && used.get(lower) !== user.id) {
+      n += 1;
+      name = `${seed.slice(0, 28)}_${n}`;
+      lower = name.toLowerCase();
+    }
+    user.name = name;
+    used.set(lower, user.id);
+  }
+}
+
 function ensureAdminUser(db) {
   const email = ADMIN_EMAIL;
   let admin = db.users.find(x => x.id === 'usr_admin')
@@ -1146,6 +1204,7 @@ function ensureAdminUser(db) {
       reservedTokens: 0,
       reservedBalance: 0,
       accountActive: true,
+      banned: false,
       unlimited: true,
       role: 'admin',
       invited: 0,
@@ -1159,6 +1218,7 @@ function ensureAdminUser(db) {
   admin.role = 'admin';
   admin.unlimited = true;
   admin.accountActive = true;
+  admin.banned = false;
   if ((admin.balance || 0) < 1000000) admin.balance = 999999999;
   if ((admin.quotaTokens || 0) < 1000000) admin.quotaTokens = 999999999;
   if (email) admin.email = email;
@@ -1191,6 +1251,7 @@ function safeUser(user) {
     usedTokens: user.usedTokens || 0,
     availableTokens: availableTokens(user),
     accountActive: user.accountActive !== false,
+    banned: !!user.banned,
     isAdmin: isAdmin(user),
     unlimited: !!(user.unlimited || isAdmin(user)),
     role: user.role || 'user',
@@ -1210,6 +1271,7 @@ function adminUserView(user) {
     quotaTokens: user.quotaTokens || 0,
     usedTokens: user.usedTokens || 0,
     accountActive: user.accountActive !== false,
+    banned: !!user.banned,
     role: user.role || 'user',
     createdAt: user.createdAt,
     invited: user.invited || 0,
@@ -1781,6 +1843,7 @@ async function chat(req, res, db, user, apiKeyRec = null) {
   if (apiKeyRec && Array.isArray(apiKeyRec.models) && apiKeyRec.models.length && requestedModel && !apiKeyRec.models.includes(requestedModel)) {
     return fail(res, 400, '该密钥无权调用此模型');
   }
+  if (isBanned(user)) return fail(res, 403, '账号已被封禁');
   if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
 
   const candidates = providersForModel(payload, db);
@@ -2077,11 +2140,17 @@ const server = http.createServer(async (req, res) => {
     if (requestedUsername) {
       if (!USERNAME_RE.test(requestedUsername)) return fail(res, 400, '用户名需为 3–32 位字母、数字、下划线或连字符，并以字母或数字开头');
       if (isReservedUsername(requestedUsername)) return fail(res, 400, '该用户名不可用');
-      if (usernameTaken(db, requestedUsername)) return fail(res, 409, '该用户名已被占用');
+      if (userLabelTaken(db, requestedUsername)) return fail(res, 409, '该用户名已被占用');
       username = requestedUsername.toLowerCase();
     } else {
       username = allocateUsername(db, p.name || email.split('@')[0] || 'user');
-      if (isReservedUsername(username)) username = allocateUsername(db, 'user');
+      if (isReservedUsername(username) || userLabelTaken(db, username)) username = allocateUsername(db, 'user');
+    }
+    let displayName = String(p.name || '').trim();
+    if (!displayName) displayName = username;
+    if (displayName.length > 32) return fail(res, 400, '名称最多 32 个字符');
+    if (displayName.toLowerCase() !== username && userLabelTaken(db, displayName)) {
+      return fail(res, 409, '该名称已被占用');
     }
     const invite = validateInviteCode(db.users, p?.inviteCode);
     if (!invite.ok) return fail(res, 400, invite.error, { code: invite.code });
@@ -2090,7 +2159,7 @@ const server = http.createServer(async (req, res) => {
       id: id('usr'),
       email,
       username,
-      name: String(p.name || '').trim() || email.split('@')[0],
+      name: displayName,
       password: hash(p.password),
       apiKey: null,
       apiKeys: [],
@@ -2103,6 +2172,7 @@ const server = http.createServer(async (req, res) => {
       reservedTokens: 0,
       reservedBalance: 0,
       accountActive: false,
+      banned: false,
       role: 'user',
       avatar: DEFAULT_AVATAR,
       invited: 0,
@@ -2125,6 +2195,7 @@ const server = http.createServer(async (req, res) => {
     const identifier = String(p?.login ?? p?.username ?? p?.email ?? '').trim();
     const user = findUserByIdentifier(db, identifier);
     if (!user || !p?.password || !verify(p.password, user.password)) return fail(res, 401, '用户名/邮箱或密码错误');
+    if (isBanned(user)) return fail(res, 403, '账号已被封禁');
     const token = crypto.randomBytes(32).toString('hex');
     sessions.set(token, user.id);
     persistSession(db, token, user.id);
@@ -2297,6 +2368,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && url.pathname === '/api/checkin') {
     if (!user) return fail(res, 401, '未登录');
+    if (isBanned(user)) return fail(res, 403, '账号已被封禁');
     if (!rateLimit(req, res, 30, 'checkin')) return;
     db.checkIns ??= [];
     const result = claimCheckIn(db, user);
@@ -2343,6 +2415,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && url.pathname === '/api/recharge/prepare') {
     if (!user) return fail(res, 401, '未登录');
+    if (isBanned(user)) return fail(res, 403, '账号已被封禁');
     if (!rateLimit(req, res, 30, 'pay-prepare')) return;
     const p = await body(req);
     const amount = Number(p?.amount);
@@ -2405,6 +2478,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && url.pathname === '/api/recharge/claim') {
     if (!user) return fail(res, 401, '未登录');
+    if (isBanned(user)) return fail(res, 403, '账号已被封禁');
     if (!rateLimit(req, res, 30, 'claim')) return;
     const p = await body(req);
     db.paymentOrders ??= [];
@@ -2578,6 +2652,8 @@ const server = http.createServer(async (req, res) => {
       resolveDisplayMultiplier,
       poolStats,
       codeAvailable,
+      findCodeRecord,
+      redeemAccess,
       PAYMENT_AMOUNTS,
       REFERRAL_REBATE_RATE,
       gatewayReady,
@@ -2885,16 +2961,22 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && url.pathname === '/api/recharge/redeem') {
     if (!user) return fail(res, 401, '未登录');
+    if (isBanned(user)) return fail(res, 403, '账号已被封禁');
+    if (!rateLimit(req, res, REDEEM_RATE_LIMIT, 'redeem', user.id)) return;
     const p = await body(req);
-    const code = db.rechargeCodes.find(x => x.code === p?.code && !x.usedAt);
-    if (!code) return fail(res, 400, '卡密无效或已使用');
-    const quotaTokens = Number(code.quotaTokens || 100000);
-    const payAmount = Number(code.amount || 0);
-    code.usedAt = new Date().toISOString();
-    code.userId = user.id;
-    user.balance += payAmount;
+    const rec = findCodeRecord(db, p?.code);
+    const access = redeemAccess(rec, user.id);
+    if (!access.ok) return fail(res, 400, REDEEM_FAIL);
+    if (rec.usedAt) return fail(res, 400, REDEEM_FAIL);
+    rec.usedAt = new Date().toISOString();
+    rec.userId = user.id;
+    rec.issuedTo = rec.issuedTo || user.id;
+    rec.issuedAt = rec.issuedAt || rec.usedAt;
+    const quotaTokens = Number(rec.quotaTokens || 100000);
+    const payAmount = Number(rec.amount || 0);
+    user.balance = money2((user.balance || 0) + payAmount);
     user.quotaTokens = (user.quotaTokens || 0) + quotaTokens;
-    user.accountActive = true;
+    if (!user.banned) user.accountActive = true;
     // Referral: only when invited user pays — inviter gets 5%
     let rebate = 0;
     if (user.invitedBy && payAmount > 0) {
@@ -2922,7 +3004,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
     writeDb(db);
-    return json(res, 200, { user: safeUser(user), message: `充值成功，到账 ¥${code.amount}` });
+    return json(res, 200, { user: safeUser(user), message: `充值成功，到账 ¥${rec.amount}` });
   }
 
   // --- Admin APIs ---
@@ -2934,13 +3016,14 @@ const server = http.createServer(async (req, res) => {
     if (!['wechat', 'alipay'].includes(method)) return fail(res, 400, '付款方式无效');
     const decoded = decodePaymentQrImage(p?.image);
     if (!decoded.ok) return fail(res, 400, decoded.error);
-    const applyAll = p?.applyAll === true || String(p?.amount || '') === 'all';
+    if (p?.applyAll === true || String(p?.amount || '') === 'all') {
+      return fail(res, 400, '每个金额的收款码不同，请按面额分别上传');
+    }
     const amount = Number(p?.amount);
-    if (!applyAll && !PAYMENT_AMOUNTS.includes(amount)) return fail(res, 400, '金额无效');
-    const keys = applyAll ? PAYMENT_AMOUNTS.map(String) : [String(amount)];
-    const publicPath = savePaymentQrFile(method, applyAll ? 'all' : String(amount), decoded.buf, decoded.ext);
+    if (!PAYMENT_AMOUNTS.includes(amount)) return fail(res, 400, '金额无效');
+    const publicPath = savePaymentQrFile(method, String(amount), decoded.buf, decoded.ext);
     const next = ensurePaymentQrs(db);
-    for (const key of keys) next[method][key] = publicPath;
+    next[method][String(amount)] = publicPath;
     db.settings.paymentQrs = next;
     if (p?.expiresAt !== undefined) {
       const cur = paymentQrMeta(db);
@@ -2953,15 +3036,15 @@ const server = http.createServer(async (req, res) => {
     audit(db, {
       actorId: user.id,
       action: 'paymentQrs.upload',
-      target: `${method}:${applyAll ? 'all' : amount}`,
-      detail: { path: publicPath, applyAll }
+      target: `${method}:${amount}`,
+      detail: { path: publicPath, amount }
     });
     writeDb(db);
     const meta = paymentQrMeta(db);
     return json(res, 200, {
       url: publicPath,
       method,
-      amounts: keys.map(Number),
+      amounts: [amount],
       paymentQrs: next,
       plans: paymentPlans(db),
       paymentQrMeta: {
@@ -2969,7 +3052,7 @@ const server = http.createServer(async (req, res) => {
         wechat: paymentQrStatus(meta.wechatExpiresAt),
         alipay: paymentQrStatus(meta.alipayExpiresAt)
       },
-      message: applyAll ? '已替换该支付方式全部金额的收款码' : `已替换 ${method === 'wechat' ? '微信' : '支付宝'} ¥${amount} 收款码`
+      message: `已替换 ${method === 'wechat' ? '微信' : '支付宝'} ¥${amount} 收款码`
     });
   }
 
@@ -3145,7 +3228,12 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/admin/users') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
-    return json(res, 200, { users: db.users.map(adminUserView) });
+    const q = String(url.searchParams.get('q') || '').trim().toLowerCase();
+    let users = db.users.map(adminUserView);
+    if (q) {
+      users = users.filter(u => [u.username, u.name, u.email, u.id].some(x => String(x || '').toLowerCase().includes(q)));
+    }
+    return json(res, 200, { users, total: db.users.length });
   }
 
   if (req.method === 'PUT' && url.pathname.startsWith('/api/admin/users/')) {
@@ -3157,16 +3245,35 @@ const server = http.createServer(async (req, res) => {
     const p = await body(req);
     if (!p || typeof p !== 'object') return fail(res, 400, '无效请求体');
     const changes = {};
+    if ('balance' in p && 'balanceDelta' in p) return fail(res, 400, '不能同时设置余额和增减额');
+    if ('banned' in p) {
+      if (typeof p.banned !== 'boolean') return fail(res, 400, 'banned 必须为布尔值');
+      if (target.id === user.id && p.banned) return fail(res, 400, '不能封禁自己');
+      if (isAdmin(target) && p.banned) return fail(res, 400, '不能封禁管理员');
+      changes.banned = { from: !!target.banned, to: p.banned };
+      target.banned = p.banned;
+    }
     if ('accountActive' in p) {
       if (typeof p.accountActive !== 'boolean') return fail(res, 400, 'accountActive 必须为布尔值');
       changes.accountActive = { from: target.accountActive !== false, to: p.accountActive };
       target.accountActive = p.accountActive;
     }
+    if ('balanceDelta' in p) {
+      const delta = money2(p.balanceDelta);
+      if (!Number.isFinite(delta) || delta === 0) return fail(res, 400, '增减额必须是非零数字');
+      const from = money2(target.balance || 0);
+      const to = money2(from + delta);
+      if (to < 0) return fail(res, 400, '余额不足，不能减到负数');
+      changes.balance = { from, to, delta };
+      target.balance = to;
+      if (to > 0 && !target.banned) target.accountActive = true;
+    }
     if ('balance' in p) {
-      const balance = Number(p.balance);
+      const balance = money2(p.balance);
       if (!Number.isFinite(balance) || balance < 0) return fail(res, 400, 'balance 必须为非负数字');
-      changes.balance = { from: target.balance || 0, to: balance };
+      changes.balance = { from: money2(target.balance || 0), to: balance };
       target.balance = balance;
+      if (balance > 0 && !target.banned) target.accountActive = true;
     }
     if ('quotaTokens' in p) {
       const quota = Number(p.quotaTokens);
@@ -3193,7 +3300,9 @@ const server = http.createServer(async (req, res) => {
       amount: Number(c.amount || 0),
       quotaTokens: Number(c.quotaTokens || 0),
       usedAt: c.usedAt || null,
-      userId: c.userId || null
+      userId: c.userId || null,
+      issuedTo: c.issuedTo || null,
+      source: c.source || (c.issuedTo ? 'issued' : 'pool')
     }));
     return json(res, 200, { codes });
   }
@@ -3211,7 +3320,7 @@ const server = http.createServer(async (req, res) => {
     const created = [];
     for (let i = 0; i < count; i++) {
       const code = `${prefix}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
-      const entry = { code, amount, quotaTokens, usedAt: null, userId: null, createdAt: new Date().toISOString() };
+      const entry = { code, amount, quotaTokens, usedAt: null, userId: null, issuedAt: null, issuedTo: null, source: 'manual', createdAt: new Date().toISOString() };
       db.rechargeCodes.push(entry);
       created.push({ code: entry.code, amount: entry.amount, quotaTokens: entry.quotaTokens, usedAt: null, userId: null });
     }
@@ -3362,12 +3471,14 @@ for (const user of initial.users) {
   user.reservedTokens ??= 0;
   user.reservedBalance ??= 0;
   user.accountActive ??= (user.balance || 0) > 0;
+  user.banned ??= false;
   user.checkInBonus ??= 0;
   user.avatar = normalizeAvatar(user.avatar).avatar;
   user.role ??= (ADMIN_EMAIL && user.email === ADMIN_EMAIL) ? 'admin' : 'user';
   ensureUsername(user, initial);
   ensureUserKeys(user);
 }
+ensureUniqueDisplayNames(initial);
 for (const provider of initial.settings.providers) {
   if (provider.id === 'grp_cursor_pool') { provider.maintenance = true; provider.maintenanceMessage = '请联系站长购买'; }
   provider.maintenance ??= (provider.id === 'grp_cursor_pool');
@@ -3403,7 +3514,7 @@ const envCodes = (process.env.RECHARGE_CODES || '').split(',').map(x => x.trim()
 for (const item of envCodes) {
   const [code, amount, quotaTokens] = item.split(':');
   if (code && !initial.rechargeCodes.some(x => x.code === code)) {
-    initial.rechargeCodes.push({ code, amount: Number(amount || 10), quotaTokens: Number(quotaTokens || 100000), usedAt: null });
+    initial.rechargeCodes.push({ code, amount: Number(amount || 10), quotaTokens: Number(quotaTokens || 100000), usedAt: null, issuedAt: null, issuedTo: null, source: 'manual' });
   }
 }
 for (const [token, session] of Object.entries(initial.sessions || {})) {

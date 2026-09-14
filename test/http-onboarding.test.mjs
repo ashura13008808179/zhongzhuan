@@ -92,6 +92,33 @@ try {
   assert.equal(emptyInvite.status, 201, JSON.stringify(emptyInvite.body));
   assert.equal(emptyInvite.body.user.balance, 0);
   assert.equal(emptyInvite.body.user.quotaTokens, 0);
+  assert.equal(emptyInvite.body.user.username, 'newbie01');
+  assert.equal(emptyInvite.body.user.name, 'Newbie');
+  const newbieId = emptyInvite.body.user.id;
+
+  const dupUsername = await req('/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      email: 'dupuser@example.com',
+      username: 'newbie01',
+      name: 'SomeoneElse',
+      password: 'password1'
+    })
+  });
+  assert.equal(dupUsername.status, 409);
+  assert.match(String(dupUsername.body.error || ''), /用户名已被占用/);
+
+  const dupName = await req('/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      email: 'dupname@example.com',
+      username: 'othername99',
+      name: 'Newbie',
+      password: 'password1'
+    })
+  });
+  assert.equal(dupName.status, 409);
+  assert.match(String(dupName.body.error || ''), /名称已被占用/);
 
   const adminLogin = await req('/api/auth/login', {
     method: 'POST',
@@ -201,23 +228,33 @@ try {
   const userUpload = await req('/api/admin/payment-qrs/upload', {
     method: 'POST',
     headers: { Authorization: `Bearer ${emptyInvite.body.token}` },
-    body: JSON.stringify({ method: 'wechat', applyAll: true, image: png1x1 })
+    body: JSON.stringify({ method: 'wechat', amount: 10, image: png1x1 })
   });
   assert.equal(userUpload.status, 403);
+  const blockedAll = await req('/api/admin/payment-qrs/upload', {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ method: 'wechat', applyAll: true, image: png1x1 })
+  });
+  assert.equal(blockedAll.status, 400);
+  assert.match(String(blockedAll.body.error || ''), /分别上传/);
+  const before = await req('/api/admin/payment-qrs', { headers: auth });
+  const original100 = before.body.paymentQrs.wechat['100'];
   const uploaded = await req('/api/admin/payment-qrs/upload', {
     method: 'POST',
     headers: auth,
     body: JSON.stringify({
       method: 'wechat',
-      applyAll: true,
+      amount: 10,
       image: png1x1,
       expiresAt: '2099-12-31'
     })
   });
   assert.equal(uploaded.status, 200, JSON.stringify(uploaded.body));
-  assert.match(String(uploaded.body.url || ''), /^\/payment-qr\/uploads\/wechat-all-\d+\.png$/);
+  assert.match(String(uploaded.body.url || ''), /^\/payment-qr\/uploads\/wechat-10-\d+\.png$/);
   assert.equal(uploaded.body.paymentQrs.wechat['10'], uploaded.body.url);
-  assert.equal(uploaded.body.paymentQrs.wechat['100'], uploaded.body.url);
+  assert.equal(uploaded.body.paymentQrs.wechat['100'], original100);
+  assert.notEqual(uploaded.body.paymentQrs.wechat['100'], uploaded.body.url);
   assert.equal(uploaded.body.paymentQrMeta.wechat.expired, false);
   const imgRes = await fetch(`${base}${uploaded.body.url}`);
   assert.equal(imgRes.status, 200);
@@ -226,11 +263,133 @@ try {
   const saved = path.join(root, 'public', ...rel.split('/'));
   try { fs.unlinkSync(saved); } catch { /* ignore leftover */ }
 
+  const usersGuest = await req('/api/admin/users');
+  assert.equal(usersGuest.status, 403);
+  const usersList = await req('/api/admin/users?q=newbie01', { headers: auth });
+  assert.equal(usersList.status, 200);
+  assert.equal(usersList.body.users.length, 1);
+  assert.equal(usersList.body.users[0].username, 'newbie01');
+
+  const addBal = await req(`/api/admin/users/${encodeURIComponent(newbieId)}`, {
+    method: 'PUT', headers: auth, body: JSON.stringify({ balanceDelta: 5 })
+  });
+  assert.equal(addBal.status, 200, JSON.stringify(addBal.body));
+  assert.equal(addBal.body.user.balance, 5);
+  const subBal = await req(`/api/admin/users/${encodeURIComponent(newbieId)}`, {
+    method: 'PUT', headers: auth, body: JSON.stringify({ balanceDelta: -1.5 })
+  });
+  assert.equal(subBal.status, 200);
+  assert.equal(subBal.body.user.balance, 3.5);
+  const setBal = await req(`/api/admin/users/${encodeURIComponent(newbieId)}`, {
+    method: 'PUT', headers: auth, body: JSON.stringify({ balance: 8 })
+  });
+  assert.equal(setBal.status, 200);
+  assert.equal(setBal.body.user.balance, 8);
+  const overdraft = await req(`/api/admin/users/${encodeURIComponent(newbieId)}`, {
+    method: 'PUT', headers: auth, body: JSON.stringify({ balanceDelta: -20 })
+  });
+  assert.equal(overdraft.status, 400);
+  const banSelf = await req(`/api/admin/users/${encodeURIComponent(adminLogin.body.user.id)}`, {
+    method: 'PUT', headers: auth, body: JSON.stringify({ banned: true })
+  });
+  assert.equal(banSelf.status, 400);
+  const banUser = await req(`/api/admin/users/${encodeURIComponent(newbieId)}`, {
+    method: 'PUT', headers: auth, body: JSON.stringify({ banned: true })
+  });
+  assert.equal(banUser.status, 200, JSON.stringify(banUser.body));
+  assert.equal(banUser.body.user.banned, true);
+  const bannedLogin = await req('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ login: 'newbie01', password: 'password1' })
+  });
+  assert.equal(bannedLogin.status, 403);
+  const unbanUser = await req(`/api/admin/users/${encodeURIComponent(newbieId)}`, {
+    method: 'PUT', headers: auth, body: JSON.stringify({ banned: false })
+  });
+  assert.equal(unbanUser.status, 200);
+  const okLogin = await req('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ login: 'newbie01', password: 'password1' })
+  });
+  assert.equal(okLogin.status, 200);
+
   const appPage = await fetch(`${base}/admin-app/`);
   assert.equal(appPage.status, 200);
   const appHtml = await appPage.text();
   assert.match(appHtml, /值班控制台/);
   assert.match(appHtml, /收款码/);
+  assert.match(appHtml, /用户/);
+
+  const newbieTok = { Authorization: `Bearer ${okLogin.body.token}` };
+  const invitedTok = { Authorization: `Bearer ${validInvite.body.token}` };
+  const prep = await req('/api/recharge/prepare', {
+    method: 'POST',
+    headers: newbieTok,
+    body: JSON.stringify({ amount: 10, method: 'wechat' })
+  });
+  assert.equal(prep.status, 200, JSON.stringify(prep.body));
+  const claimed = await req('/api/recharge/claim', {
+    method: 'POST',
+    headers: newbieTok,
+    body: JSON.stringify({ orderId: prep.body.orderId })
+  });
+  assert.equal(claimed.status, 200, JSON.stringify(claimed.body));
+  const confirmedPay = await req(`/api/admin/payment-orders/${encodeURIComponent(prep.body.orderId)}/confirm`, {
+    method: 'POST',
+    headers: auth,
+    body: '{}'
+  });
+  assert.equal(confirmedPay.status, 200, JSON.stringify(confirmedPay.body));
+  const issuedCode = confirmedPay.body.order?.code;
+  assert.ok(issuedCode);
+  const steal = await req('/api/recharge/redeem', {
+    method: 'POST',
+    headers: invitedTok,
+    body: JSON.stringify({ code: issuedCode })
+  });
+  assert.equal(steal.status, 400);
+  assert.match(String(steal.body.error || ''), /无权兑换|无效|已使用/);
+  const emptyCode = await req('/api/recharge/redeem', {
+    method: 'POST',
+    headers: newbieTok,
+    body: JSON.stringify({ code: '' })
+  });
+  assert.equal(emptyCode.status, 400);
+  const stockList = await req('/api/admin/codes', { headers: auth });
+  const stock = (stockList.body.codes || []).find(c => !c.usedAt && !c.issuedTo && Number(c.amount) === 10 && c.code !== issuedCode);
+  assert.ok(stock, 'expected unused pool code');
+  const stockTry = await req('/api/recharge/redeem', {
+    method: 'POST',
+    headers: newbieTok,
+    body: JSON.stringify({ code: stock.code })
+  });
+  assert.equal(stockTry.status, 400);
+  const own = await req('/api/recharge/redeem', {
+    method: 'POST',
+    headers: newbieTok,
+    body: JSON.stringify({ code: String(issuedCode).toLowerCase() })
+  });
+  assert.equal(own.status, 200, JSON.stringify(own.body));
+  assert.equal(own.body.user.balance, 18);
+  const twice = await req('/api/recharge/redeem', {
+    method: 'POST',
+    headers: newbieTok,
+    body: JSON.stringify({ code: issuedCode })
+  });
+  assert.equal(twice.status, 400);
+  const made = await req('/api/admin/codes', {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ count: 1, amount: 10, quotaTokens: 1000, prefix: 'GIFT' })
+  });
+  assert.equal(made.status, 201, JSON.stringify(made.body));
+  const giftOk = await req('/api/recharge/redeem', {
+    method: 'POST',
+    headers: invitedTok,
+    body: JSON.stringify({ code: made.body.codes[0].code })
+  });
+  assert.equal(giftOk.status, 200, JSON.stringify(giftOk.body));
+  assert.equal(giftOk.body.user.balance, 10);
 
   console.log('http-onboarding.test.mjs: all assertions passed');
 } finally {

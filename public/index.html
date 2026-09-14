@@ -49,10 +49,10 @@
           <input id="regEmail" type="email" autocomplete="email" placeholder="you@example.com" required>
         </label>
         <label>用户名
-          <input id="regUsername" type="text" autocomplete="username" placeholder="3-32 位字母数字下划线" required minlength="3" maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9_-]{2,31}">
+          <input id="regUsername" type="text" autocomplete="username" placeholder="全站唯一，3-32 位字母数字下划线" required minlength="3" maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9_-]{2,31}">
         </label>
-        <label>显示名称 <span class="optional">可选</span>
-          <input id="regName" autocomplete="nickname" placeholder="你的名字">
+        <label>显示名称 <span class="optional">可选，不填则与用户名相同</span>
+          <input id="regName" autocomplete="nickname" placeholder="全站唯一，不能与别人重名">
         </label>
         <label>密码
           <input id="regPassword" type="password" autocomplete="new-password" minlength="8" placeholder="至少 8 位字符" required>

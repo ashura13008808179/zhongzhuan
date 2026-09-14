@@ -218,7 +218,7 @@ function render(name){
   if(name==='billing'){
   const plans=(window.appConfig?.paymentPlans||[{amount:10,qr:''},{amount:30,qr:''},{amount:50,qr:''},{amount:100,qr:''}]);
   shell('卡密充值','BILLING & RECHARGE',`<div class="billing-grid">
-    <section class="card recharge-card"><p class="eyebrow">REDEEM CODE</p><h2>使用充值卡密</h2><p class="sub">输入卡密，余额会立即到账。</p><form id="redeemForm"><input id="redeemCode" placeholder="例如：R10-XXXX" required><button class="primary-btn">立即充值 ↗</button></form><div id="redeemMsg" class="inline-msg"></div></section>
+    <section class="card recharge-card"><p class="eyebrow">REDEEM CODE</p><h2>使用充值卡密</h2><p class="sub">每张卡密只能兑换一次。付款确认后发给你的卡密仅本人可用，别人乱试兑不了。</p><form id="redeemForm"><input id="redeemCode" placeholder="例如：R10-XXXX" required><button class="primary-btn">立即充值 ↗</button></form><div id="redeemMsg" class="inline-msg"></div></section>
     <section class="card"><p class="eyebrow">PAYMENT</p><h2>购买卡密</h2><p class="sub">选择金额并确认购买后扫码付款；付款备注请填写你的用户名，付完再提交确认，管理员核对后发卡。</p>
       <div class="pay-method-tabs" id="payMethodTabs">
         <button type="button" class="pay-method-btn active" data-method="wechat">微信支付</button>
@@ -942,7 +942,7 @@ async function renderOperations() {
       }
     } else if (adminTab === 'users') {
       const { users } = await api('/api/admin/users');
-      shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><div class="card-head"><div><p class="eyebrow">USERS</p><h2>用户管理</h2></div><span class="sub">${users.length} 位用户</span></div><div id="usersMsg" class="inline-msg"></div><table class="admin-table"><thead><tr><th>邮箱</th><th>用户名</th><th>名称</th><th>余额</th><th>配额</th><th>已用</th><th>角色</th><th>状态</th><th>操作</th></tr></thead><tbody>${users.map(u => `<tr data-user="${esc(u.id)}">
+      shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><div class="card-head"><div><p class="eyebrow">USERS</p><h2>用户管理</h2><p class="sub">用户名和显示名称全站唯一。可加余额、减余额、改余额、封号。</p></div><span class="sub">${users.length} 位用户</span></div><div id="usersMsg" class="inline-msg"></div><table class="admin-table"><thead><tr><th>邮箱</th><th>用户名</th><th>名称</th><th>余额</th><th>配额</th><th>已用</th><th>角色</th><th>状态</th><th>操作</th></tr></thead><tbody>${users.map(u => `<tr data-user="${esc(u.id)}">
         <td>${esc(u.email)}</td>
         <td>@${esc(u.username||'-')}</td>
         <td>${esc(u.name)}</td>
@@ -950,18 +950,32 @@ async function renderOperations() {
         <td><input class="mini-input" data-edit="quotaTokens" type="number" min="0" value="${u.quotaTokens}"></td>
         <td>${Number(u.usedTokens||0).toLocaleString()}</td>
         <td><select data-edit="role"><option value="user" ${u.role==='user'?'selected':''}>user</option><option value="admin" ${u.role==='admin'?'selected':''}>admin</option></select></td>
-        <td><span class="tag ${u.accountActive?'success':'danger'}">${u.accountActive?'启用':'停用'}</span></td>
+        <td><span class="tag ${u.banned?'danger':(u.accountActive?'success':'danger')}">${u.banned?'已封禁':(u.accountActive?'启用':'未激活')}</span></td>
         <td class="ops-cell">
-          <button class="ghost-btn" data-toggle-active="${esc(u.id)}" data-active="${u.accountActive}">${u.accountActive?'封禁':'启用'}</button>
-          <button class="ghost-btn" data-save-user="${esc(u.id)}">保存</button>
+          <button class="ghost-btn" data-delta="${esc(u.id)}" data-sign="1">加余额</button>
+          <button class="ghost-btn" data-delta="${esc(u.id)}" data-sign="-1">减余额</button>
+          <button class="ghost-btn" data-toggle-ban="${esc(u.id)}" data-banned="${u.banned? 'true':'false'}">${u.banned?'解封':'封号'}</button>
+          <button class="ghost-btn" data-save-user="${esc(u.id)}">保存余额</button>
         </td>
       </tr>`).join('')}</tbody></table></section>`);
-      page.querySelectorAll('[data-toggle-active]').forEach(btn => btn.onclick = async () => {
+      const showUsersErr = (err) => { const el = $('#usersMsg'); if (el) { el.textContent = err.message || String(err); el.className = 'inline-msg'; } };
+      page.querySelectorAll('[data-toggle-ban]').forEach(btn => btn.onclick = async () => {
         try {
-          const active = btn.dataset.active === 'true';
-          await api(`/api/admin/users/${btn.dataset.toggleActive}`, { method: 'PUT', body: JSON.stringify({ accountActive: !active }) });
+          const banned = btn.dataset.banned === 'true';
+          await api(`/api/admin/users/${btn.dataset.toggleBan}`, { method: 'PUT', body: JSON.stringify({ banned: !banned }) });
           renderOperations();
-        } catch (err) { $('#usersMsg').textContent = err.message; }
+        } catch (err) { showUsersErr(err); }
+      });
+      page.querySelectorAll('[data-delta]').forEach(btn => btn.onclick = async () => {
+        const sign = Number(btn.dataset.sign);
+        const raw = prompt(sign > 0 ? '增加多少余额（元）' : '减少多少余额（元）', '10');
+        if (raw == null) return;
+        const amount = Number(raw);
+        if (!Number.isFinite(amount) || amount <= 0) { showUsersErr(Error('请输入大于 0 的金额')); return; }
+        try {
+          await api(`/api/admin/users/${btn.dataset.delta}`, { method: 'PUT', body: JSON.stringify({ balanceDelta: sign * amount }) });
+          renderOperations();
+        } catch (err) { showUsersErr(err); }
       });
       page.querySelectorAll('[data-save-user]').forEach(btn => btn.onclick = async () => {
         const row = btn.closest('tr');
@@ -977,7 +991,7 @@ async function renderOperations() {
           $('#usersMsg').textContent = '已保存';
           $('#usersMsg').className = 'inline-msg ok';
           renderOperations();
-        } catch (err) { $('#usersMsg').textContent = err.message; $('#usersMsg').className = 'inline-msg'; }
+        } catch (err) { showUsersErr(err); }
       });
     } else if (adminTab === 'codes') {
       const { codes } = await api('/api/admin/codes');

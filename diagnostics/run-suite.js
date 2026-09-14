@@ -20,6 +20,8 @@ export async function runDiagnosticSuite(ctx) {
     resolveDisplayMultiplier,
     poolStats,
     codeAvailable,
+    findCodeRecord,
+    redeemAccess,
     PAYMENT_AMOUNTS,
     REFERRAL_REBATE_RATE,
     gatewayReady,
@@ -341,7 +343,18 @@ export async function runDiagnosticSuite(ctx) {
       });
     }
 
-    const redeemable = (code) => (db.rechargeCodes || []).find(x => x.code === code && !x.usedAt) || null;
+    const redeemable = (code) => {
+      const rec = typeof findCodeRecord === 'function'
+        ? findCodeRecord(db, code)
+        : (db.rechargeCodes || []).find(x => String(x.code || '').toUpperCase() === String(code || '').trim().toUpperCase());
+      return rec && !rec.usedAt ? rec : null;
+    };
+    const canUserRedeem = (rec, userId) => {
+      if (typeof redeemAccess === 'function') return redeemAccess(rec, userId).ok;
+      if (!rec || rec.usedAt) return false;
+      if (rec.issuedTo) return rec.issuedTo === userId;
+      return rec.source === 'manual';
+    };
     const ghost = redeemable('__diag_invalid_code__');
     const emptyHit = redeemable('');
     push({
@@ -353,29 +366,36 @@ export async function runDiagnosticSuite(ctx) {
     });
 
     const sample = (db.rechargeCodes || []).find(c => (typeof codeAvailable === 'function' ? codeAvailable(c) : (!c.usedAt && !c.issuedAt)) && Number(c.amount) > 0);
+    const issued = (db.rechargeCodes || []).find(c => c.issuedTo && !c.usedAt);
     const used = (db.rechargeCodes || []).find(c => c.usedAt);
     const usedStillOpen = used ? !!redeemable(used.code) : false;
+    const poolFreelyRedeemable = sample ? canUserRedeem(sample, 'usr_stranger') : false;
+    const ownerCanRedeem = issued ? canUserRedeem(issued, issued.issuedTo) : true;
+    const thiefCanRedeem = issued ? canUserRedeem(issued, 'usr_other') : false;
     const rate = Number(REFERRAL_REBATE_RATE || 0.05);
     const rebate10 = Math.round(10 * rate * 100) / 100;
     const amountsOk = amounts.length >= 1 && amounts.every(a => Number(a) > 0);
-    if (!sample) {
+    if (!sample && !issued && !used) {
       push({
         id: 'recharge_redeem', name: '卡密兑换逻辑', ok: false,
-        message: '没有可用卡密，无法校验兑换字段',
+        message: '没有卡密样例，无法校验兑换字段',
         fix: ['先补卡密库存再测兑换']
       });
     } else {
-      const found = redeemable(sample.code);
-      const amountOk = Number.isFinite(Number(sample.amount)) && Number(sample.amount) > 0;
-      const codeOk = typeof sample.code === 'string' && sample.code.length >= 6;
-      const whitelistOk = amounts.includes(Number(sample.amount)) || amounts.includes(sample.amount);
+      const amountSrc = issued || sample || used;
+      const amountOk = Number.isFinite(Number(amountSrc?.amount)) && Number(amountSrc.amount) > 0;
+      const codeOk = typeof (amountSrc?.code) === 'string' && amountSrc.code.length >= 6;
+      const whitelistOk = amounts.includes(Number(amountSrc?.amount)) || amounts.includes(amountSrc?.amount);
+      const bindOk = !poolFreelyRedeemable && ownerCanRedeem && !thiefCanRedeem && !usedStillOpen;
       push({
         id: 'recharge_redeem',
         name: '卡密兑换逻辑',
-        ok: amountOk && codeOk && !!found && !usedStillOpen && amountsOk,
-        message: `可兑 ¥${Number(sample.amount).toFixed(2)} · 码长 ${String(sample.code).length} · 面额档 ${amounts.map(a => '¥' + a).join('/')} · 已用卡密${used ? (usedStillOpen ? '仍可兑换（异常）' : '已正确作废') : '暂无已用样例'} · 邀请返利 ${fmtRate(rate * 100)}%（¥10→¥${rebate10.toFixed(2)}）`,
-        detail: whitelistOk ? null : `样例面额 ¥${sample.amount} 不在充值档位里`,
-        fix: usedStillOpen ? ['已使用卡密不应再能兑换，检查 usedAt 写入'] : []
+        ok: amountOk && codeOk && bindOk && amountsOk,
+        message: `库存码不可乱兑 · 已发放仅本人可兑 · 已用卡密${used ? (usedStillOpen ? '仍可兑换（异常）' : '已正确作废') : '暂无已用样例'} · 邀请返利 ${fmtRate(rate * 100)}%（¥10→¥${rebate10.toFixed(2)}）`,
+        detail: whitelistOk ? null : `样例面额 ¥${amountSrc?.amount} 不在充值档位里`,
+        fix: usedStillOpen
+          ? ['已使用卡密不应再能兑换，检查 usedAt 写入']
+          : (poolFreelyRedeemable || thiefCanRedeem ? ['未发放库存和他人卡密不得兑换'] : [])
       });
     }
 
@@ -411,7 +431,7 @@ export async function runDiagnosticSuite(ctx) {
 
     const dupes = {};
     for (const c of db.rechargeCodes || []) {
-      const k = String(c.code || '');
+      const k = String(c.code || '').trim().toUpperCase();
       if (!k) continue;
       dupes[k] = (dupes[k] || 0) + 1;
     }

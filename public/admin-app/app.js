@@ -188,7 +188,7 @@ async function render(preloaded) {
         <p class="sub">诊断上次：${inbox.diagnostics?.at ? when(inbox.diagnostics.at) : '尚未运行'} · 失败 ${inbox.diagnostics?.summary?.failed ?? '-'}</p>
         <div class="row"><button class="primary" id="goOrders">去确认充值</button></div>
         ${inbox.paymentQr?.wechat?.expired || inbox.paymentQr?.alipay?.expired
-          ? `<article class="item" style="margin-top:12px"><h3 class="bad">收款码已过期</h3><p class="sub">${esc([inbox.paymentQr?.wechat?.expired ? '微信' : '', inbox.paymentQr?.alipay?.expired ? '支付宝' : ''].filter(Boolean).join(' / '))} 需要换图。点「收款码」相册一键替换。</p><button class="primary" id="goQr">去替换收款码</button></article>`
+          ? `<article class="item" style="margin-top:12px"><h3 class="bad">收款码已过期</h3><p class="sub">${esc([inbox.paymentQr?.wechat?.expired ? '微信' : '', inbox.paymentQr?.alipay?.expired ? '支付宝' : ''].filter(Boolean).join(' / '))} 需要按金额分别换图。</p><button class="primary" id="goQr">去替换收款码</button></article>`
           : ''}`;
       $('#goOrders').onclick = () => { tab = 'orders'; syncTabs(); render(); };
       $('#goQr')?.addEventListener('click', () => { tab = 'qr'; syncTabs(); render(); });
@@ -224,6 +224,70 @@ async function render(preloaded) {
           } catch (err) { alert(err.message); }
         };
       });
+    } else if (tab === 'users') {
+      const q = ($('#userQ')?.value || '').trim();
+      const data = await api('/api/admin/users' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+      const list = data.users || [];
+      pane.innerHTML = `
+        <p class="sub">用户名和显示名称全站唯一。共 ${data.total ?? list.length} 人。</p>
+        <label>搜索<input id="userQ" value="${esc(q)}" placeholder="用户名 / 名称 / 邮箱"></label>
+        <button class="primary" type="button" id="userSearch">搜索</button>
+        <div class="list" style="margin-top:12px">${list.length ? list.map(u => `
+          <article class="item">
+            <h3>@${esc(u.username || '-')} ${u.banned ? '<span class="tag bad">已封禁</span>' : (u.accountActive ? '<span class="tag">正常</span>' : '<span class="tag warn">未激活</span>')}</h3>
+            <p class="sub">${esc(u.name || '')} · ${esc(u.email || '')}</p>
+            <p><b class="${u.banned ? 'bad' : 'ok'}">${money(u.balance)}</b></p>
+            <div class="row">
+              <button class="primary" data-add="${esc(u.id)}">加余额</button>
+              <button class="ghost" data-sub="${esc(u.id)}">减余额</button>
+            </div>
+            <div class="row">
+              <button class="ghost" data-set="${esc(u.id)}" data-bal="${esc(u.balance)}">改余额</button>
+              <button class="ghost" data-ban="${esc(u.id)}" data-banned="${u.banned ? '1' : '0'}">${u.banned ? '解封' : '封号'}</button>
+            </div>
+          </article>`).join('') : '<p class="sub">没有匹配的用户。</p>'}</div>`;
+      $('#userSearch').onclick = () => render();
+      $('#userQ')?.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); render(); } });
+      const act = async (id, body) => {
+        try {
+          await api('/api/admin/users/' + encodeURIComponent(id), { method: 'PUT', body: JSON.stringify(body) });
+          render();
+        } catch (err) { alert(err.message); }
+      };
+      pane.querySelectorAll('[data-add]').forEach(btn => {
+        btn.onclick = () => {
+          const raw = prompt('增加多少余额（元）', '10');
+          if (raw == null) return;
+          const n = Number(raw);
+          if (!Number.isFinite(n) || n <= 0) return alert('请输入大于 0 的金额');
+          act(btn.dataset.add, { balanceDelta: n });
+        };
+      });
+      pane.querySelectorAll('[data-sub]').forEach(btn => {
+        btn.onclick = () => {
+          const raw = prompt('减少多少余额（元）', '10');
+          if (raw == null) return;
+          const n = Number(raw);
+          if (!Number.isFinite(n) || n <= 0) return alert('请输入大于 0 的金额');
+          act(btn.dataset.sub, { balanceDelta: -n });
+        };
+      });
+      pane.querySelectorAll('[data-set]').forEach(btn => {
+        btn.onclick = () => {
+          const raw = prompt('把余额改成多少（元）', btn.dataset.bal || '0');
+          if (raw == null) return;
+          const n = Number(raw);
+          if (!Number.isFinite(n) || n < 0) return alert('余额必须是非负数');
+          act(btn.dataset.set, { balance: n });
+        };
+      });
+      pane.querySelectorAll('[data-ban]').forEach(btn => {
+        btn.onclick = () => {
+          const banned = btn.dataset.banned === '1';
+          if (!banned && !confirm('确认封禁该用户？封禁后无法登录、充值和调用 API。')) return;
+          act(btn.dataset.ban, { banned: !banned });
+        };
+      });
     } else if (tab === 'qr') {
       const data = await api('/api/admin/payment-qrs');
       const qrs = data.paymentQrs || {};
@@ -232,28 +296,30 @@ async function render(preloaded) {
       const bust = Date.now();
       const card = (method, title) => {
         const st = meta[method] || {};
-        const preview = qrs[method]?.['10'] || qrs[method]?.['30'] || qrs[method]?.['50'] || qrs[method]?.['100'] || '';
         const slots = amounts.map(a => {
           const src = qrs[method]?.[String(a)] || '';
-          return `<p class="sub">¥${a} ${src ? '已配置' : '缺图'}</p>`;
+          return `<article class="qr-slot">
+            <h3>¥${a}</h3>
+            ${src ? `<img class="qr-preview" alt="${title} ¥${a}" src="${esc(src)}?t=${bust}">` : '<p class="sub">还没有这张收款码</p>'}
+            <label class="file-btn">替换这张图
+              <input class="hidden-file" type="file" accept="image/*" data-method="${method}" data-amount="${a}">
+            </label>
+            <p class="sub" id="${method}-${a}-msg">${src ? '只改这一档金额' : '缺图'}</p>
+          </article>`;
         }).join('');
         return `<article class="item">
           <h3>${title} ${qrStatusHtml(st)}</h3>
           <p class="sub">${esc(st.tip || '')}</p>
-          ${preview ? `<img class="qr-preview" alt="${title}收款码" src="${esc(preview)}?t=${bust}">` : '<p class="sub">还没有收款码图片</p>'}
-          <div class="qr-grid">${slots}</div>
-          <label>新到期日<input type="date" id="${method}Exp" value="${esc(dateInput(st.expiresAt || meta[method + 'ExpiresAt']))}"></label>
-          <label class="file-btn">从相册一键替换全部面额
-            <input class="hidden-file" type="file" accept="image/*" data-upload="${method}">
-          </label>
+          <label>该支付方式到期日<input type="date" id="${method}Exp" value="${esc(dateInput(st.expiresAt || meta[method + 'ExpiresAt']))}"></label>
           <button class="ghost" type="button" data-save-exp="${method}" style="width:100%;margin-top:8px">只保存到期日</button>
-          <p class="sub" id="${method}Msg">会同时更新 ¥10 / 30 / 50 / 100，并写入上面的到期日。</p>
+          <p class="sub" id="${method}Msg">到期日按微信/支付宝整组计算，图片必须按金额分开换。</p>
+          <div class="qr-list">${slots}</div>
         </article>`;
       };
-      pane.innerHTML = `<p class="sub">收款码过期或扫码失败时，直接从相册换一张新图，不必回电脑后台。</p>
+      pane.innerHTML = `<p class="sub">¥10 / 30 / 50 / 100 各是一张收款码，过期或扫码失败时只替换对应金额的那张。</p>
         <div class="list">${card('wechat', '微信')}${card('alipay', '支付宝')}</div>`;
-      const upload = async (method, file) => {
-        const msg = document.getElementById(method + 'Msg');
+      const upload = async (method, amount, file) => {
+        const msg = document.getElementById(`${method}-${amount}-msg`);
         if (!msg) return;
         msg.textContent = '处理图片…';
         msg.className = 'sub';
@@ -265,12 +331,11 @@ async function render(preloaded) {
             method: 'POST',
             body: JSON.stringify({
               method,
-              applyAll: true,
-              image,
-              expiresAt: document.getElementById(method + 'Exp')?.value || null
+              amount: Number(amount),
+              image
             })
           });
-          msg.textContent = '已替换全部面额';
+          msg.textContent = `已替换 ¥${amount}`;
           msg.className = 'sub ok';
           render();
         } catch (err) {
@@ -278,11 +343,11 @@ async function render(preloaded) {
           msg.className = 'sub bad';
         }
       };
-      pane.querySelectorAll('[data-upload]').forEach(input => {
+      pane.querySelectorAll('input[data-amount]').forEach(input => {
         input.onchange = () => {
           const file = input.files && input.files[0];
           input.value = '';
-          if (file) upload(input.dataset.upload, file);
+          if (file) upload(input.dataset.method, input.dataset.amount, file);
         };
       });
       pane.querySelectorAll('[data-save-exp]').forEach(btn => {
@@ -369,7 +434,7 @@ async function render(preloaded) {
         <button class="primary" id="saveSet">保存后端设置</button>
         <p class="sub" id="setMsg"></p>
         <button class="ghost" id="editServer" type="button" style="width:100%;margin-top:12px">更换 APK 连接的网站地址</button>
-        <p class="sub">渠道同步、聚合支付、用户余额等完整项仍可在电脑后台处理；手机侧重值班。</p>`;
+        <p class="sub">渠道同步、聚合支付仍可在电脑后台处理。用户余额加减和封号已可在本页「用户」操作。</p>`;
       $('#saveSet').onclick = async () => {
         const msg = $('#setMsg');
         try {
