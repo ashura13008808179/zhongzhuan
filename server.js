@@ -84,7 +84,7 @@ const CONTACT_EMAIL = process.env.CONTACT_EMAIL || '3845440106@qq.com';
 const CONTACT_WECHAT = process.env.CONTACT_WECHAT || '';
 const CONTACT_QQ = process.env.CONTACT_QQ || '3845440106';
 const CONTACT_QQ_GROUP = process.env.CONTACT_QQ_GROUP || '1061247399';
-const PAYMENT_QR = process.env.PAYMENT_QR || '/payment-qr.svg';
+const PAYMENT_QR = process.env.PAYMENT_QR || '/payment-qr/10.png';
 const PAYMENT_AMOUNTS = [10, 30, 50, 100];
 const PAYMENT_METHODS = [
   { id: 'wechat', label: '微信支付' },
@@ -2703,7 +2703,7 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { last: db.settings?.lastDiagnostics || null });
   }
 
-  if (req.method === 'GET' && url.pathname === '/api/admin/mobile/inbox') {
+  if (req.method === 'GET' && (url.pathname === '/api/admin/mobile/inbox' || url.pathname === '/api/admin/inbox')) {
     if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
     const inbox = buildMobileInbox(db);
     const meta = paymentQrMeta(db);
@@ -3311,7 +3311,13 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/admin/codes') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
-    const codes = (db.rechargeCodes || []).map(c => ({
+    const all = db.rechargeCodes || [];
+    const total = all.length;
+    const limitRaw = Number(url.searchParams.get('limit'));
+    const offsetRaw = Number(url.searchParams.get('offset'));
+    const limit = Number.isFinite(limitRaw) ? Math.min(500, Math.max(1, Math.floor(limitRaw))) : 200;
+    const offset = Number.isFinite(offsetRaw) ? Math.max(0, Math.floor(offsetRaw)) : Math.max(0, total - limit);
+    const mapCode = (c) => ({
       code: c.code,
       amount: Number(c.amount || 0),
       quotaTokens: Number(c.quotaTokens || 0),
@@ -3319,8 +3325,10 @@ const server = http.createServer(async (req, res) => {
       userId: c.userId || null,
       issuedTo: c.issuedTo || null,
       source: c.source || (c.issuedTo ? 'issued' : 'pool')
-    }));
-    return json(res, 200, { codes });
+    });
+    // Default offset to the newest slice (end of array) so UI reverse().slice still shows recent codes.
+    const codes = all.slice(offset, offset + limit).map(mapCode);
+    return json(res, 200, { codes, total, limit, offset });
   }
 
   if (req.method === 'POST' && url.pathname === '/api/admin/codes') {
@@ -3404,6 +3412,11 @@ const server = http.createServer(async (req, res) => {
     url.pathname = '/admin-app/index.html';
   }
 
+
+  if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/payment-qr.svg') {
+    res.writeHead(302, { Location: '/payment-qr/10.png' });
+    return res.end();
+  }
   let file = url.pathname === '/' ? path.join(publicDir, 'index.html') : path.join(publicDir, url.pathname);
   file = path.normalize(file);
   if (!file.startsWith(publicDir)) return fail(res, 403, 'Forbidden');
