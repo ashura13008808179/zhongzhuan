@@ -425,7 +425,7 @@ async function renderApiKeys(){
     const models=options.models||[];
     const first=keys[0];
     const sample=first?.key||'rk_your_key';
-    const recommendedModel=(window.appConfig?.recommendedModel)||'gpt-5.6';
+    const recommendedModel=(window.appConfig?.recommendedModel)||'gpt-5.6-sol';
     const modelSample=esc(recommendedModel);
     const configured=(window.appConfig?.publicBaseUrl||'').replace(/\/$/,'');
     const origin=(configured||location.origin).replace(/\/$/,'');
@@ -647,7 +647,8 @@ function providerFormHtml(provider, idx) {
   const healthLabel = health.ok === false ? '异常' : '正常';
   const healthClass = health.ok === false ? 'tag danger' : 'tag success';
   const models = provider.models || [];
-  const keyOn = Boolean(provider.apiKeyConfigured);
+  const perKey = Boolean(provider.usesPerKeyUpstream);
+  const keyOn = Boolean(provider.apiKeyConfigured) || perKey;
   const synced = provider.modelsSyncedAt ? new Date(provider.modelsSyncedAt).toLocaleString('zh-CN') : '';
   return `<article class="card provider-form channel-card" data-provider-idx="${idx}">
     <div class="card-head">
@@ -658,7 +659,7 @@ function providerFormHtml(provider, idx) {
       </div>
       <div class="provider-head-actions">
         <span class="tag ${provider.enabled !== false ? 'success' : 'danger'}">${provider.enabled !== false ? '启用' : '停用'}</span>
-        <span class="tag ${keyOn ? 'success' : 'danger'}">${keyOn ? '密钥已配置' : '密钥未配置'}</span>
+        <span class="tag ${keyOn ? 'success' : 'danger'}">${perKey ? `上游同步 ${esc(provider.upstreamSync || '')}`.trim() : (keyOn ? '密钥已配置' : '密钥未配置')}</span>
         <span class="${healthClass}">${healthLabel}</span>
         <button type="button" class="ghost-btn" data-sync-models="${esc(provider.id || '')}">同步上游模型</button>
         <button type="button" class="ghost-btn danger" data-remove-provider="${idx}">删除</button>
@@ -672,7 +673,7 @@ function providerFormHtml(provider, idx) {
       <label class="span-2">上游地址<input data-f="url" value="${esc(provider.url || '')}" placeholder="https://api.example.com/v1/chat/completions"></label>
       <label class="span-2">API 密钥
         <input data-f="apiKey" type="password" placeholder="${keyOn ? '•••• 已配置，留空则保留原密钥' : '新渠道必填'}" autocomplete="new-password">
-        <small class="hint">${keyOn ? '密钥已配置（不会回显明文）' : '填写后点击同步上游模型'}</small>
+        <small class="hint">${perKey ? '该渠道走用户密钥同步，渠道级 Key 可留空；对话和健康检查会注入已同步的 sk-' : (keyOn ? '密钥已配置（不会回显明文）' : '填写后点击同步上游模型')}</small>
       </label>
       <label>默认模型<input data-f="defaultModel" value="${esc(provider.defaultModel || '')}" placeholder="同步后自动填第一个"></label>
       <label>优先级（越小越高）<input data-f="priority" type="number" value="${esc(provider.priority ?? 100)}"></label>
@@ -730,6 +731,10 @@ function collectProvidersFromDom() {
       apiKey,
       modelPrices,
       apiKeyConfigured: Boolean(apiKey) || Boolean(previous?.apiKeyConfigured),
+      upstreamSync: previous?.upstreamSync || null,
+      usesPerKeyUpstream: Boolean(previous?.usesPerKeyUpstream),
+      maintenance: Boolean(previous?.maintenance),
+      maintenanceMessage: previous?.maintenanceMessage || null,
       modelsSyncedAt: previous?.modelsSyncedAt || null,
       modelsSource: previous?.modelsSource || null,
       health: previous?.health || { ok: true, lastCheckedAt: null, lastError: null }
@@ -1092,19 +1097,22 @@ async function renderOperations() {
       <section class="card"><div class="card-head"><div><p class="eyebrow">SITE URL</p><h2>站点网址 / API 基础地址</h2>
         <p class="sub">给用户和客户端看的 Base URL。你上线域名后填这里；留空则自动用当前访问域名。上游中转地址（如 vip1129）在「渠道」里单独配置，不会展示给普通用户。</p></div></div>
         <label>公网站点网址<input id="publicBaseUrlInput" placeholder="https://api.your-domain.com" value="${esc(data.publicBaseUrl||'')}"></label>
+        <label style="margin-top:12px">推荐模型<input id="recommendedModelInput" placeholder="gpt-5.6-sol" value="${esc(data.recommendedModel||'gpt-5.6-sol')}"></label>
         <p class="sub" style="margin-top:10px">当前解析：<code>${esc(data.resolvedBaseUrl||'(未设置)')}</code></p>
         <p class="sub">用户 API Base URL：<code>${esc(data.apiBaseUrl||'')}</code></p>
-        <button class="primary-btn" type="button" id="saveSiteUrlBtn" style="margin-top:12px">保存站点网址</button>
+        <p class="sub">推荐模型会写入 API 接入示例和 CC Switch 导入链接。请填上游真实存在的模型名（不要用已下线的 gpt-5.6）。</p>
+        <button class="primary-btn" type="button" id="saveSiteUrlBtn" style="margin-top:12px">保存站点设置</button>
         <div id="siteUrlMsg" class="inline-msg"></div>
       </section>`);
       $('#saveSiteUrlBtn')?.addEventListener('click', async () => {
         const msg = $('#siteUrlMsg');
         msg.textContent = '保存中…'; msg.className = 'inline-msg';
         try {
-          const j = await api('/api/admin/site-settings', { method: 'PUT', body: JSON.stringify({ publicBaseUrl: $('#publicBaseUrlInput').value.trim() }) });
+          const j = await api('/api/admin/site-settings', { method: 'PUT', body: JSON.stringify({ publicBaseUrl: $('#publicBaseUrlInput').value.trim(), recommendedModel: $('#recommendedModelInput').value.trim() }) });
           if (window.appConfig) {
             window.appConfig.publicBaseUrl = j.resolvedBaseUrl || j.publicBaseUrl || '';
             window.appConfig.apiBaseUrl = j.apiBaseUrl || '';
+            window.appConfig.recommendedModel = j.recommendedModel || 'gpt-5.6-sol';
           }
           msg.textContent = j.message || '已保存'; msg.className = 'inline-msg ok';
         } catch (err) {

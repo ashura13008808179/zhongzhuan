@@ -68,8 +68,17 @@ export function tipsForCode(code, extra = {}) {
       '或改用其它可用模型组'
     ],
     channel_no_key: [
-      'vip1129/Beibeihai 渠道依赖用户密钥同步，请先配置上游同步并让用户建钥',
+      'vip1129/Beibeihai 渠道的渠道级 API Key 可以为空，对话和健康检查会注入已同步的 sk-',
+      '请先在对应同步页登录并映射分组，然后新建一把该模型组的密钥',
       '若是其它直连渠道，请在「渠道」里填写渠道级 API Key'
+    ],
+    invite_invalid: [
+      '检查邀请码是否抄错（不区分大小写）',
+      '邀请码为空时可以不填；填写了就必须是有效码',
+      '向邀请人重新索取邀请码'
+    ],
+    invite_expired: [
+      '该邀请码已过期，请向邀请人索取新码，或留空后自行注册'
     ],
     channel_down: [
       '检查渠道 URL 是否可访问',
