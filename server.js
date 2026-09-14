@@ -1014,9 +1014,6 @@ const DEFAULT_MODEL_GROUPS = [
   { id: 'grp_aws_cc', name: 'AWS-CC', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: 'claude-fable-5', models: [], priority: 210, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_aws_cc') },
   { id: 'grp_grok_vip', name: 'Grok VIP', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: 'grok-4.5', models: [], priority: 220, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_grok_vip'), timeoutMs: 90000 },
   { id: 'grp_cn_models', name: '国产模型', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'glm-5.2', models: [], priority: 230, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_cn_models') },
-  { id: 'grp_nano_banana', name: 'nano banana 2', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'gemini-3.1-flash-image', models: [], priority: 250, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_nano_banana') },
-  { id: 'grp_nano_banana_pro', name: 'nano banana Pro', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'gemini-3-pro-image', models: [], priority: 260, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_nano_banana_pro') },
-  { id: 'grp_grok_image', name: 'Grok 生图', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'grok-imagine-image', models: [], priority: 270, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_grok_image') }
 ];
 
 function seedDefaultProviders(db) {
@@ -1111,7 +1108,10 @@ const RETIRED_MODEL_GROUP_IDS = [
   'grp_gpt_pro_mixplus',
   'grp_gpt_pro_welfare',
   'grp_gpt_bomb',
-  'grp_gpt_image'
+  'grp_gpt_image',
+  'grp_nano_banana',
+  'grp_nano_banana_pro',
+  'grp_grok_image'
 ];
 
 function pruneRetiredModelGroups(db) {
@@ -1397,6 +1397,19 @@ async function fetchUpstreamModels(provider, overrideApiKey = null) {
 }
 
 
+
+async function fetchUpstreamModelsRetry(db, provider, bearer) {
+  try {
+    return await fetchUpstreamModels(provider, bearer);
+  } catch (err) {
+    if (/401|INVALID_API_KEY/i.test(String(err && err.message || err))) {
+      const next = await ensureUpstreamProbeKey(db, provider, { forceNew: true });
+      if (next) return fetchUpstreamModels(provider, next);
+    }
+    throw err;
+  }
+}
+
 async function syncAllUpstreamModels(db, { onlyStaleMs = 0, ids = null } = {}) {
   db.settings ??= {};
   db.settings.providers ??= [];
@@ -1417,7 +1430,7 @@ async function syncAllUpstreamModels(db, { onlyStaleMs = 0, ids = null } = {}) {
   for (const provider of list) {
     try {
       const bearer = await ensureUpstreamProbeKey(db, provider);
-      const { endpoint, models } = await fetchUpstreamModels(provider, bearer);
+      const { endpoint, models } = await fetchUpstreamModelsRetry(db, provider, bearer);
       provider.models = models;
       if (!provider.defaultModel || !models.includes(provider.defaultModel)) {
         provider.defaultModel = models[0];
@@ -1566,7 +1579,7 @@ async function probeProviderHealth(db, provider) {
       updateProviderHealth(db, provider.id, false, error);
       return { id: provider.id, name: provider.name, ok: false, error, fix: tipsForCode(mapped ? 'channel_no_key' : 'no_group_map') };
     }
-    const { endpoint, models } = await fetchUpstreamModels(provider, bearer);
+    const { endpoint, models } = await fetchUpstreamModelsRetry(db, provider, bearer);
     updateProviderHealth(db, provider.id, true);
     provider.health.probe = 'models';
     provider.health.endpoint = endpoint;
@@ -1753,13 +1766,12 @@ async function ensureProxyApiKey(db, user, provider, apiKeyRec = null) {
   return String(provider?.apiKey || '').trim();
 }
 
-async function ensureUpstreamProbeKey(db, provider) {
-  const fromUsers = resolveProxyApiKey(provider, null, db, null);
-  if (fromUsers) return fromUsers;
+async function ensureUpstreamProbeKey(db, provider, { forceNew = false } = {}) {
   db.settings ??= {};
   db.settings.upstreamProbeKeys ??= {};
+  if (forceNew) delete db.settings.upstreamProbeKeys[provider.id];
   const cached = db.settings.upstreamProbeKeys[provider.id];
-  if (cached?.key) return cached.key;
+  if (!forceNew && cached?.key) return cached.key;
 
   const persist = (secret) => {
     if (!secret?.key) return '';
@@ -1777,14 +1789,16 @@ async function ensureUpstreamProbeKey(db, provider) {
     if (groupId == null) return '';
     const auth = await ensureVip1129Token(db);
     if (!auth.ok) return '';
-    const listed = await vip1129ListKeys(auth.cfg.baseUrl, auth.token, 'page=1&page_size=100');
-    if (listed.ok) {
-      const exact = findListedSecret(listed.data, { name: probeName, groupId });
-      if (exact.key) return persist(exact);
-      const named = findListedSecret(listed.data, { nameIncludes: 'relay-probe', groupId });
-      if (named.key) return persist(named);
-      const any = findListedSecret(listed.data, { groupId });
-      if (any.key) return persist(any);
+    if (!forceNew) {
+      const listed = await vip1129ListKeys(auth.cfg.baseUrl, auth.token, 'page=1&page_size=100');
+      if (listed.ok) {
+        const exact = findListedSecret(listed.data, { name: probeName, groupId });
+        if (exact.key) return persist(exact);
+        const named = findListedSecret(listed.data, { nameIncludes: 'relay-probe', groupId });
+        if (named.key) return persist(named);
+        const any = findListedSecret(listed.data, { groupId });
+        if (any.key) return persist(any);
+      }
     }
     const created = await vip1129CreateKey(auth.cfg.baseUrl, auth.token, {
       name: probeName,
@@ -1798,14 +1812,16 @@ async function ensureUpstreamProbeKey(db, provider) {
     if (groupId == null) return '';
     const auth = await ensureBeibeihaiToken(db);
     if (!auth.ok) return '';
-    const listed = await beibeihaiListKeys(auth.cfg.baseUrl, auth.token, 'page=1&page_size=100');
-    if (listed.ok) {
-      const exact = findListedSecret(listed.data, { name: probeName, groupId });
-      if (exact.key) return persist(exact);
-      const named = findListedSecret(listed.data, { nameIncludes: 'relay-probe', groupId });
-      if (named.key) return persist(named);
-      const any = findListedSecret(listed.data, { groupId });
-      if (any.key) return persist(any);
+    if (!forceNew) {
+      const listed = await beibeihaiListKeys(auth.cfg.baseUrl, auth.token, 'page=1&page_size=100');
+      if (listed.ok) {
+        const exact = findListedSecret(listed.data, { name: probeName, groupId });
+        if (exact.key) return persist(exact);
+        const named = findListedSecret(listed.data, { nameIncludes: 'relay-probe', groupId });
+        if (named.key) return persist(named);
+        const any = findListedSecret(listed.data, { groupId });
+        if (any.key) return persist(any);
+      }
     }
     const created = await beibeihaiCreateKey(auth.cfg.baseUrl, auth.token, {
       name: probeName,
