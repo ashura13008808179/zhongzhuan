@@ -11,6 +11,7 @@ import {
   listKeys as vip1129ListKeys,
   listAvailableGroups as vip1129ListGroups,
   extractCreatedSecret as vip1129ExtractSecret,
+  fetchAccount as vip1129FetchAccount,
   isVip1129Provider,
   defaultGroupMap as vip1129DefaultGroupMap,
   normalizeBase as vip1129NormalizeBase,
@@ -23,6 +24,7 @@ import {
   listKeys as beibeihaiListKeys,
   listAvailableGroups as beibeihaiListGroups,
   extractCreatedSecret as beibeihaiExtractSecret,
+  fetchAccount as beibeihaiFetchAccount,
   isBeibeihaiProvider,
   defaultGroupMap as beibeihaiDefaultGroupMap,
   normalizeBase as beibeihaiNormalizeBase,
@@ -31,6 +33,7 @@ import {
 import { ensureSiteErrors, recordSiteError, clearSiteErrors, tipsForCode, failPayload, SITE_ERROR_CAP } from './diagnostics/site-errors.js';
 import { runDiagnosticSuite } from './diagnostics/run-suite.js';
 import { claimCheckIn, checkInStatus, checkInAdminStats, CHECKIN_LOG_STATUS } from './lib/checkin.js';
+import { buildMobileInbox, parseUpstreamAccount } from './lib/admin-mobile.js';
 import {
   compactGroupMap,
   normalizeAvailableGroups,
@@ -204,6 +207,41 @@ function paymentQrStatus(expiresAt) {
     return { expiresAt, expired: false, daysLeft, tip: `该付款码将在约 ${daysLeft} 天后到期，若扫码失败请联系客服` };
   }
   return { expiresAt, expired: false, daysLeft, tip: `管理员登记有效期至 ${end.toISOString().slice(0, 10)}` };
+}
+
+const PAYMENT_QR_UPLOAD_DIR = path.join(publicDir, 'payment-qr', 'uploads');
+const PAYMENT_QR_MAX_BYTES = 4 * 1024 * 1024;
+
+function sniffImageExt(buf) {
+  if (!buf || buf.length < 12) return null;
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
+  if (buf.slice(0, 4).toString('ascii') === 'RIFF' && buf.slice(8, 12).toString('ascii') === 'WEBP') return 'webp';
+  const gif = buf.slice(0, 6).toString('ascii');
+  if (gif === 'GIF87a' || gif === 'GIF89a') return 'gif';
+  return null;
+}
+
+function decodePaymentQrImage(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return { ok: false, error: '请选择收款码图片' };
+  const m = s.match(/^data:image\/([a-zA-Z0-9+.-]+);base64,([A-Za-z0-9+/=\s]+)$/);
+  const b64 = m ? m[2].replace(/\s/g, '') : (s.startsWith('data:') ? '' : s.replace(/\s/g, ''));
+  if (!b64) return { ok: false, error: '请上传 png/jpg/webp 图片' };
+  let buf;
+  try { buf = Buffer.from(b64, 'base64'); } catch { return { ok: false, error: '图片数据无效' }; }
+  if (!buf.length) return { ok: false, error: '图片数据无效' };
+  if (buf.length > PAYMENT_QR_MAX_BYTES) return { ok: false, error: '图片太大，请压缩到 4MB 以内' };
+  const ext = sniffImageExt(buf);
+  if (!ext) return { ok: false, error: '无法识别图片格式，请换一张收款码截图' };
+  return { ok: true, buf, ext };
+}
+
+function savePaymentQrFile(method, amountKey, buf, ext) {
+  fs.mkdirSync(PAYMENT_QR_UPLOAD_DIR, { recursive: true });
+  const name = `${method}-${amountKey}-${Date.now()}.${ext}`;
+  fs.writeFileSync(path.join(PAYMENT_QR_UPLOAD_DIR, name), buf);
+  return `/payment-qr/uploads/${name}`;
 }
 
 function paymentPlans(db) {
@@ -653,6 +691,28 @@ function providerNeedsVip1129Sync(db, groupId) {
   if (!isVip1129Provider(provider)) return false;
   const upstreamGroupId = resolveVip1129GroupId(db, groupId);
   return upstreamGroupId != null;
+}
+
+async function snapshotUpstreamAccount(kind, db) {
+  const isVip = kind === 'vip1129';
+  const auth = isVip ? await ensureVip1129Token(db) : await ensureBeibeihaiToken(db);
+  const view = isVip ? publicVip1129View(getVip1129Config(db)) : publicBeibeihaiView(getBeibeihaiConfig(db));
+  const name = isVip ? 'vip1129' : 'beibeihai';
+  if (!auth.ok) return { name, ok: false, error: auth.error || 'login_failed', account: null, upstream: view };
+  const parsed = isVip
+    ? await vip1129FetchAccount(auth.cfg.baseUrl, auth.token)
+    : await beibeihaiFetchAccount(auth.cfg.baseUrl, auth.token);
+  const account = parseUpstreamAccount(parsed);
+  if (!parsed.ok || !account) {
+    return {
+      name,
+      ok: false,
+      error: parsed?.error || `HTTP ${parsed?.status || 0}`,
+      account: null,
+      upstream: view
+    };
+  }
+  return { name, ok: true, error: null, account, upstream: view };
 }
 
 async function syncCreateVip1129Key(db, user, localKey) {
@@ -2551,6 +2611,32 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { last: db.settings?.lastDiagnostics || null });
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/admin/mobile/inbox') {
+    if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
+    const inbox = buildMobileInbox(db);
+    const meta = paymentQrMeta(db);
+    return json(res, 200, {
+      ...inbox,
+      finance: poolStats(db),
+      me: safeUser(user),
+      paymentQr: {
+        wechat: paymentQrStatus(meta.wechatExpiresAt),
+        alipay: paymentQrStatus(meta.alipayExpiresAt),
+        note: meta.note || ''
+      }
+    });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/admin/upstream-accounts') {
+    if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
+    const [vip1129, beibeihai] = await Promise.all([
+      snapshotUpstreamAccount('vip1129', db),
+      snapshotUpstreamAccount('beibeihai', db)
+    ]);
+    writeDb(db);
+    return json(res, 200, { vip1129, beibeihai });
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/admin/upstream-beibeihai') {
     if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
     const cfg = getBeibeihaiConfig(db);
@@ -2840,6 +2926,52 @@ const server = http.createServer(async (req, res) => {
   }
 
   // --- Admin APIs ---
+
+  if (req.method === 'POST' && url.pathname === '/api/admin/payment-qrs/upload') {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const p = await body(req);
+    const method = String(p?.method || '').toLowerCase();
+    if (!['wechat', 'alipay'].includes(method)) return fail(res, 400, '付款方式无效');
+    const decoded = decodePaymentQrImage(p?.image);
+    if (!decoded.ok) return fail(res, 400, decoded.error);
+    const applyAll = p?.applyAll === true || String(p?.amount || '') === 'all';
+    const amount = Number(p?.amount);
+    if (!applyAll && !PAYMENT_AMOUNTS.includes(amount)) return fail(res, 400, '金额无效');
+    const keys = applyAll ? PAYMENT_AMOUNTS.map(String) : [String(amount)];
+    const publicPath = savePaymentQrFile(method, applyAll ? 'all' : String(amount), decoded.buf, decoded.ext);
+    const next = ensurePaymentQrs(db);
+    for (const key of keys) next[method][key] = publicPath;
+    db.settings.paymentQrs = next;
+    if (p?.expiresAt !== undefined) {
+      const cur = paymentQrMeta(db);
+      const field = method === 'wechat' ? 'wechatExpiresAt' : 'alipayExpiresAt';
+      db.settings.paymentQrMeta = {
+        ...cur,
+        [field]: p.expiresAt === '' || p.expiresAt == null ? null : String(p.expiresAt)
+      };
+    }
+    audit(db, {
+      actorId: user.id,
+      action: 'paymentQrs.upload',
+      target: `${method}:${applyAll ? 'all' : amount}`,
+      detail: { path: publicPath, applyAll }
+    });
+    writeDb(db);
+    const meta = paymentQrMeta(db);
+    return json(res, 200, {
+      url: publicPath,
+      method,
+      amounts: keys.map(Number),
+      paymentQrs: next,
+      plans: paymentPlans(db),
+      paymentQrMeta: {
+        ...meta,
+        wechat: paymentQrStatus(meta.wechatExpiresAt),
+        alipay: paymentQrStatus(meta.alipayExpiresAt)
+      },
+      message: applyAll ? '已替换该支付方式全部金额的收款码' : `已替换 ${method === 'wechat' ? '微信' : '支付宝'} ¥${amount} 收款码`
+    });
+  }
 
   if (req.method === 'GET' && url.pathname === '/api/admin/payment-qrs') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
@@ -3142,6 +3274,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method !== 'GET' && req.method !== 'HEAD') return fail(res, 405, 'Method not allowed');
+
+  if (url.pathname === '/admin-app' || url.pathname === '/admin-app/') {
+    url.pathname = '/admin-app/index.html';
+  }
 
   let file = url.pathname === '/' ? path.join(publicDir, 'index.html') : path.join(publicDir, url.pathname);
   file = path.normalize(file);

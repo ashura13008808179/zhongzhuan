@@ -189,6 +189,49 @@ try {
   assert.equal(validInvite.status, 201, JSON.stringify(validInvite.body));
   assert.equal(validInvite.body.user.balance, 0);
 
+  const inboxGuest = await req('/api/admin/mobile/inbox');
+  assert.equal(inboxGuest.status, 403);
+  const inbox = await req('/api/admin/mobile/inbox', { headers: auth });
+  assert.equal(inbox.status, 200, JSON.stringify(inbox.body));
+  assert.ok(Array.isArray(inbox.body.pending));
+  assert.equal(typeof inbox.body.pendingCount, 'number');
+  assert.equal(typeof inbox.body.paymentQr?.wechat?.expired, 'boolean');
+
+  const png1x1 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  const userUpload = await req('/api/admin/payment-qrs/upload', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${emptyInvite.body.token}` },
+    body: JSON.stringify({ method: 'wechat', applyAll: true, image: png1x1 })
+  });
+  assert.equal(userUpload.status, 403);
+  const uploaded = await req('/api/admin/payment-qrs/upload', {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({
+      method: 'wechat',
+      applyAll: true,
+      image: png1x1,
+      expiresAt: '2099-12-31'
+    })
+  });
+  assert.equal(uploaded.status, 200, JSON.stringify(uploaded.body));
+  assert.match(String(uploaded.body.url || ''), /^\/payment-qr\/uploads\/wechat-all-\d+\.png$/);
+  assert.equal(uploaded.body.paymentQrs.wechat['10'], uploaded.body.url);
+  assert.equal(uploaded.body.paymentQrs.wechat['100'], uploaded.body.url);
+  assert.equal(uploaded.body.paymentQrMeta.wechat.expired, false);
+  const imgRes = await fetch(`${base}${uploaded.body.url}`);
+  assert.equal(imgRes.status, 200);
+  assert.match(String(imgRes.headers.get('content-type') || ''), /image\/png/);
+  const rel = String(uploaded.body.url).replace(/^\//, '');
+  const saved = path.join(root, 'public', ...rel.split('/'));
+  try { fs.unlinkSync(saved); } catch { /* ignore leftover */ }
+
+  const appPage = await fetch(`${base}/admin-app/`);
+  assert.equal(appPage.status, 200);
+  const appHtml = await appPage.text();
+  assert.match(appHtml, /值班控制台/);
+  assert.match(appHtml, /收款码/);
+
   console.log('http-onboarding.test.mjs: all assertions passed');
 } finally {
   child.kill('SIGTERM');

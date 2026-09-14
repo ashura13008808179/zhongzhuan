@@ -1035,7 +1035,7 @@ async function renderOperations() {
       const last = (await api('/api/admin/diagnostics/last').catch(()=>({}))).last;
       shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}
       <section class="card"><div class="card-head"><div><p class="eyebrow">DIAGNOSTICS</p><h2>诊断测试</h2>
-        <p class="sub">一键测数据库、上游登录、分组映射、每个渠道能否对话（延迟 / 报错）、扣费与展示倍率、卡密库存与兑换拦截、收款码与支付。不会真的兑换卡密，也不会改用户余额。全部渠道对话大约需要几分钟。</p></div>
+        <p class="sub">一键测数据库、上游登录、分组映射、每个渠道能否对话（延迟 / 报错）、扣费与展示倍率、卡密库存与兑换拦截、收款码与支付。不会真的兑换卡密，也不会改用户余额。手机值班请打开 <a href="/admin-app/" target="_blank">/admin-app/</a> 或安装 APK。</p></div>
         <button class="primary-btn" type="button" id="runDiagBtn">运行全部测试</button></div>
         <div id="diagOut">${diagReportHtml(last)}</div>
       </section>`);

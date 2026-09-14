@@ -8,4 +8,12 @@ node_modules/
 payment-qr.svg
 
 start-local.ps1
+android-admin/.gradle/
+android-admin/build/
+android-admin/app/build/
+android-admin/local.properties
+public/payment-qr/uploads/*
+!public/payment-qr/uploads/.gitkeep
+dist/
+*.apk
 

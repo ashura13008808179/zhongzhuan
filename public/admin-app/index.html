@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0d1016">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>中转站值班</title>
+  <link rel="stylesheet" href="/admin-app/styles.css">
+</head>
+<body>
+  <div id="loginView" class="screen">
+    <p class="eyebrow">ADMIN APP</p>
+    <h1>值班控制台</h1>
+    <p class="lead">充值确认、收款码换图、渠道探测、上游余额。仅管理员登录。</p>
+    <label>用户名 / 邮箱<input id="loginId" autocomplete="username"></label>
+    <label>密码<input id="loginPw" type="password" autocomplete="current-password"></label>
+    <button class="primary" id="loginBtn" type="button">登录</button>
+    <p id="loginMsg" class="msg"></p>
+  </div>
+
+  <div id="appView" class="screen" hidden>
+    <header class="top">
+      <div>
+        <p class="eyebrow">值班中</p>
+        <h1 id="hello">管理员</h1>
+      </div>
+      <button class="ghost" id="logoutBtn" type="button">退出</button>
+    </header>
+    <nav class="tabs">
+      <button type="button" data-tab="home" class="active">首页</button>
+      <button type="button" data-tab="orders">充值</button>
+      <button type="button" data-tab="qr">收款码</button>
+      <button type="button" data-tab="diag">渠道</button>
+      <button type="button" data-tab="up">上游</button>
+      <button type="button" data-tab="set">设置</button>
+    </nav>
+    <main id="pane"></main>
+  </div>
+  <script src="/admin-app/app.js"></script>
+</body>
+</html>

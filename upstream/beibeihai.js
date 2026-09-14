@@ -90,6 +90,12 @@ export async function deleteKey(baseUrl, token, id) {
   return readJson(res);
 }
 
+export async function fetchAccount(baseUrl, token) {
+  const base = normalizeBase(baseUrl);
+  const res = await fetch(`${base}/api/v1/auth/me`, { headers: authHeaders(token) });
+  return readJson(res);
+}
+
 export function extractCreatedSecret(data) {
   if (!data || typeof data !== 'object') return { id: null, key: null, raw: null };
   const root = data.data && typeof data.data === 'object' ? data.data : data;

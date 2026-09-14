@@ -7,6 +7,6 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node --test tests/checkin.test.js && node tests/checkin-api.mjs && node test/relay-fixes.test.mjs && node test/http-onboarding.test.mjs && node test/diagnostics-suite.test.mjs"
+    "test": "node --test tests/checkin.test.js && node tests/checkin-api.mjs && node test/relay-fixes.test.mjs && node test/http-onboarding.test.mjs && node test/diagnostics-suite.test.mjs && node test/admin-mobile.test.mjs"
   }
 }
