@@ -8,6 +8,7 @@ import {
   login as vip1129Login,
   createKey as vip1129CreateKey,
   deleteKey as vip1129DeleteKey,
+  listKeys as vip1129ListKeys,
   listAvailableGroups as vip1129ListGroups,
   extractCreatedSecret as vip1129ExtractSecret,
   isVip1129Provider,
@@ -19,6 +20,7 @@ import {
   login as beibeihaiLogin,
   createKey as beibeihaiCreateKey,
   deleteKey as beibeihaiDeleteKey,
+  listKeys as beibeihaiListKeys,
   listAvailableGroups as beibeihaiListGroups,
   extractCreatedSecret as beibeihaiExtractSecret,
   isBeibeihaiProvider,
@@ -35,6 +37,7 @@ import {
   suggestGroupMap,
   wireAllProviders,
   resolveProxyApiKey as resolveProxyApiKeyPure,
+  findListedSecret,
   validateInviteCode,
   insufficientBalanceMessage,
   BEIBEIHAI_GROUP_HINTS,
@@ -43,7 +46,10 @@ import {
   VIP1129_CHAT_URL,
   DEFAULT_RECOMMENDED_MODEL,
   resolveRecommendedModel,
-  normalizeRecommendedModel
+  normalizeRecommendedModel,
+  AVATAR_IDS,
+  DEFAULT_AVATAR,
+  normalizeAvatar
 } from './lib/relay-core.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1011,6 +1017,7 @@ function safeUser(user) {
     unlimited: !!(user.unlimited || isAdmin(user)),
     role: user.role || 'user',
     invited: user.invited || 0,
+    avatar: normalizeAvatar(user.avatar).avatar,
     createdAt: user.createdAt
   };
 }
@@ -1349,7 +1356,7 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
     // Admin / unlimited: do not deduct local balance; upstream billing is the real limit
     user.accountActive = true;
   } else {
-    user.usedTokens = Math.min(user.quotaTokens || 0, (user.usedTokens || 0) + billedTokens);
+    user.usedTokens = (user.usedTokens || 0) + billedTokens;
     user.balance = Math.max(0, (user.balance || 0) - chargedAmount);
   }
   if (apiKeyRec && !isUnlimited(user)) {
@@ -1426,27 +1433,20 @@ async function ensureProxyApiKey(db, user, provider, apiKeyRec = null) {
   if (!isVip1129Provider(provider) && !isBeibeihaiProvider(provider)) {
     return String(provider?.apiKey || '').trim();
   }
-  if (!user) return '';
 
-  let rec = apiKeyRec && (!apiKeyRec.groupId || apiKeyRec.groupId === provider.id) ? apiKeyRec : null;
-  if (!rec) {
-    rec = (user.apiKeys || []).find(k => k.enabled !== false && k.groupId === provider.id) || null;
-  }
-  if (rec && !rec.upstream) {
+  const rec = apiKeyRec && (!apiKeyRec.groupId || String(apiKeyRec.groupId) === String(provider.id))
+    ? apiKeyRec
+    : (user?.apiKeys || []).find(k => k.enabled !== false && String(k.groupId || '') === String(provider.id)) || null;
+  // Only sync when the local key is bound to this model group. Empty-group
+  // rk_ keys stay as platform keys; chat injects the station probe sk- below.
+  if (user && rec && !rec.upstream && rec.groupId) {
     const synced = await createUpstreamKeyForProvider(db, user, provider, rec);
     if (synced.ok && rec.key) return rec.key;
   }
-  if (!rec && (isUnlimited(user) || (user.apiKeys || []).some(k => k.groupId === provider.id))) {
-    const created = normalizeApiKey({ name: `auto-${provider.id}`, groupId: provider.id }, null, db);
-    const synced = await createUpstreamKeyForProvider(db, user, provider, created);
-    if (synced.ok && created.key) {
-      user.apiKeys ??= [];
-      user.apiKeys.push(created);
-      if (!user.apiKey) user.apiKey = created.key;
-      return created.key;
-    }
-  }
-  return '';
+
+  const probe = await ensureUpstreamProbeKey(db, provider);
+  if (probe) return probe;
+  return String(provider?.apiKey || '').trim();
 }
 
 async function ensureUpstreamProbeKey(db, provider) {
@@ -1467,13 +1467,23 @@ async function ensureUpstreamProbeKey(db, provider) {
     return secret.key;
   };
 
+  const probeName = `relay-probe-${provider.id}`.slice(0, 60);
   if (isVip1129Provider(provider)) {
     const groupId = resolveVip1129GroupId(db, provider.id);
     if (groupId == null) return '';
     const auth = await ensureVip1129Token(db);
     if (!auth.ok) return '';
+    const listed = await vip1129ListKeys(auth.cfg.baseUrl, auth.token, 'page=1&page_size=100');
+    if (listed.ok) {
+      const exact = findListedSecret(listed.data, { name: probeName, groupId });
+      if (exact.key) return persist(exact);
+      const named = findListedSecret(listed.data, { nameIncludes: 'relay-probe', groupId });
+      if (named.key) return persist(named);
+      const any = findListedSecret(listed.data, { groupId });
+      if (any.key) return persist(any);
+    }
     const created = await vip1129CreateKey(auth.cfg.baseUrl, auth.token, {
-      name: `relay-probe-${provider.id}`.slice(0, 60),
+      name: probeName,
       group_id: groupId
     });
     if (created.ok) return persist(vip1129ExtractSecret(created.data));
@@ -1484,8 +1494,17 @@ async function ensureUpstreamProbeKey(db, provider) {
     if (groupId == null) return '';
     const auth = await ensureBeibeihaiToken(db);
     if (!auth.ok) return '';
+    const listed = await beibeihaiListKeys(auth.cfg.baseUrl, auth.token, 'page=1&page_size=100');
+    if (listed.ok) {
+      const exact = findListedSecret(listed.data, { name: probeName, groupId });
+      if (exact.key) return persist(exact);
+      const named = findListedSecret(listed.data, { nameIncludes: 'relay-probe', groupId });
+      if (named.key) return persist(named);
+      const any = findListedSecret(listed.data, { groupId });
+      if (any.key) return persist(any);
+    }
     const created = await beibeihaiCreateKey(auth.cfg.baseUrl, auth.token, {
-      name: `relay-probe-${provider.id}`.slice(0, 60),
+      name: probeName,
       group_id: groupId
     });
     if (created.ok) return persist(beibeihaiExtractSecret(created.data));
@@ -1547,13 +1566,7 @@ async function chat(req, res, db, user, apiKeyRec = null) {
     user.accountActive = true;
     writeDb(db);
   } else {
-    let tokenBudget = Math.floor(availableTokens(user) / rate);
-    if (apiKeyRec && apiKeyRec.tokenLimit > 0) {
-      const keyLeft = Math.max(0, apiKeyRec.tokenLimit - (apiKeyRec.tokenUsed || 0) - (apiKeyRec.reservedTokens || 0));
-      tokenBudget = Math.min(tokenBudget, Math.floor(keyLeft / rate));
-    }
-    if (tokenBudget <= inputReserve) return fail(res, 402, apiKeyRec?.tokenLimit > 0 ? '该密钥 Token 额度不足' : 'API 配额不足，无法发起请求');
-
+    // Spending quota is account balance. Token 配额不再单独拦请求。
     let availableBalance = Math.max(0, (user.balance || 0) - (user.reservedBalance || 0));
     if (apiKeyRec && apiKeyRec.spendLimit > 0) {
       availableBalance = Math.min(availableBalance, Math.max(0, apiKeyRec.spendLimit - (apiKeyRec.spendUsed || 0) - (apiKeyRec.reservedSpend || 0)));
@@ -1562,25 +1575,20 @@ async function chat(req, res, db, user, apiKeyRec = null) {
     const inputEstimate = estimatedCost(primary, inputReserve, 0, model) * rate;
     const outputUnitPrice = Math.max(modelPrice(primary, model, 'outputPricePer1K') / 1000 * rate, Number.EPSILON);
     const moneyBudget = Math.floor(Math.max(0, availableBalance - safety - inputEstimate) / outputUnitPrice);
-    outputBudget = Math.min(requestedOutput, tokenBudget - inputReserve, moneyBudget);
+    outputBudget = Math.min(requestedOutput, moneyBudget);
+    if (apiKeyRec && apiKeyRec.tokenLimit > 0) {
+      const keyLeft = Math.max(0, apiKeyRec.tokenLimit - (apiKeyRec.tokenUsed || 0) - (apiKeyRec.reservedTokens || 0));
+      outputBudget = Math.min(outputBudget, Math.max(0, Math.floor(keyLeft / rate) - inputReserve));
+    }
     if (outputBudget < 1) {
-      if (!apiKeyRec?.spendLimit) {
-        user.balance = 0;
-        user.accountActive = false;
-        writeDb(db);
-      }
-      return fail(res, 402, apiKeyRec?.spendLimit > 0 ? '该密钥消费额度不足' : insufficientBalanceMessage());
+      const keyTokenBlocked = apiKeyRec?.tokenLimit > 0 && moneyBudget >= 1;
+      return fail(res, 402, keyTokenBlocked ? '该密钥 Token 额度不足' : (apiKeyRec?.spendLimit > 0 ? '该密钥消费额度不足' : insufficientBalanceMessage()));
     }
 
     const upstreamReservation = inputReserve + outputBudget;
     tokenReservation = upstreamReservation * rate;
     amountReservation = estimatedCost(primary, inputReserve, outputBudget, model) * rate;
     if (availableBalance < amountReservation + safety) {
-      if (!apiKeyRec?.spendLimit) {
-        user.balance = 0;
-        user.accountActive = false;
-        writeDb(db);
-      }
       return fail(res, 402, apiKeyRec?.spendLimit > 0 ? '该密钥消费额度不足' : insufficientBalanceMessage());
     }
 
@@ -1854,6 +1862,7 @@ const server = http.createServer(async (req, res) => {
       reservedBalance: 0,
       accountActive: false,
       role: 'user',
+      avatar: DEFAULT_AVATAR,
       invited: 0,
       inviteCode: crypto.randomBytes(4).toString('hex').toUpperCase(),
       createdAt: new Date().toISOString()
@@ -1895,6 +1904,18 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/me') {
     return user ? json(res, 200, { user: safeUser(user) }) : fail(res, 401, '未登录');
+  }
+
+  if ((req.method === 'PATCH' || req.method === 'PUT') && url.pathname === '/api/me') {
+    if (!user) return fail(res, 401, '未登录');
+    const p = await body(req);
+    if (!p || typeof p !== 'object') return fail(res, 400, '无效请求体');
+    if (!('avatar' in p)) return fail(res, 400, '没有可更新的字段');
+    const parsed = normalizeAvatar(p.avatar);
+    if (!parsed.ok || !AVATAR_IDS.includes(String(p.avatar || ''))) return fail(res, 400, parsed.error || '无效的头像');
+    user.avatar = parsed.avatar;
+    writeDb(db);
+    return json(res, 200, { user: safeUser(user) });
   }
 
   if (req.method === 'GET' && url.pathname === '/api/models') {
@@ -2623,7 +2644,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
     writeDb(db);
-    return json(res, 200, { user: safeUser(user), message: `充值成功，到账 ¥${code.amount}，新增 ${quotaTokens.toLocaleString()} Token 配额` });
+    return json(res, 200, { user: safeUser(user), message: `充值成功，到账 ¥${code.amount}` });
   }
 
   // --- Admin APIs ---
@@ -3010,6 +3031,7 @@ for (const user of initial.users) {
   user.reservedBalance ??= 0;
   user.accountActive ??= (user.balance || 0) > 0;
   user.checkInBonus ??= 0;
+  user.avatar = normalizeAvatar(user.avatar).avatar;
   user.role ??= (ADMIN_EMAIL && user.email === ADMIN_EMAIL) ? 'admin' : 'user';
   ensureUsername(user, initial);
   ensureUserKeys(user);

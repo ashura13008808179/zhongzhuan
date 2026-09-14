@@ -40,7 +40,7 @@
           <input id="loginPassword" type="password" autocomplete="current-password" placeholder="输入密码" required>
         </label>
         <div class="form-row">
-          <label class="check"><input type="checkbox"> 记住我</label>
+          <label class="check" for="rememberMe"><input id="rememberMe" type="checkbox"> 记住我</label>
         </div>
         <button class="primary-btn" type="submit">登录控制台 <span>↗</span></button>
       </form>
@@ -72,11 +72,6 @@
         <div class="brand-mark"><i></i><i></i><i></i></div>
         <b>relay<span>station</span></b>
       </div>
-      <div class="workspace">
-        <span class="pulse"></span>
-        <div><small>当前工作区</small><b>个人空间</b></div>
-        <span>⌄</span>
-      </div>
       <nav>
         <p>概览</p>
         <a class="active" data-page="overview">⌁ 数据概览</a>
@@ -89,14 +84,14 @@
         <a data-page="contact">◎ 联系支持</a>
       </nav>
       <div class="side-bottom">
-        <div class="side-tip">
+        <button class="side-tip" id="helpTip" type="button">
           <span>✦</span>
           <div><b>需要帮助？</b><small>联系专属支持</small></div>
-        </div>
+        </button>
         <div class="profile">
-          <div class="avatar" id="sideAvatar">L</div>
+          <button class="avatar is-letter" id="sideAvatar" type="button" aria-label="更换头像" aria-haspopup="dialog" aria-expanded="false">?</button>
           <div><b id="sideName">Lin Wei</b><small id="sideEmail">user@example.com</small></div>
-          <button id="logoutBtn">↪</button>
+          <button id="logoutBtn" type="button" aria-label="退出登录">↪</button>
         </div>
       </div>
     </aside>
@@ -114,12 +109,15 @@
         </div>
         <div class="top-right">
           <div class="status"><span class="pulse"></span> 服务运行正常</div>
-          <button class="icon-btn">♢<i></i></button>
-          <button class="avatar top-avatar" id="topAvatar">L</button>
+          <button class="avatar top-avatar is-letter" id="topAvatar" type="button" aria-label="更换头像" aria-haspopup="dialog" aria-expanded="false">?</button>
         </div>
       </header>
       <section class="page" id="page"></section>
     </main>
+  </div>
+  <div id="avatarMenu" class="avatar-menu" hidden role="dialog" aria-label="选择头像">
+    <p class="eyebrow">选择头像</p>
+    <div class="avatar-grid" id="avatarGrid"></div>
   </div>
   <script src="/app.js"></script>
 </body>

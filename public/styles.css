@@ -285,3 +285,80 @@ body.nav-lock{overflow:hidden}
   .page-head h1{font-size:24px}
   .metric-grid{grid-template-columns:1fr}
 }
+
+.check{cursor:pointer;user-select:none}
+.check input{
+  display:inline-block !important;
+  width:16px !important;
+  height:16px !important;
+  min-height:0 !important;
+  margin:0 !important;
+  padding:0 !important;
+  accent-color:var(--lime);
+  cursor:pointer;
+  appearance:auto;
+  -webkit-appearance:checkbox;
+  background:transparent;
+  border:0;
+  flex:0 0 16px;
+}
+.sidebar .brand{margin-bottom:8px}
+.sidebar nav{margin-top:18px}
+.side-tip{
+  display:flex;
+  width:100%;
+  gap:9px;
+  padding:13px 11px;
+  border:0;
+  border-top:1px solid var(--line);
+  border-bottom:1px solid var(--line);
+  margin:0 0 16px;
+  background:transparent;
+  color:inherit;
+  text-align:left;
+  cursor:pointer;
+  font:inherit;
+}
+.side-tip:hover{background:#171c24}
+.profile .avatar{cursor:pointer;border:0;padding:0;flex:0 0 auto;margin-left:0}
+.profile #logoutBtn{margin-left:auto;background:none;border:0;color:#778195;font-size:17px;cursor:pointer}
+.avatar{
+  width:29px;height:29px;border-radius:50%;
+  display:grid;place-items:center;
+  font-weight:600;font-size:12px;color:#10150e;
+  overflow:hidden;position:relative;
+}
+.top-avatar{width:32px;height:32px;border:0!important;cursor:pointer}
+.avatar.is-letter{background:#d0c4a6;color:#332e28}
+.avatar.is-lime{background:radial-gradient(circle at 30% 20%,#e7ff9c,#4a6a28)}
+.avatar.is-cyan{background:radial-gradient(circle at 70% 30%,#b8fff4,#1e5c64)}
+.avatar.is-sunset{background:linear-gradient(135deg,#ffb37a,#d45d7a 55%,#6b3a7a)}
+.avatar.is-mint{background:linear-gradient(160deg,#d4ffe8,#2f8f78)}
+.avatar.is-violet{background:radial-gradient(circle at 40% 30%,#e3c4ff,#5a3d9a)}
+.avatar.is-ember{background:radial-gradient(circle at 50% 80%,#ffd18a,#c23b2e 58%,#4a1c18)}
+.avatar.is-slate{background:linear-gradient(180deg,#9aa6b8,#3d4656)}
+.avatar-mark{display:block;width:12px;height:12px;border-radius:3px;background:rgba(16,21,14,.28);box-shadow:4px -3px 0 rgba(255,255,255,.28)}
+.avatar.is-cyan .avatar-mark{border-radius:50%;background:rgba(255,255,255,.45);box-shadow:none;width:10px;height:10px}
+.avatar.is-sunset .avatar-mark{width:14px;height:4px;border-radius:4px;background:rgba(255,255,255,.55);box-shadow:0 5px 0 rgba(16,21,14,.2)}
+.avatar.is-mint .avatar-mark{width:8px;height:12px;border-radius:8px 8px 3px 3px;background:rgba(255,255,255,.5);box-shadow:none}
+.avatar.is-violet .avatar-mark{width:0;height:0;border-radius:0;background:transparent;border-left:6px solid transparent;border-right:6px solid transparent;border-bottom:10px solid rgba(255,255,255,.55);box-shadow:none}
+.avatar.is-ember .avatar-mark{width:10px;height:10px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);background:rgba(255,255,255,.55);box-shadow:none}
+.avatar.is-slate .avatar-mark{width:12px;height:8px;border-radius:1px;background:rgba(255,255,255,.28);box-shadow:0 4px 0 rgba(16,21,14,.25)}
+.avatar-menu{
+  position:fixed;z-index:80;
+  background:#151922;border:1px solid var(--line);border-radius:12px;
+  padding:12px;box-shadow:0 16px 40px rgba(0,0,0,.45);
+}
+.avatar-menu[hidden]{display:none!important}
+.avatar-menu .eyebrow{margin:0 0 10px}
+.avatar-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.avatar-choice{
+  display:flex;flex-direction:column;align-items:center;gap:6px;
+  padding:8px 4px;border:1px solid transparent;border-radius:10px;
+  background:transparent;color:var(--muted);cursor:pointer;font:10px 'Space Grotesk';
+}
+.avatar-choice:hover,.avatar-choice.selected{border-color:#43503a;background:#1a2218;color:var(--text)}
+.avatar-choice .avatar{width:36px;height:36px;font-size:14px;pointer-events:none}
+@media(max-width:600px){
+  .profile .avatar,.top-avatar{width:36px;height:36px}
+}

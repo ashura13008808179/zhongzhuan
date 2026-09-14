@@ -11,13 +11,18 @@ import {
   isUsableUpstreamSecret,
   findSyncedKeyRecord,
   resolveProxyApiKey,
+  flattenListedKeys,
+  findListedSecret,
   validateInviteCode,
   insufficientBalanceMessage,
   resolveRecommendedModel,
   normalizeRecommendedModel,
   DEFAULT_RECOMMENDED_MODEL,
   BEIBEIHAI_CHAT_URL,
-  VIP1129_CHAT_URL
+  VIP1129_CHAT_URL,
+  AVATAR_IDS,
+  DEFAULT_AVATAR,
+  normalizeAvatar
 } from '../lib/relay-core.js';
 
 const isVip1129 = (p) => p?.upstreamSync === 'vip1129' || String(p?.url || '').includes('vip1129.cc');
@@ -115,6 +120,21 @@ assert.equal(resolveProxyApiKey({ ...gpt, apiKey: 'sk-channel' }, localRk, { use
 const found = findSyncedKeyRecord({ users: [user] }, gpt, localRk, user, detectors);
 assert.equal(found.key, 'sk-upstream-gpt');
 
+const listedPayload = {
+  code: 0,
+  data: {
+    data: [
+      { id: 1, name: 'other', group_id: 10, key: 'sk-other' },
+      { id: 6086, name: 'relay-probe-grp_gpt_pro', group_id: 10, key: 'sk-probe-pro' },
+      { id: 34, name: 'relay-probe-grp_gpt_plus', group_id: 34, key: 'sk-probe-plus' }
+    ]
+  }
+};
+assert.equal(flattenListedKeys(listedPayload).length, 3);
+assert.equal(findListedSecret(listedPayload, { name: 'relay-probe-grp_gpt_pro', groupId: 10 }).key, 'sk-probe-pro');
+assert.equal(findListedSecret(listedPayload, { nameIncludes: 'relay-probe', groupId: 34 }).key, 'sk-probe-plus');
+assert.equal(findListedSecret(listedPayload, { groupId: 99 }).key, null);
+
 // --- invite / 402 copy ---
 const users = [
   { id: 'u1', inviteCode: 'ABCD1234' },
@@ -136,5 +156,12 @@ assert.equal(resolveRecommendedModel({ recommendedModel: 'gpt-5.6' }), 'gpt-5.6-
 assert.equal(resolveRecommendedModel({ recommendedModel: 'gpt-5.6-terra' }), 'gpt-5.6-terra');
 assert.equal(normalizeRecommendedModel('gpt-5.6-sol').ok, true);
 assert.equal(normalizeRecommendedModel('bad model!').ok, false);
+
+assert.equal(DEFAULT_AVATAR, 'letter');
+assert.ok(AVATAR_IDS.includes('mint'));
+assert.equal(normalizeAvatar('mint').ok, true);
+assert.equal(normalizeAvatar('mint').avatar, 'mint');
+assert.equal(normalizeAvatar('').avatar, 'letter');
+assert.equal(normalizeAvatar('nope').ok, false);
 
 console.log('relay-fixes.test.mjs: all assertions passed');

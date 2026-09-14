@@ -1,4 +1,90 @@
-const $=s=>document.querySelector(s);let token=localStorage.getItem('relay_token'),me=null,data=null,checkin=null;
+const $=s=>document.querySelector(s);
+const TOKEN_KEY='relay_token', REMEMBER_KEY='relay_remember', LOGIN_KEY='relay_login';
+const AVATARS=[
+  {id:'letter',label:'首字母'},
+  {id:'lime',label:'青柠'},
+  {id:'cyan',label:'湖青'},
+  {id:'sunset',label:'暮光'},
+  {id:'mint',label:'薄荷'},
+  {id:'violet',label:'紫雾'},
+  {id:'ember',label:'熔岩'},
+  {id:'slate',label:'岩灰'}
+];
+function readStoredToken(){ return localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY); }
+function persistToken(value, remember){
+  localStorage.removeItem(TOKEN_KEY);
+  sessionStorage.removeItem(TOKEN_KEY);
+  if(!value) return;
+  (remember ? localStorage : sessionStorage).setItem(TOKEN_KEY, value);
+}
+function rememberPrefill(){
+  const remember = localStorage.getItem(REMEMBER_KEY) === '1';
+  const box = $('#rememberMe');
+  if(box) box.checked = remember;
+  const saved = localStorage.getItem(LOGIN_KEY) || '';
+  const loginInput = $('#loginIdentifier');
+  if(loginInput && saved && !loginInput.value) loginInput.value = saved;
+}
+function avatarIdOf(user){ return AVATARS.some(a=>a.id===user?.avatar) ? user.avatar : 'letter'; }
+function initialOf(user){ return String(user?.name||user?.username||'?').trim().slice(0,1).toUpperCase() || '?'; }
+function paintAvatar(el, user){
+  if(!el) return;
+  const id = avatarIdOf(user);
+  const extras = [...el.classList].filter(c=>c!=='avatar' && !c.startsWith('is-'));
+  el.className = ['avatar', 'is-'+id, ...extras].join(' ');
+  el.innerHTML = id==='letter' ? esc(initialOf(user)) : '<span class="avatar-mark" aria-hidden="true"></span>';
+}
+function paintUserAvatars(){
+  paintAvatar($('#sideAvatar'), me);
+  paintAvatar($('#topAvatar'), me);
+}
+function closeAvatarMenu(){
+  const menu = $('#avatarMenu');
+  if(menu) menu.hidden = true;
+  ['#topAvatar','#sideAvatar'].forEach(sel=>{
+    const btn=$(sel);
+    if(btn) btn.setAttribute('aria-expanded','false');
+  });
+}
+function openAvatarMenu(anchor){
+  const menu = $('#avatarMenu'), grid = $('#avatarGrid');
+  if(!menu || !grid) return;
+  const current = avatarIdOf(me);
+  grid.innerHTML = AVATARS.map(a=>`<button type="button" class="avatar-choice ${current===a.id?'selected':''}" data-avatar="${a.id}" title="${esc(a.label)}"><span class="avatar is-${a.id}">${a.id==='letter'?esc(initialOf(me)):'<span class="avatar-mark"></span>'}</span><small>${esc(a.label)}</small></button>`).join('');
+  grid.querySelectorAll('[data-avatar]').forEach(btn=>{
+    btn.onclick = async ()=>{
+      const next = btn.dataset.avatar;
+      try{
+        const j = await api('/api/me', { method:'PATCH', body: JSON.stringify({ avatar: next }) });
+        me = { ...me, ...j.user };
+        paintUserAvatars();
+        closeAvatarMenu();
+      }catch(err){
+        btn.classList.add('error');
+        btn.title = err.message;
+      }
+    };
+  });
+  menu.hidden = false;
+  if(anchor){
+    const r = anchor.getBoundingClientRect();
+    const width = Math.min(280, window.innerWidth - 16);
+    let left = r.right - width;
+    if(left < 8) left = 8;
+    let top = r.bottom + 8;
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+    menu.style.width = `${width}px`;
+    requestAnimationFrame(()=>{
+      const box = menu.getBoundingClientRect();
+      if(box.bottom > window.innerHeight - 8){
+        menu.style.top = `${Math.max(8, r.top - box.height - 8)}px`;
+      }
+    });
+    anchor.setAttribute('aria-expanded','true');
+  }
+}
+let token=readStoredToken(),me=null,data=null,checkin=null;
 const authView=$('#authView'),dash=$('#dashboard'),page=$('#page');
 function isMobileNav(){ return window.matchMedia('(max-width: 600px)').matches; }
 function setMobileNav(open){
@@ -43,14 +129,31 @@ function setAuthMode(mode){
 }
 document.querySelectorAll('[data-auth]').forEach(b=>b.onclick=()=>setAuthMode(b.dataset.auth));
 setAuthMode('login');
-$('#loginForm').onsubmit=async e=>{e.preventDefault();try{const j=await api('/api/auth/login',{method:'POST',body:JSON.stringify({login:$('#loginIdentifier').value.trim(),password:$('#loginPassword').value})});token=j.token;localStorage.setItem('relay_token',token);await boot()}catch(err){msg(err.message)}};
-$('#registerForm').onsubmit=async e=>{e.preventDefault();try{const j=await api('/api/auth/register',{method:'POST',body:JSON.stringify({email:$('#regEmail').value.trim(),username:$('#regUsername').value.trim(),name:$('#regName').value.trim(),password:$('#regPassword').value,inviteCode:$('#regInvite').value.trim()})});token=j.token;localStorage.setItem('relay_token',token);await boot()}catch(err){msg(err.message)}};
-$('#logoutBtn').onclick=async()=>{try{if(token)await api('/api/auth/logout',{method:'POST'});}catch{}localStorage.removeItem('relay_token');location.reload()};
-async function boot(){try{data=await api('/api/dashboard');me=data.user;try{checkin=await api('/api/checkin/status')}catch{checkin=null}authView.hidden=true;dash.hidden=false;$('#sideName').textContent=me.name;$('#sideEmail').textContent=me.username?`@${me.username}`:me.email;$('#sideAvatar').textContent=(me.name||me.username||'?')[0].toUpperCase();$('#topAvatar').textContent=(me.name||me.username||'?')[0].toUpperCase();render('overview')}catch{localStorage.removeItem('relay_token');token=null}}
+rememberPrefill();
+$('#loginForm').onsubmit=async e=>{e.preventDefault();try{const identifier=$('#loginIdentifier').value.trim();const remember=!!$('#rememberMe')?.checked;const j=await api('/api/auth/login',{method:'POST',body:JSON.stringify({login:identifier,password:$('#loginPassword').value})});token=j.token;localStorage.setItem(REMEMBER_KEY,remember?'1':'0');if(remember) localStorage.setItem(LOGIN_KEY,identifier);else localStorage.removeItem(LOGIN_KEY);persistToken(token,remember);await boot()}catch(err){msg(err.message)}};
+$('#registerForm').onsubmit=async e=>{e.preventDefault();try{const j=await api('/api/auth/register',{method:'POST',body:JSON.stringify({email:$('#regEmail').value.trim(),username:$('#regUsername').value.trim(),name:$('#regName').value.trim(),password:$('#regPassword').value,inviteCode:$('#regInvite').value.trim()})});token=j.token;persistToken(token,true);localStorage.setItem(REMEMBER_KEY,'1');const ident=$('#regUsername').value.trim()||$('#regEmail').value.trim();if(ident) localStorage.setItem(LOGIN_KEY,ident);await boot()}catch(err){msg(err.message)}};
+$('#logoutBtn').onclick=async()=>{try{if(token)await api('/api/auth/logout',{method:'POST'});}catch{}persistToken(null);location.reload()};
+async function boot(){try{data=await api('/api/dashboard');me=data.user;try{checkin=await api('/api/checkin/status')}catch{checkin=null}authView.hidden=true;dash.hidden=false;$('#sideName').textContent=me.name;$('#sideEmail').textContent=me.username?`@${me.username}`:me.email;paintUserAvatars();render('overview')}catch{persistToken(null);token=null}}
+$('#helpTip')?.addEventListener('click',()=>{ closeMobileNav(); render('contact'); });
+['#topAvatar','#sideAvatar'].forEach(sel=>{
+  $(sel)?.addEventListener('click', e=>{
+    e.stopPropagation();
+    const menu=$('#avatarMenu');
+    if(menu && !menu.hidden && e.currentTarget.getAttribute('aria-expanded')==='true'){ closeAvatarMenu(); return; }
+    openAvatarMenu(e.currentTarget);
+  });
+});
+document.addEventListener('click', e=>{
+  const menu=$('#avatarMenu');
+  if(!menu || menu.hidden) return;
+  if(menu.contains(e.target) || e.target.closest('#topAvatar,#sideAvatar')) return;
+  closeAvatarMenu();
+});
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeAvatarMenu(); });
 function shell(title,kicker,html){$('#pageTitle').textContent=title;page.innerHTML=`<div class="page-head"><div><p class="eyebrow">${kicker}</p><h1>${title}</h1><p class="sub">管理你的 Relay Station 账户与 API 服务</p></div></div>${html}`}
 function render(name){
   document.querySelectorAll('[data-page]').forEach(a=>a.classList.toggle('active',a.dataset.page===name));
-  if(name==='overview')shell('数据概览','ACCOUNT OVERVIEW',`<div class="metric-grid"><article><small>账户余额</small><strong>${me.unlimited||me.isAdmin?'无限':('¥'+Number(me.balance||0).toFixed(2))}</strong><span class="green">${me.unlimited||me.isAdmin?'管理员不扣本地余额':'可用于 API 调用'}</span></article><article><small>累计请求</small><strong>${data.stats.requests.toLocaleString()}</strong><span>成功率 ${data.stats.requests?Math.round(data.stats.success/data.stats.requests*100):100}%</span></article><article><small>剩余 API 配额</small><strong>${data.stats.availableTokens.toLocaleString()}</strong><span>已使用 ${data.stats.usedTokens.toLocaleString()} / ${data.stats.quotaTokens.toLocaleString()}</span></article><article><small>邀请奖励</small><strong>¥${me.bonusBalance.toFixed(2)}</strong><span>已邀请 ${data.inviteCount} 位用户</span></article></div><div class="content-grid"><section class="card"><div class="card-head"><div><p class="eyebrow">RECENT REQUESTS</p><h2>最近请求</h2></div><button class="link-btn" data-page="logs">查看全部 →</button></div><table><thead><tr><th>模型</th><th>Token</th><th>延迟</th><th>状态</th><th>时间</th></tr></thead><tbody>${data.logs.slice(0,8).map(l=>`<tr><td>${esc(l.model)}</td><td>${l.tokens}</td><td>${l.latency}ms</td><td><span class="tag success">成功</span></td><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无请求记录</td></tr>'}</tbody></table></section><section class="card balance-card"><p class="eyebrow">QUICK ACTIONS</p><h2>快捷操作</h2><button class="action" data-page="checkin"><span>✦</span><div><b>每日签到</b><small>${checkin?.checkedInToday?`今日已领 ¥${Number(checkin.todayAmount||0).toFixed(2)}`:'随机领取 ¥0.05–¥0.50'}</small></div><i>→</i></button><button class="action" data-page="api"><span>◈</span><div><b>查看 API 接入</b><small>复制你的专属调用密钥</small></div><i>→</i></button><button class="action" data-page="billing"><span>◇</span><div><b>卡密充值</b><small>充值后立即到账</small></div><i>→</i></button><button class="action" data-page="referral"><span>♧</span><div><b>邀请好友</b><small>好友付费后返利 5%</small></div><i>→</i></button></section></div>`);
+  if(name==='overview')shell('数据概览','ACCOUNT OVERVIEW',`<div class="metric-grid"><article><small>账户余额</small><strong>${me.unlimited||me.isAdmin?'无限':('¥'+Number(me.balance||0).toFixed(2))}</strong><span class="green">${me.unlimited||me.isAdmin?'管理员不扣本地余额':'可用于 API 调用'}</span></article><article><small>累计请求</small><strong>${data.stats.requests.toLocaleString()}</strong><span>成功率 ${data.stats.requests?Math.round(data.stats.success/data.stats.requests*100):100}%</span></article><article><small>累计用量</small><strong>${data.stats.usedTokens.toLocaleString()}</strong><span>按账户余额扣费</span></article><article><small>邀请奖励</small><strong>¥${me.bonusBalance.toFixed(2)}</strong><span>已邀请 ${data.inviteCount} 位用户</span></article></div><div class="content-grid"><section class="card"><div class="card-head"><div><p class="eyebrow">RECENT REQUESTS</p><h2>最近请求</h2></div><button class="link-btn" data-page="logs">查看全部 →</button></div><table><thead><tr><th>模型</th><th>Token</th><th>延迟</th><th>状态</th><th>时间</th></tr></thead><tbody>${data.logs.slice(0,8).map(l=>`<tr><td>${esc(l.model)}</td><td>${l.tokens}</td><td>${l.latency}ms</td><td><span class="tag success">成功</span></td><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无请求记录</td></tr>'}</tbody></table></section><section class="card balance-card"><p class="eyebrow">QUICK ACTIONS</p><h2>快捷操作</h2><button class="action" data-page="checkin"><span>✦</span><div><b>每日签到</b><small>${checkin?.checkedInToday?`今日已领 ¥${Number(checkin.todayAmount||0).toFixed(2)}`:'随机领取 ¥0.05–¥0.50'}</small></div><i>→</i></button><button class="action" data-page="api"><span>◈</span><div><b>查看 API 接入</b><small>复制你的专属调用密钥</small></div><i>→</i></button><button class="action" data-page="billing"><span>◇</span><div><b>卡密充值</b><small>充值后立即到账</small></div><i>→</i></button><button class="action" data-page="referral"><span>♧</span><div><b>邀请好友</b><small>好友付费后返利 5%</small></div><i>→</i></button></section></div>`);
   if(name==='checkin'){renderCheckIn();return;}
   if(name==='operations'){renderOperations();return;}
   if(name==='api'){renderApiKeys();return;}

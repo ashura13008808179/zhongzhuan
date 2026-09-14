@@ -137,6 +137,23 @@ try {
   const cfg2 = await req('/api/config');
   assert.equal(cfg2.body.recommendedModel, 'gpt-5.6-terra');
 
+  const meBefore = await req('/api/me', { headers: auth });
+  assert.equal(meBefore.status, 200);
+  assert.equal(meBefore.body.user.avatar, 'letter');
+  const av = await req('/api/me', {
+    method: 'PATCH',
+    headers: auth,
+    body: JSON.stringify({ avatar: 'mint' })
+  });
+  assert.equal(av.status, 200, JSON.stringify(av.body));
+  assert.equal(av.body.user.avatar, 'mint');
+  const avBad = await req('/api/me', {
+    method: 'PATCH',
+    headers: auth,
+    body: JSON.stringify({ avatar: 'not-a-face' })
+  });
+  assert.equal(avBad.status, 400);
+
   const validInvite = await req('/api/auth/register', {
     method: 'POST',
     body: JSON.stringify({
