@@ -207,6 +207,7 @@ function paymentPlans(db) {
 
 const CODE_POOL_TARGET = Number(process.env.CODE_POOL_TARGET || 10000);
 const CLAIM_DAILY_LIMIT = Number(process.env.CLAIM_DAILY_LIMIT || 20);
+const REFERRAL_REBATE_RATE = 0.05;
 
 function localDay(d = new Date()) {
   const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
@@ -2379,12 +2380,12 @@ const server = http.createServer(async (req, res) => {
     user.balance += payAmount;
     user.quotaTokens = (user.quotaTokens || 0) + quotaTokens;
     user.accountActive = true;
-    // Referral: only when invited user pays — inviter gets 10%
+    // Referral: only when invited user pays — inviter gets 5%
     let rebate = 0;
     if (user.invitedBy && payAmount > 0) {
       const inviter = db.users.find(x => x.id === user.invitedBy);
       if (inviter) {
-        rebate = Math.round(payAmount * 0.1 * 100) / 100;
+        rebate = Math.round(payAmount * REFERRAL_REBATE_RATE * 100) / 100;
         inviter.bonusBalance = (inviter.bonusBalance || 0) + rebate;
         inviter.balance = (inviter.balance || 0) + rebate;
         db.logs = db.logs || [];
@@ -2399,7 +2400,7 @@ const server = http.createServer(async (req, res) => {
           multiplier: 1,
           latency: 0,
           status: 'referral_rebate',
-          detail: { fromUserId: user.id, payAmount, rebate, rate: 0.1 },
+          detail: { fromUserId: user.id, payAmount, rebate, rate: REFERRAL_REBATE_RATE },
           createdAt: new Date().toISOString()
         });
         db.logs = db.logs.slice(0, 3000);
