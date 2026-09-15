@@ -92,7 +92,22 @@ export async function deleteKey(baseUrl, token, id) {
 
 export async function fetchAccount(baseUrl, token) {
   const base = normalizeBase(baseUrl);
-  const res = await fetch(`${base}/api/v1/auth/me`, { headers: authHeaders(token) });
+  const res = await fetch(`${base}/api/v1/auth/me`, {
+    headers: authHeaders(token),
+    signal: AbortSignal.timeout(8000)
+  });
+  return readJson(res);
+}
+
+/** Per-request bills. actual_cost is what Beibeihai deducted for that call. */
+export async function fetchUsage(baseUrl, token, query = 'page=1&page_size=15', opts = {}) {
+  const base = normalizeBase(baseUrl);
+  const q = query ? (query.startsWith('?') ? query : `?${query}`) : '';
+  const timeoutMs = Math.max(1000, Number(opts.timeoutMs) || 20000);
+  const res = await fetch(`${base}/api/v1/usage${q}`, {
+    headers: authHeaders(token),
+    signal: AbortSignal.timeout(timeoutMs)
+  });
   return readJson(res);
 }
 

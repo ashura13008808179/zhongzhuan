@@ -117,6 +117,10 @@ function fmtRate(n){
   if(!Number.isFinite(x)) return '1';
   return String(Math.round(x*10000)/10000);
 }
+function spentTokens(l){
+  const n=Number(l?.billedTokens ?? l?.tokens ?? 0);
+  return Math.round(Number.isFinite(n)?n:0);
+}
 function groupRateSuffix(g){
   const n=Number(g?.displayMultiplier);
   if(!Number.isFinite(n)) return '';
@@ -299,13 +303,13 @@ function startPayLive(){
 function render(name){
   stopMyPayOrdersPoll();
   document.querySelectorAll('[data-page]').forEach(a=>a.classList.toggle('active',a.dataset.page===name));
-  if(name==='overview')shell('数据概览','ACCOUNT OVERVIEW',`<div class="metric-grid"><article><small>账户余额</small><strong>${me.unlimited||me.isAdmin?'无限':('¥'+Number(me.balance||0).toFixed(2))}</strong><span class="green">${me.unlimited||me.isAdmin?'管理员不扣本地余额':'可用于 API 调用'}</span></article><article><small>累计请求</small><strong>${data.stats.requests.toLocaleString()}</strong><span>成功率 ${data.stats.requests?Math.round(data.stats.success/data.stats.requests*100):100}%</span></article><article><small>累计用量</small><strong>${data.stats.usedTokens.toLocaleString()}</strong><span>按账户余额扣费</span></article><article><small>累计花销</small><strong>¥${Number(data.stats.totalSpent||0).toFixed(2)}</strong><span>API 实际扣费合计</span></article></div><div class="content-grid"><section class="card"><div class="card-head"><div><p class="eyebrow">RECENT REQUESTS</p><h2>最近请求</h2></div><button class="link-btn" data-page="logs">查看全部 →</button></div><table><thead><tr><th>模型</th><th>Token</th><th>延迟</th><th>状态</th><th>时间</th></tr></thead><tbody>${data.logs.slice(0,8).map(l=>`<tr><td>${esc(l.model)}</td><td>${l.tokens}</td><td>${l.latency}ms</td><td><span class="tag success">成功</span></td><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无请求记录</td></tr>'}</tbody></table></section><section class="card balance-card"><p class="eyebrow">QUICK ACTIONS</p><h2>快捷操作</h2><button class="action" data-page="checkin"><span>✦</span><div><b>每日签到</b><small>${checkin?.checkedInToday?`今日已领 ¥${Number(checkin.todayAmount||0).toFixed(2)}`:'随机领取 ¥0.05–¥0.50'}</small></div><i>→</i></button><button class="action" data-page="api"><span>◈</span><div><b>查看 API 接入</b><small>复制你的专属调用密钥</small></div><i>→</i></button><button class="action" data-page="billing"><span>◇</span><div><b>卡密充值</b><small>充值后立即到账</small></div><i>→</i></button><button class="action" data-page="referral"><span>♧</span><div><b>邀请好友</b><small>好友付费后返利 5%</small></div><i>→</i></button></section></div>`);
+  if(name==='overview')shell('数据概览','ACCOUNT OVERVIEW',`<div class="metric-grid"><article><small>账户余额</small><strong>${me.unlimited||me.isAdmin?'无限':('¥'+Number(me.balance||0).toFixed(2))}</strong><span class="green">${me.unlimited||me.isAdmin?'管理员不扣本地余额':'可用于 API 调用'}</span></article><article><small>累计请求</small><strong>${data.stats.requests.toLocaleString()}</strong><span>成功率 ${data.stats.requests?Math.round(data.stats.success/data.stats.requests*100):100}%</span></article><article><small>累计用量</small><strong>${Number(data.stats.usedTokens||data.stats.billedTokens||0).toLocaleString()}</strong><span>账户已计费用量</span></article><article><small>累计花销</small><strong>¥${Number(data.stats.totalSpent||0).toFixed(2)}</strong><span>API 调用累计扣费</span></article></div><div class="content-grid"><section class="card"><div class="card-head"><div><p class="eyebrow">RECENT REQUESTS</p><h2>最近请求</h2></div><button class="link-btn" data-page="logs">查看全部 →</button></div><table><thead><tr><th>模型</th><th>Token</th><th>花销</th><th>延迟</th><th>状态</th><th>时间</th></tr></thead><tbody>${data.logs.slice(0,8).map(l=>`<tr><td>${esc(l.model)}</td><td>${spentTokens(l)}</td><td>¥${Number(l.chargedAmount||0).toFixed(4)}</td><td>${l.latency}ms</td><td><span class="tag success">成功</span></td><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">暂无请求记录</td></tr>'}</tbody></table></section><section class="card balance-card"><p class="eyebrow">QUICK ACTIONS</p><h2>快捷操作</h2><button class="action" data-page="checkin"><span>✦</span><div><b>每日签到</b><small>${checkin?.checkedInToday?`今日已领 ¥${Number(checkin.todayAmount||0).toFixed(2)}`:'随机领取 ¥0.05–¥0.50'}</small></div><i>→</i></button><button class="action" data-page="api"><span>◈</span><div><b>查看 API 接入</b><small>复制你的专属调用密钥</small></div><i>→</i></button><button class="action" data-page="billing"><span>◇</span><div><b>卡密充值</b><small>充值后立即到账</small></div><i>→</i></button><button class="action" data-page="referral"><span>♧</span><div><b>邀请好友</b><small>好友付费后返利 5%</small></div><i>→</i></button></section></div>`);
   if(name==='checkin'){renderCheckIn();return;}
   if(name==='operations'){renderOperations();return;}
   if(name==='api'){renderApiKeys();return;}
-  if(name==='logs')shell('使用日志','REQUEST LOGS',`<section class="card"><div class="card-head"><div><p class="eyebrow">AUDIT TRAIL</p><h2>全部请求记录</h2></div><span class="sub">最近 30 条</span></div><table><thead><tr><th>时间</th><th>模型</th><th>Token</th><th>延迟</th><th>状态</th></tr></thead><tbody>${data.logs.map(l=>`<tr><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td><td>${esc(l.model)}</td><td>${l.tokens}</td><td>${l.latency}ms</td><td><span class="tag success">成功</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无日志</td></tr>'}</tbody></table></section>`);
+  if(name==='logs')shell('使用日志','REQUEST LOGS',`<section class="card"><div class="card-head"><div><p class="eyebrow">AUDIT TRAIL</p><h2>全部请求记录</h2></div></div><table><thead><tr><th>时间</th><th>模型</th><th>Token</th><th>花销</th><th>延迟</th><th>状态</th></tr></thead><tbody>${data.logs.map(l=>`<tr><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td><td>${esc(l.model)}</td><td>${spentTokens(l)}</td><td>¥${Number(l.chargedAmount||0).toFixed(4)}</td><td>${l.latency}ms</td><td><span class="tag success">成功</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">暂无日志</td></tr>'}</tbody></table></section>`);
   if(name==='billing'){
-  shell('智能充值','BILLING & RECHARGE','<section class="card"><p class="sub">正在加载充值方案…</p></section>');
+  shell('卡密充值','BILLING & RECHARGE','<section class="card"><p class="sub">正在加载充值方案…</p></section>');
   (async () => {
     await ensureAppConfig();
     renderBillingContent();
@@ -734,7 +738,7 @@ async function renderApiKeys(){
         <div class="code-box"><b>基础 URL（Base URL）</b><pre id="baseUrlText">${esc(baseUrl)}</pre><button type="button" class="link-btn" id="copyBaseUrl">复制</button></div>
         <div class="code-box"><b>完整对话地址</b><pre id="chatUrlText">${esc(chatUrl)}</pre><button type="button" class="link-btn" id="copyChatUrl">复制</button></div>
       </div>
-      <p class="sub" style="margin-bottom:14px">客户端请填写<strong>本站</strong>地址（上线后为你的域名），不要填 OpenAI 或上游中转地址。</p>
+      <p class="sub" style="margin-bottom:14px">客户端请填写<strong>本站</strong>地址（上线后为你的域名），不要填 OpenAI 或其他第三方地址。</p>
       <div class="key-list">${keys.map(k=>`<article class="key-card" data-key-id="${esc(k.id)}">
         <div class="card-head">
           <div><h2>${esc(k.name)}</h2><p class="sub">${esc(keyLimitLabel(k))}${k.groupId?` · 组 ${esc(groupName(k.groupId))}`:''}</p></div>
@@ -780,6 +784,7 @@ async function renderApiKeys(){
         <button type="button" class="active" data-docs="curl">cURL</button>
         <button type="button" data-docs="openai">OpenAI SDK</button>
         <button type="button" data-docs="cursor">Cursor</button>
+        <button type="button" data-docs="claudecode">Claude Code</button>
         <button type="button" data-docs="cherry">Cherry Studio</button>
         <button type="button" data-docs="ccswitch">CC Switch 手动</button>
       </div>
@@ -816,6 +821,19 @@ const r = await client.chat.completions.create({
           <li>关掉不需要的官方模型勾选，保存后重启 Cursor 再试对话</li>
         </ol>
         <p class="warning">常见错误：Base URL 少了 /v1、多写了 /chat/completions、模型名写错、Key 前后有空格。</p>
+      </div>
+      <div class="docs-pane" data-pane="claudecode" hidden>
+        <ol class="guide-list">
+          <li>用本站 <b>CC-MAX / Claude-Kiro</b> 渠道创建密钥（不要用 GPT PRO 的 Codex 密钥）</li>
+          <li>环境变量 <code>ANTHROPIC_API_KEY</code> 填该密钥</li>
+          <li><code>ANTHROPIC_BASE_URL</code> 填站点根地址（到域名为止，<b>不要</b>加 /v1；客户端会请求 /v1/messages）</li>
+          <li>模型名与控制台完全一致，例如 <code>claude-fable-5</code></li>
+          <li>本站会原样转发 tools / tool_use，Claude Code 才能像官方一样读写本机文件</li>
+        </ol>
+        <div class="code-box"><pre>set ANTHROPIC_API_KEY=${esc(sample)}
+set ANTHROPIC_BASE_URL=${esc(String(baseUrl||'').replace(/\/v1\/?$/,''))}
+set ANTHROPIC_MODEL=claude-fable-5
+claude</pre></div>
       </div>
       <div class="docs-pane" data-pane="cherry" hidden>
         <ol class="guide-list">
@@ -900,6 +918,7 @@ render = function(name) {
 let adminTab = 'rates';
 let adminProvidersCache = [];
 let adminDefaultProviderId = null;
+let opsRenderSeq = 0;
 
 function adminTabsHtml() {
   const tabs = [
@@ -929,9 +948,10 @@ function modelPricesEditorHtml(provider, idx) {
       <input data-mp-field="model" value="${esc(model)}" placeholder="模型名">
       <input data-mp-field="input" type="number" step="0.0001" min="0" value="${esc(price.inputPricePer1K ?? 0)}" placeholder="输入/1K">
       <input data-mp-field="output" type="number" step="0.0001" min="0" value="${esc(price.outputPricePer1K ?? 0)}" placeholder="输出/1K">
+      <input data-mp-field="cache" type="number" step="0.0001" min="0" value="${esc(price.cacheReadPricePer1K ?? '')}" placeholder="缓存读/1K">
       <button type="button" class="ghost-btn" data-remove-mp="${idx}:${pi}">删除</button>
     </div>`).join('');
-  return `<div class="model-prices" data-provider-mp="${idx}"><div class="model-price-head"><span>模型</span><span>输入价/1K</span><span>输出价/1K</span><span></span></div>${rows || '<p class="sub">暂无按模型价格，将使用渠道默认输入/输出价。</p>'}<button type="button" class="ghost-btn" data-add-mp="${idx}">+ 添加模型价格</button></div>`;
+  return `<div class="model-prices" data-provider-mp="${idx}"><div class="model-price-head"><span>模型</span><span>输入价/1K</span><span>输出价/1K</span><span>缓存读/1K</span><span></span></div>${rows || '<p class="sub">暂无按模型价格，将使用渠道默认输入/输出/缓存价。</p>'}<button type="button" class="ghost-btn" data-add-mp="${idx}">+ 添加模型价格</button></div>`;
 }
 
 function providerHost(url) {
@@ -939,7 +959,13 @@ function providerHost(url) {
   catch { return url || '未填写上游地址'; }
 }
 
-function providerFormHtml(provider, idx) {
+function chargeRateHint(provider, settings) {
+  const vip = provider?.upstreamSync === 'vip1129' || /vip1129/i.test(String(provider?.url || ''));
+  const rate = vip ? (settings?.multiplierVip1129 ?? 1.5) : (settings?.multiplier ?? 2.5);
+  return `真实花销倍率 ${fmtRate(rate)}x（${vip ? 'vip1129 / Codex' : 'beibeihai / 北海'} 全局）`;
+}
+
+function providerFormHtml(provider, idx, settings) {
   const health = provider.health || {};
   const healthLabel = health.ok === false ? '异常' : '正常';
   const healthClass = health.ok === false ? 'tag danger' : 'tag success';
@@ -974,10 +1000,12 @@ function providerFormHtml(provider, idx) {
       </label>
       <label>默认模型<input data-f="defaultModel" value="${esc(provider.defaultModel || '')}" placeholder="同步后自动填第一个"></label>
       <label>优先级（越小越高）<input data-f="priority" type="number" value="${esc(provider.priority ?? 100)}"></label>
-      <label>计费倍率<input data-f="billingMultiplier" type="number" step="0.01" min="0.01" max="10" value="${esc(fmtRate(provider.billingMultiplier ?? 2.5))}"><small class="hint">真实扣费倍率，仅管理员可见。默认 2.5x。</small></label>
+      <label>计费倍率<input data-f="billingMultiplier" type="number" step="0.01" min="0.01" max="10" value="${esc(fmtRate(provider.billingMultiplier ?? 2.5))}"><small class="hint">摆设，不参与扣费。${esc(chargeRateHint(provider, settings))}</small></label>
       <label>展示倍率<input data-f="displayMultiplier" type="number" step="0.01" min="0.01" max="10" value="${esc(fmtRate(provider.displayMultiplier ?? 0.2))}"><small class="hint">写在用户端模型组名称后面，仅展示，不参与扣费。</small></label>
       <label>输入价/1K<input data-f="inputPricePer1K" type="number" step="0.0001" min="0" value="${esc(provider.inputPricePer1K ?? 0)}"></label>
       <label>输出价/1K<input data-f="outputPricePer1K" type="number" step="0.0001" min="0" value="${esc(provider.outputPricePer1K ?? 0)}"></label>
+      <label>缓存读价/1K<input data-f="cacheReadPricePer1K" type="number" step="0.0001" min="0" value="${esc(provider.cacheReadPricePer1K ?? '')}"><small class="hint">对齐上游 cache / cached_tokens，空则按输入价 10%。</small></label>
+      <label>上游分组倍率<input data-f="upstreamRateMultiplier" type="number" step="0.01" min="0" value="${esc(provider.upstreamRateMultiplier ?? 1)}"><small class="hint">vip1129/北海 group rate_multiplier。估算上游成本 = 基价 × 此倍率；有实扣字段时以实扣为准。</small></label>
       <label>超时 ms<input data-f="timeoutMs" type="number" min="1000" value="${esc(provider.timeoutMs ?? 60000)}"></label>
       <label>重试次数<input data-f="maxRetries" type="number" min="0" max="5" value="${esc(provider.maxRetries ?? 0)}"></label>
       <label class="check-label"><input data-f="enabled" type="checkbox" ${provider.enabled !== false ? 'checked' : ''}> 启用</label>
@@ -1006,7 +1034,8 @@ function collectProvidersFromDom() {
       if (!model) return;
       modelPrices[model] = {
         inputPricePer1K: Number(row.querySelector('[data-mp-field="input"]')?.value || 0),
-        outputPricePer1K: Number(row.querySelector('[data-mp-field="output"]')?.value || 0)
+        outputPricePer1K: Number(row.querySelector('[data-mp-field="output"]')?.value || 0),
+        cacheReadPricePer1K: Number(row.querySelector('[data-mp-field="cache"]')?.value || 0)
       };
     });
     const apiKey = get('apiKey')?.value || '';
@@ -1021,6 +1050,8 @@ function collectProvidersFromDom() {
       models,
       inputPricePer1K: Number(get('inputPricePer1K')?.value || 0),
       outputPricePer1K: Number(get('outputPricePer1K')?.value || 0),
+      cacheReadPricePer1K: Number(get('cacheReadPricePer1K')?.value || previous?.cacheReadPricePer1K || 0),
+      upstreamRateMultiplier: Number(get('upstreamRateMultiplier')?.value ?? previous?.upstreamRateMultiplier ?? 1),
       priority: Number(get('priority')?.value || 100),
       billingMultiplier: Number(get('billingMultiplier')?.value || 2.5),
       displayMultiplier: Number(get('displayMultiplier')?.value || 0.2),
@@ -1048,13 +1079,17 @@ async function renderOperations() {
     shell('运营配置', 'ADMIN CONSOLE', `<section class="card"><h2>无权访问</h2><p class="sub">仅管理员账户可查看运营数据。</p></section>`);
     return;
   }
+  const renderId = ++opsRenderSeq;
+  const stillCurrent = () => renderId === opsRenderSeq;
   try {
     if (adminTab === 'rates' || adminTab === 'channels') {
       const settings = await api('/api/admin/pricing');
+      if (!stillCurrent()) return;
       adminProvidersCache = settings.providers || [];
       adminDefaultProviderId = settings.defaultProviderId;
       if (adminTab === 'rates') {
-        shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><p class="eyebrow">REAL-TIME PRICING</p><h2>客户计费倍率</h2><p class="sub">真实扣费按<strong>上游全局倍率</strong>分两档：beibeihai / 北海 与 vip1129 / Codex 直连中转。客户花销 = 上游成本 × 对应上游全局倍率。各渠道名称旁的数字只是<strong>摆设文字</strong>，绝不参与扣费。</p>
+        shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><p class="eyebrow">REAL-TIME PRICING</p><h2>客户计费倍率</h2><p class="sub">真实扣费按<strong>上游全局倍率</strong>分两档：beibeihai / 北海 与 vip1129 / Codex 直连中转。默认只按上游账单 <code>actual_cost</code> 实时扣款：客户花销 = 上游实扣 × 对应上游全局倍率。估价结算默认关闭，避免估低亏本。</p>
+<div class="rate-block" style="margin:1rem 0;padding:1rem;border:1px solid rgba(255,255,255,.08);border-radius:12px"><h3 style="margin:0 0 .5rem">扣费方式</h3><label style="display:flex;align-items:flex-start;gap:.6rem;margin:.5rem 0"><input id="allowEstimate" type="checkbox" ${settings.allowEstimatedBilling ? 'checked' : ''}><span>允许估价结算（仅当拿不到上游 <code>actual_cost</code> 时）。<br><small class="sub">关闭时：只认上游实时实扣；实扣未到会挂起继续对齐，不会用价表定稿。</small></span></label><button class="primary-btn" id="saveEstimateMode">保存扣费方式</button></div>
 <div class="rate-block" style="margin:1rem 0;padding:1rem;border:1px solid rgba(255,255,255,.08);border-radius:12px"><h3 style="margin:0 0 .5rem">beibeihai / 北海 全局倍率</h3><p class="sub">绑定 <code>settings.billingMultiplier</code>，默认 <b>2.5x</b>。当前 <b>${esc(fmtRate(settings.multiplier))}x</b></p><div class="inline-form"><input id="customRate" type="number" min="0.01" max="10" step="0.01" value="${esc(fmtRate(settings.multiplier))}"><button class="primary-btn" id="saveCustomRate">保存北海倍率</button></div><p class="sub">快捷选择：</p><div class="rate-buttons" id="beibeiRates">${[1,1.5,2,2.5,3,4].map(rate=>`<button class="rate-btn ${rateEquals(settings.multiplier,rate)?'selected':''}" data-rate="${rate}" data-which="beibei">${fmtRate(rate)}x <small>北海</small></button>`).join('')}</div></div>
 <div class="rate-block" style="margin:1rem 0;padding:1rem;border:1px solid rgba(255,255,255,.08);border-radius:12px"><h3 style="margin:0 0 .5rem">vip1129 / Codex 直连中转 全局倍率</h3><p class="sub">绑定 <code>settings.billingMultiplierVip1129</code> / <code>settings.multiplierVip1129</code>，默认 <b>1.5x</b>。当前 <b>${esc(fmtRate(settings.multiplierVip1129 ?? 1.5))}x</b></p><div class="inline-form"><input id="customRateVip" type="number" min="0.01" max="10" step="0.01" value="${esc(fmtRate(settings.multiplierVip1129 ?? 1.5))}"><button class="primary-btn" id="saveCustomRateVip">保存 vip1129 倍率</button></div><p class="sub">快捷选择：</p><div class="rate-buttons" id="vipRates">${[1,1.5,2,2.5,3,4].map(rate=>`<button class="rate-btn ${rateEquals(settings.multiplierVip1129 ?? 1.5,rate)?'selected':''}" data-rate="${rate}" data-which="vip">${fmtRate(rate)}x <small>vip1129</small></button>`).join('')}</div></div>
 <p id="rateResult" class="inline-msg"></p><p class="sub">渠道列表（仅展示摆设倍率；真实扣费看上方对应上游全局倍率）：</p><div class="health-summary">${(settings.providers||[]).map(p=>`<div class="account-row"><span>${esc(p.name)}</span><b>展示倍率 ${esc(fmtRate(p.displayMultiplier))}x（摆设）· 真实扣费看上游全局倍率</b></div>`).join('')||'<p class="sub">暂无渠道。</p>'}</div></section>`);
@@ -1082,14 +1117,23 @@ async function renderOperations() {
             renderOperations();
           } catch (error) { $('#rateResult').textContent = error.message; $('#rateResult').className = 'inline-msg'; }
         });
+        $('#saveEstimateMode')?.addEventListener('click', async () => {
+          try {
+            await api('/api/admin/pricing', { method: 'PUT', body: JSON.stringify({ allowEstimatedBilling: !!$('#allowEstimate')?.checked }) });
+            $('#rateResult').textContent = $('#allowEstimate')?.checked ? '已开启估价结算（仅实扣缺失时）' : '已关闭估价结算，只按上游实扣扣费';
+            $('#rateResult').className = 'inline-msg ok';
+            renderOperations();
+          } catch (error) { $('#rateResult').textContent = error.message; $('#rateResult').className = 'inline-msg'; }
+        });
         $('#customRate')?.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); $('#saveCustomRate')?.click(); } });
         $('#customRateVip')?.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); $('#saveCustomRateVip')?.click(); } });
       } else {
-        shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<div class="admin-actions-bar"><div><p class="eyebrow">CHANNEL POOL</p><h2 style="margin:0">渠道管理</h2><p class="sub">填写上游地址和 API Key 后会自动同步模型；后台每小时自动探测渠道是否可用。</p></div><button class="primary-btn" id="addProvider">+ 添加渠道</button><button class="ghost-btn" id="probeHealth">立即探测渠道</button><button class="ghost-btn" id="syncAllModels">同步全部上游模型</button><button class="primary-btn" id="saveProviders">保存全部渠道</button><span id="providerResult" class="inline-msg"></span></div><div id="providersList">${adminProvidersCache.map((p, i) => providerFormHtml(p, i)).join('') || '<section class="card"><p class="sub">尚未配置渠道，请点击添加。</p></section>'}</div>`);
+        shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<div class="admin-actions-bar"><div><p class="eyebrow">CHANNEL POOL</p><h2 style="margin:0">渠道管理</h2><p class="sub">填写上游地址和 API Key 后会自动同步模型；后台每小时自动探测渠道是否可用。</p></div><button class="primary-btn" id="addProvider">+ 添加渠道</button><button class="ghost-btn" id="probeHealth">立即探测渠道</button><button class="ghost-btn" id="syncAllModels">同步全部上游模型</button><button class="primary-btn" id="saveProviders">保存全部渠道</button><span id="providerResult" class="inline-msg"></span></div><div id="providersList">${adminProvidersCache.map((p, i) => providerFormHtml(p, i, settings)).join('') || '<section class="card"><p class="sub">尚未配置渠道，请点击添加。</p></section>'}</div>`);
         wireProviderEditor();
       }
     } else if (adminTab === 'users') {
       const { users } = await api('/api/admin/users');
+      if (!stillCurrent()) return;
       shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><div class="card-head"><div><p class="eyebrow">USERS</p><h2>用户管理</h2><p class="sub">用户名和显示名称全站唯一。可加余额、减余额、改余额、封号。</p></div><span class="sub">${users.length} 位用户</span></div><div id="usersMsg" class="inline-msg"></div><table class="admin-table"><thead><tr><th>邮箱</th><th>用户名</th><th>名称</th><th>余额</th><th>配额</th><th>已用</th><th>角色</th><th>状态</th><th>操作</th></tr></thead><tbody>${users.map(u => `<tr data-user="${esc(u.id)}">
         <td>${esc(u.email)}</td>
         <td>@${esc(u.username||'-')}</td>
@@ -1143,6 +1187,7 @@ async function renderOperations() {
       });
     } else if (adminTab === 'codes') {
       const { codes } = await api('/api/admin/codes?limit=200');
+      if (!stillCurrent()) return;
       shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<div class="content-grid"><section class="card"><p class="eyebrow">GENERATE</p><h2>生成卡密</h2><form id="genCodesForm" class="stack-form"><label>数量<input name="count" type="number" min="1" max="200" value="5" required></label><label>金额 ¥<input name="amount" type="number" min="0" step="0.01" value="10" required></label><label>Token 配额<input name="quotaTokens" type="number" min="0" value="100000" required></label><label>前缀<input name="prefix" value="RELAY"></label><button class="primary-btn" type="submit">生成</button></form><div id="codesMsg" class="inline-msg"></div></section><section class="card"><p class="eyebrow">CODES</p><h2>卡密列表</h2><table class="admin-table"><thead><tr><th>卡密</th><th>金额</th><th>配额</th><th>状态</th><th>用户</th></tr></thead><tbody>${codes.slice().reverse().slice(0,100).map(c=>`<tr><td><code>${esc(c.code)}</code></td><td>¥${Number(c.amount).toFixed(2)}</td><td>${Number(c.quotaTokens).toLocaleString()}</td><td><span class="tag ${c.usedAt?'danger':'success'}">${c.usedAt?'已用':'未用'}</span></td><td>${esc(c.userId||'-')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无卡密</td></tr>'}</tbody></table></section></div>`);
       $('#genCodesForm')?.addEventListener('submit', async e => {
         e.preventDefault();
@@ -1164,9 +1209,11 @@ async function renderOperations() {
       });
     } else if (adminTab === 'audit') {
       const { entries } = await api('/api/admin/audit');
+      if (!stillCurrent()) return;
       shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><div class="card-head"><div><p class="eyebrow">AUDIT LOG</p><h2>最近审计</h2></div><span class="sub">最多 200 条</span></div><table class="admin-table"><thead><tr><th>时间</th><th>操作</th><th>目标</th><th>操作者</th><th>详情</th></tr></thead><tbody>${entries.map(e=>`<tr><td>${new Date(e.createdAt).toLocaleString('zh-CN')}</td><td>${esc(e.action)}</td><td>${esc(e.target||'-')}</td><td>${esc(e.actorId||'-')}</td><td><code class="detail-code">${esc(JSON.stringify(e.detail||{}))}</code></td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无审计记录</td></tr>'}</tbody></table></section>`);
     } else if (adminTab === 'errors') {
       const data = await api('/api/admin/site-errors');
+      if (!stillCurrent()) return;
       const errors = data.errors || [];
       const rows = errors.length ? errors.map(e => `
         <tr>
@@ -1186,15 +1233,16 @@ async function renderOperations() {
         <div class="table-wrap"><table class="data-table"><thead><tr><th>时间</th><th>来源/错误码</th><th>问题与解决</th></tr></thead><tbody>${rows}</tbody></table></div>
         <p class="sub" style="margin-top:8px">共 ${data.total||0} 条（最多保留 ${data.cap||200}）</p>
       </section>`);
-      $('#refreshErrorsBtn')?.addEventListener('click', () => renderAdmin());
+      $('#refreshErrorsBtn')?.addEventListener('click', () => renderOperations());
       $('#clearErrorsBtn')?.addEventListener('click', async () => {
         if (!confirm('确定清空全部网站错误记录？')) return;
         await api('/api/admin/site-errors', { method: 'DELETE' });
         toast('已清空');
-        renderAdmin();
+        renderOperations();
       });
     } else if (adminTab === 'diag') {
       const last = (await api('/api/admin/diagnostics/last').catch(()=>({}))).last;
+      if (!stillCurrent()) return;
       shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}
       <section class="card"><div class="card-head"><div><p class="eyebrow">DIAGNOSTICS</p><h2>诊断测试</h2>
         <p class="sub">一键测数据库、上游登录、分组映射、每个渠道能否对话（延迟 / 报错）、扣费与展示倍率、卡密库存与兑换拦截、收款码与支付。不会真的兑换卡密，也不会改用户余额。手机值班请打开 <a href="/admin-app/" target="_blank">/admin-app/</a> 或安装 APK。</p></div>
@@ -1223,6 +1271,7 @@ async function renderOperations() {
     
     } else if (adminTab === 'beibeihai') {
       const data = await api('/api/admin/upstream-beibeihai');
+      if (!stillCurrent()) return;
       const u = data.upstream || {};
       const groups = data.groups || [];
       const localGroups = data.localGroups || [];
@@ -1267,11 +1316,12 @@ async function renderOperations() {
         if (pw) body.password = pw;
         const j = await api('/api/admin/upstream-beibeihai', { method: 'PUT', body: JSON.stringify(body) });
         toast(j.probe && j.probe.ok ? 'Beibeihai 登录成功，已保存' : (j.probe && j.probe.error ? ('已保存，登录探测失败：'+j.probe.error) : '已保存'));
-        renderAdmin();
+        renderOperations();
       });
     
     } else if (adminTab === 'upstream') {
       const data = await api('/api/admin/upstream-vip1129');
+      if (!stillCurrent()) return;
       const u = data.upstream || {};
       const groups = data.groups || [];
       const localGroups = data.localGroups || [];
@@ -1316,11 +1366,12 @@ async function renderOperations() {
         if (pw) body.password = pw;
         const j = await api('/api/admin/upstream-vip1129', { method: 'PUT', body: JSON.stringify(body) });
         toast(j.probe && j.probe.ok ? '上游登录成功，已保存' : (j.probe && j.probe.error ? ('已保存，登录探测失败：'+j.probe.error) : '已保存'));
-        renderAdmin();
+        renderOperations();
       });
     
     } else if (adminTab === 'pool') {
       const stats = await api('/api/admin/code-pool');
+      if (!stillCurrent()) return;
       shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}
       <div class="metric-grid admin-finance">
         <article><small>今日收入</small><strong>¥${Number(stats.incomeToday||0).toFixed(2)}</strong><span class="green">付款领取卡密面额</span></article>
@@ -1409,6 +1460,7 @@ async function renderOperations() {
 
     } else if (adminTab === 'site') {
       const data = await api('/api/admin/site-settings');
+      if (!stillCurrent()) return;
       shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}
       <section class="card"><div class="card-head"><div><p class="eyebrow">SITE URL</p><h2>站点网址 / API 基础地址</h2>
         <p class="sub">给用户和客户端看的 Base URL。你上线域名后填这里；留空则自动用当前访问域名。上游中转地址（如 vip1129）在「渠道」里单独配置，不会展示给普通用户。</p></div></div>
@@ -1437,6 +1489,7 @@ async function renderOperations() {
       });
     } else if (adminTab === 'gateway') {
       const data = await api('/api/admin/payment-gateway');
+      if (!stillCurrent()) return;
       const g = data.gateway || {};
       shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}
       <section class="card"><div class="card-head"><div><p class="eyebrow">AGGREGATOR</p><h2>聚合支付（易支付兼容）</h2>
@@ -1477,6 +1530,7 @@ async function renderOperations() {
       });
     } else if (adminTab === 'payments') {
       const data = await api('/api/admin/payment-orders');
+      if (!stillCurrent()) return;
       const orders = data.orders || [];
       const methodText={wechat:'微信',alipay:'支付宝'};
       const statusText={awaiting_payment:'待支付',pending:'待核对',confirmed:'已确认',rejected:'已拒绝'};
@@ -1516,6 +1570,7 @@ async function renderOperations() {
       });
     } else if (adminTab === 'checkin') {
       const stats = await api('/api/admin/checkin');
+      if (!stillCurrent()) return;
       const recent = stats.recent || [];
       const rows = recent.map(r => `<tr><td>${esc(r.date)}</td><td>@${esc(r.username||'-')}</td><td>${esc(r.email||'-')}</td><td>¥${Number(r.amount||0).toFixed(2)}</td><td>${r.at?new Date(r.at).toLocaleString('zh-CN'):'-'}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">暂无签到记录</td></tr>';
       shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}
@@ -1529,6 +1584,7 @@ async function renderOperations() {
       <table class="admin-table"><thead><tr><th>日期</th><th>用户名</th><th>邮箱</th><th>金额</th><th>时间</th></tr></thead><tbody>${rows}</tbody></table></section>`);
     } else if (adminTab === 'orders') {
       const { orders } = await api('/api/admin/orders');
+      if (!stillCurrent()) return;
       shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><div class="card-head"><div><p class="eyebrow">ORDERS</p><h2>兑换订单</h2></div><span class="sub">${orders.length} 笔</span></div><table class="admin-table"><thead><tr><th>订单 ID</th><th>卡密</th><th>金额</th><th>配额</th><th>用户</th><th>兑换时间</th></tr></thead><tbody>${orders.map(o=>`<tr><td>${esc(o.id)}</td><td><code>${esc(o.code)}</code></td><td>¥${Number(o.amount).toFixed(2)}</td><td>${Number(o.quotaTokens).toLocaleString()}</td><td>${esc(o.userId||'-')}</td><td>${o.redeemedAt?new Date(o.redeemedAt).toLocaleString('zh-CN'):'-'}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">暂无订单</td></tr>'}</tbody></table></section>`);
     }
     page.querySelectorAll('[data-admin-tab]').forEach(btn => btn.onclick = () => { adminTab = btn.dataset.adminTab; renderOperations(); });
@@ -1555,6 +1611,8 @@ function wireProviderEditor() {
       models: [],
       inputPricePer1K: 0,
       outputPricePer1K: 0,
+      cacheReadPricePer1K: 0,
+      upstreamRateMultiplier: 1,
       priority: 100,
       billingMultiplier: 2.5,
       displayMultiplier: 0.2,
@@ -1610,7 +1668,7 @@ function wireProviderEditor() {
     adminProvidersCache[idx].modelPrices = adminProvidersCache[idx].modelPrices || {};
     let n = 1;
     while (adminProvidersCache[idx].modelPrices[`model-${n}`]) n += 1;
-    adminProvidersCache[idx].modelPrices[`model-${n}`] = { inputPricePer1K: 0, outputPricePer1K: 0 };
+    adminProvidersCache[idx].modelPrices[`model-${n}`] = { inputPricePer1K: 0, outputPricePer1K: 0, cacheReadPricePer1K: 0 };
     renderOperations();
   });
 

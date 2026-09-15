@@ -202,6 +202,19 @@ try {
     body: JSON.stringify({ multiplier: 0 })
   });
   assert.equal(rateBad.status, 400);
+  const estimateOn = await req('/api/admin/pricing', {
+    method: 'PUT',
+    headers: auth,
+    body: JSON.stringify({ allowEstimatedBilling: true })
+  });
+  assert.equal(estimateOn.status, 200, JSON.stringify(estimateOn.body));
+  assert.equal(estimateOn.body.allowEstimatedBilling, true);
+  const estimateOff = await req('/api/admin/pricing', {
+    method: 'PUT',
+    headers: auth,
+    body: JSON.stringify({ allowEstimatedBilling: false })
+  });
+  assert.equal(estimateOff.body.allowEstimatedBilling, false);
 
   const validInvite = await req('/api/auth/register', {
     method: 'POST',

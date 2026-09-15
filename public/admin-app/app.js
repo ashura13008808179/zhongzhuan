@@ -450,7 +450,8 @@ async function render(preloaded) {
         <label>站点公开地址<input id="pubUrl" value="${esc(site.publicBaseUrl || '')}" placeholder="https://你的域名"></label>
         <label>贝贝海全局倍率<input id="rate" type="number" min="0.01" max="10" step="0.01" value="${esc(pricing.multiplier)}"></label>
         <label>vip1129/Codex倍率<input id="rateVip" type="number" min="0.01" max="10" step="0.01" value="${esc(pricing.multiplierVip1129 ?? pricing.multiplier ?? 1.5)}"></label>
-        <p class="sub">渠道旁展示倍率=摆设，不参与扣费。客户花销=上游成本×对应上游全局倍率。</p>
+        <label style="display:flex;align-items:center;gap:10px"><input id="allowEstimate" type="checkbox" style="width:auto" ${pricing.allowEstimatedBilling ? 'checked' : ''}><span>允许估价结算（拿不到上游实扣时）</span></label>
+        <p class="sub">默认关闭估价。关闭后只按上游 actual_cost 实时扣费；实扣未到会挂起对齐，不会用价表定稿。</p>
         <button class="primary" id="saveSet">保存站点设置</button>
         <p class="sub" id="setMsg"></p>
         <label style="display:flex;align-items:center;gap:10px;margin-top:16px">
@@ -465,6 +466,7 @@ async function render(preloaded) {
           await api('/api/admin/site-settings', { method: 'PUT', body: JSON.stringify({ publicBaseUrl: $('#pubUrl').value.trim() }) });
           const body = { multiplier: Number($('#rate').value) };
           if ($('#rateVip')) body.multiplierVip1129 = Number($('#rateVip').value);
+          body.allowEstimatedBilling = !!$('#allowEstimate')?.checked;
           await api('/api/admin/pricing', { method: 'PUT', body: JSON.stringify(body) });
           msg.textContent = '已保存';
           msg.className = 'sub ok';

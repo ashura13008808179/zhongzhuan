@@ -12,6 +12,7 @@ import {
   listAvailableGroups as vip1129ListGroups,
   extractCreatedSecret as vip1129ExtractSecret,
   fetchAccount as vip1129FetchAccount,
+  fetchUsage as vip1129FetchUsage,
   isVip1129Provider,
   defaultGroupMap as vip1129DefaultGroupMap,
   normalizeBase as vip1129NormalizeBase,
@@ -25,6 +26,7 @@ import {
   listAvailableGroups as beibeihaiListGroups,
   extractCreatedSecret as beibeihaiExtractSecret,
   fetchAccount as beibeihaiFetchAccount,
+  fetchUsage as beibeihaiFetchUsage,
   isBeibeihaiProvider,
   defaultGroupMap as beibeihaiDefaultGroupMap,
   normalizeBase as beibeihaiNormalizeBase,
@@ -59,6 +61,30 @@ import {
   defaultDisplayMultiplier,
   resolveDisplayMultiplier
 } from './lib/relay-core.js';
+import {
+  modelPrice,
+  providerUpstreamRate,
+  resolveUpstreamCost,
+  estimatedCost,
+  billedTokensFromLog,
+  extractReportedUpstreamCost,
+  usageListFromPayload,
+  pickUpstreamUsageRow,
+  applyUpstreamUsageRow,
+  allowEstimatedBilling,
+  isPendingBillStatus
+} from './lib/billing-cost.js';
+import { liveChargeDelta, applyLiveMoneyCharge, settleRemainder, parkPendingHold, releasePendingHold, LIVE_POLL_INTERVAL_MS } from './lib/live-billing.js';
+import { catalogPrice, channelFallbackPrice } from './lib/upstream-prices.js';
+import {
+  messagesEndpointFromChatUrl,
+  normalizeAnthropicUsage,
+  mergeAnthropicStreamUsage,
+  anthropicStreamFinished,
+  anthropicContentToText,
+  anthropicToChatPayload,
+  chatCompletionToAnthropic as chatCompletionToAnthropicWire
+} from './lib/anthropic-wire.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, 'public');
@@ -634,6 +660,36 @@ function applyUpstreamGroupRates(db, kind, groups) {
   return changed;
 }
 
+/** Fill missing modelPrices from measured BASE catalog so estimates match upstream when actual_cost is late. */
+function ensureMeasuredPrices(db) {
+  let changed = 0;
+  for (const provider of db.settings?.providers || []) {
+    provider.modelPrices = provider.modelPrices && typeof provider.modelPrices === 'object' ? provider.modelPrices : {};
+    const models = [...new Set([provider.defaultModel, ...(provider.models || [])].filter(Boolean))];
+    for (const model of models) {
+      const current = provider.modelPrices[model];
+      const has = current && Number(current.inputPricePer1K) > 0 && Number(current.outputPricePer1K) > 0;
+      if (has) continue;
+      const cat = catalogPrice(model);
+      if (!cat) continue;
+      provider.modelPrices[model] = { ...cat };
+      changed += 1;
+    }
+    const generic = Number(provider.inputPricePer1K) === 0.01 && Number(provider.outputPricePer1K) === 0.03;
+    if (!Number(provider.inputPricePer1K) || generic) {
+      const fb = catalogPrice(provider.defaultModel) || channelFallbackPrice(provider.id);
+      if (fb) {
+        provider.inputPricePer1K = fb.inputPricePer1K;
+        provider.outputPricePer1K = fb.outputPricePer1K;
+        provider.cacheReadPricePer1K = fb.cacheReadPricePer1K;
+        if (fb.cacheWritePricePer1K) provider.cacheWritePricePer1K = fb.cacheWritePricePer1K;
+        changed += 1;
+      }
+    }
+  }
+  return changed;
+}
+
 async function autofillVip1129GroupMap(db, token = null) {
   const cfg = getVip1129Config(db);
   if (!cfg.enabled) return cfg;
@@ -781,24 +837,31 @@ function providerNeedsVip1129Sync(db, groupId) {
 
 async function snapshotUpstreamAccount(kind, db) {
   const isVip = kind === 'vip1129';
-  const auth = isVip ? await ensureVip1129Token(db) : await ensureBeibeihaiToken(db);
-  const view = isVip ? publicVip1129View(getVip1129Config(db)) : publicBeibeihaiView(getBeibeihaiConfig(db));
   const name = isVip ? 'vip1129' : 'beibeihai';
-  if (!auth.ok) return { name, ok: false, error: auth.error || 'login_failed', account: null, upstream: view };
-  const parsed = isVip
-    ? await vip1129FetchAccount(auth.cfg.baseUrl, auth.token)
-    : await beibeihaiFetchAccount(auth.cfg.baseUrl, auth.token);
-  const account = parseUpstreamAccount(parsed);
-  if (!parsed.ok || !account) {
-    return {
-      name,
-      ok: false,
-      error: parsed?.error || `HTTP ${parsed?.status || 0}`,
-      account: null,
-      upstream: view
-    };
+  const view = isVip ? publicVip1129View(getVip1129Config(db)) : publicBeibeihaiView(getBeibeihaiConfig(db));
+  try {
+    const auth = isVip ? await ensureVip1129Token(db) : await ensureBeibeihaiToken(db);
+    if (!auth.ok) return { name, ok: false, error: auth.error || 'login_failed', account: null, upstream: view };
+    const parsed = isVip
+      ? await vip1129FetchAccount(auth.cfg.baseUrl, auth.token)
+      : await beibeihaiFetchAccount(auth.cfg.baseUrl, auth.token);
+    const account = parseUpstreamAccount(parsed);
+    if (!parsed.ok || !account) {
+      return {
+        name,
+        ok: false,
+        error: parsed?.error || `HTTP ${parsed?.status || 0}`,
+        account: null,
+        upstream: view
+      };
+    }
+    return { name, ok: true, error: null, account, upstream: view };
+  } catch (err) {
+    const msg = /timeout|abort/i.test(String(err && err.name || '') + String(err && err.message || ''))
+      ? 'timeout'
+      : (err?.message || String(err));
+    return { name, ok: false, error: msg, account: null, upstream: view };
   }
-  return { name, ok: true, error: null, account, upstream: view };
 }
 
 async function syncCreateVip1129Key(db, user, localKey) {
@@ -1555,106 +1618,6 @@ function providersForModel(payload, db) {
 function providerFor(payload, db) {
   return providersForModel(payload, db)[0] || null;
 }
-function modelPrice(provider, model, kind) {
-  const prices = provider.modelPrices?.[model];
-  if (prices) {
-    const value = Number(prices[kind]);
-    if (Number.isFinite(value)) return value;
-  }
-  const fallback = Number(provider.pricePer1K || 0);
-  if (kind === 'inputPricePer1K') return Number(provider.inputPricePer1K ?? fallback);
-  if (kind === 'outputPricePer1K') return Number(provider.outputPricePer1K ?? fallback);
-  if (kind === 'cacheReadPricePer1K') {
-    const explicit = Number(provider.cacheReadPricePer1K);
-    if (Number.isFinite(explicit) && explicit >= 0) return explicit;
-    // OpenAI-style cache read ≈ 10% of input when upstream omits a dedicated price.
-    return modelPrice(provider, model, 'inputPricePer1K') * 0.1;
-  }
-  return Number(provider.outputPricePer1K ?? fallback);
-}
-/** Prefer real upstream bill fields when present (vip1129/beibeihai usage.*_cost). */
-function extractReportedUpstreamCost(usage) {
-  if (!usage || typeof usage !== 'object') return null;
-  const candidates = [
-    usage.actual_cost, usage.actualCost,
-    usage.total_cost, usage.totalCost,
-    usage.cost, usage.upstream_cost, usage.upstreamCost,
-    usage.billing_amount, usage.billingAmount,
-    usage.quota_cost, usage.quotaCost
-  ];
-  for (const c of candidates) {
-    const n = Number(c);
-    if (Number.isFinite(n) && n >= 0) return n;
-  }
-  return null;
-}
-/** Group rate_multiplier from vip1129/beibeihai; 1 when unset (prices already effective). */
-function providerUpstreamRate(provider) {
-  const n = Number(provider?.upstreamRateMultiplier);
-  return Number.isFinite(n) && n >= 0 ? n : 1;
-}
-/**
- * Base token cost BEFORE group rate_multiplier.
- * Uses prompt_tokens_details.cached_tokens when present (chat usage often folds cache into prompt_tokens).
- */
-function estimateBaseUpstreamCost(provider, usage, model) {
-  const resolvedModel = model || provider.defaultModel || '';
-  const inputPrice = modelPrice(provider, resolvedModel, 'inputPricePer1K');
-  const outputPrice = modelPrice(provider, resolvedModel, 'outputPricePer1K');
-  const cachePrice = modelPrice(provider, resolvedModel, 'cacheReadPricePer1K');
-  const cacheWritePrice = modelPrice(provider, resolvedModel, 'cacheWritePricePer1K');
-  const prompt = Math.max(0, Number(usage?.prompt_tokens ?? usage?.input_tokens ?? 0) || 0);
-  const completion = Math.max(0, Number(usage?.completion_tokens ?? usage?.output_tokens ?? 0) || 0);
-  const cachedRaw = Number(
-    usage?.prompt_tokens_details?.cached_tokens ??
-    usage?.input_tokens_details?.cached_tokens ??
-    usage?.cache_read_input_tokens ??
-    usage?.cache_read_tokens ??
-    usage?.cached_tokens ??
-    0
-  ) || 0;
-  const cacheWriteRaw = Number(
-    usage?.cache_creation_input_tokens ??
-    usage?.cache_creation_tokens ??
-    usage?.cache_write_tokens ??
-    usage?.input_tokens_details?.cache_write_tokens ??
-    usage?.input_tokens_details?.cache_creation_tokens ??
-    usage?.prompt_tokens_details?.cache_write_tokens ??
-    0
-  ) || 0;
-  // OpenAI-style: cache is folded into prompt/input_tokens → subtract.
-  // vip1129 usage-style: input_tokens is fresh-only and cache_read_tokens is separate → add.
-  let cacheTokens;
-  let freshInput;
-  if (cachedRaw > prompt && prompt > 0) {
-    freshInput = prompt;
-    cacheTokens = cachedRaw;
-  } else {
-    cacheTokens = Math.min(prompt, Math.max(0, cachedRaw));
-    freshInput = Math.max(0, prompt - cacheTokens);
-  }
-  const writeTokens = Math.max(0, cacheWriteRaw);
-  const writePrice = Number.isFinite(Number(cacheWritePrice)) && Number(cacheWritePrice) > 0
-    ? Number(cacheWritePrice)
-    : inputPrice;
-  return (freshInput / 1000) * inputPrice
-    + (cacheTokens / 1000) * cachePrice
-    + (writeTokens / 1000) * writePrice
-    + (completion / 1000) * outputPrice;
-}
-/** Real upstream bill when reported; else base×upstreamRateMultiplier (NOT displayMultiplier). */
-function resolveUpstreamCost(provider, usage, model) {
-  const reported = extractReportedUpstreamCost(usage);
-  if (reported != null) return { cost: reported, source: 'reported' };
-  const cost = estimateBaseUpstreamCost(provider, usage, model) * providerUpstreamRate(provider);
-  return { cost, source: 'estimated' };
-}
-function providerCost(provider, usage, model) {
-  return resolveUpstreamCost(provider, usage, model).cost;
-}
-function estimatedCost(provider, inputTokens, outputTokens, model) {
-  return providerCost(provider, { prompt_tokens: inputTokens, completion_tokens: outputTokens }, model);
-}
 function safetyBuffer(provider, rate, model) {
   const input = modelPrice(provider, model || provider.defaultModel || '', 'inputPricePer1K');
   const output = modelPrice(provider, model || provider.defaultModel || '', 'outputPricePer1K');
@@ -1674,6 +1637,16 @@ function isNearlyEmptyBalance(user, provider, rate, model) {
   const bal = Math.max(0, Number(user?.balance || 0));
   const need = Math.max(LOW_BALANCE_FLOOR, minimalReplyCost(provider, rate, model) * 2);
   return bal < need;
+}
+function availableUserBalance(user, apiKeyRec = null) {
+  let availableBalance = Math.max(0, (user.balance || 0) - (user.reservedBalance || 0) - (user.pendingActualHold || 0));
+  if (apiKeyRec && apiKeyRec.spendLimit > 0) {
+    availableBalance = Math.min(
+      availableBalance,
+      Math.max(0, apiKeyRec.spendLimit - (apiKeyRec.spendUsed || 0) - (apiKeyRec.reservedSpend || 0) - (apiKeyRec.pendingActualHold || 0))
+    );
+  }
+  return availableBalance;
 }
 function requestTooLargeMessage() {
   return '当前余额不够完成本次较大请求，请缩短上下文或稍后再试；余额快用完时才会提示充值。';
@@ -1748,6 +1721,15 @@ function updateProviderHealth(db, providerId, ok, errorMessage = null) {
     lastCheckedAt: new Date().toISOString(),
     lastError: ok ? null : String(errorMessage || 'upstream_error').slice(0, 300)
   };
+}
+
+function copyProviderHealth(fromDb, toDb) {
+  const src = fromDb?.settings?.providers || [];
+  const dst = toDb?.settings?.providers || [];
+  for (const p of src) {
+    const t = dst.find((x) => x && p && x.id === p.id);
+    if (t && p.health) t.health = p.health;
+  }
 }
 
 async function probeProviderHealth(db, provider) {
@@ -1872,37 +1854,179 @@ async function probeProviderChat(db, provider) {
   }
 }
 
-function settleUsage(db, user, provider, usage, rate, tokenReservation, amountReservation, started, model, status = 'success', apiKeyRec = null) {
+const claimedUpstreamUsageIds = new Set();
+const liveUsageListCache = new Map();
+
+function pruneClaimedUsageIds() {
+  if (claimedUpstreamUsageIds.size <= 800) return;
+  const extra = claimedUpstreamUsageIds.size - 400;
+  let dropped = 0;
+  for (const old of claimedUpstreamUsageIds) {
+    claimedUpstreamUsageIds.delete(old);
+    dropped += 1;
+    if (dropped >= extra) break;
+  }
+}
+
+function rememberClaimedUsageId(id) {
+  if (id == null || id === '') return;
+  claimedUpstreamUsageIds.add(String(id));
+  pruneClaimedUsageIds();
+}
+
+function tryClaimUsageId(id) {
+  if (id == null || id === '') return false;
+  const key = String(id);
+  if (claimedUpstreamUsageIds.has(key)) return false;
+  claimedUpstreamUsageIds.add(key);
+  pruneClaimedUsageIds();
+  return true;
+}
+
+async function fetchUsageListForLookup(db, kind, query, { timeoutMs = 20000, cacheKey = '', cacheMs = 0 } = {}) {
+  if (cacheKey && cacheMs > 0) {
+    const hit = liveUsageListCache.get(cacheKey);
+    if (hit?.list && Date.now() - hit.at < cacheMs) return hit.list;
+    if (hit?.pending) return hit.pending;
+  }
+  const pending = (async () => {
+    const auth = kind === 'vip1129' ? await ensureVip1129Token(db) : await ensureBeibeihaiToken(db);
+    if (!auth.ok) return [];
+    const fetchUsage = kind === 'vip1129' ? vip1129FetchUsage : beibeihaiFetchUsage;
+    const parsed = await fetchUsage(auth.cfg.baseUrl, auth.token, query, { timeoutMs });
+    if (!parsed?.ok) return [];
+    const list = usageListFromPayload(parsed.data);
+    if (cacheKey) liveUsageListCache.set(cacheKey, { at: Date.now(), list, pending: null });
+    return list;
+  })().catch(() => []);
+  if (cacheKey) {
+    const prev = liveUsageListCache.get(cacheKey);
+    liveUsageListCache.set(cacheKey, { at: prev?.at || 0, list: prev?.list || null, pending });
+  }
+  return pending;
+}
+
+async function lookupUpstreamUsageRow(db, provider, apiKeyRec, usage, meta = {}) {
+  const kind = isVip1129Provider(provider) ? 'vip1129' : (isBeibeihaiProvider(provider) ? 'beibeihai' : null);
+  if (!kind) return null;
+  const live = meta.live === true;
+  const apiKeyId = apiKeyRec?.upstream?.id;
+  const timeoutMs = live ? 4000 : 20000;
+  const pageSize = live ? 20 : 80;
+  const cacheMs = live ? Math.max(200, LIVE_POLL_INTERVAL_MS - 100) : 0;
+  const queries = [];
+  if (apiKeyId != null && apiKeyId !== '') {
+    queries.push({
+      query: `page=1&page_size=${pageSize}&api_key_id=${encodeURIComponent(apiKeyId)}`,
+      cacheKey: live ? `${kind}:${apiKeyId}` : ''
+    });
+  }
+  if (!live) queries.push({ query: `page=1&page_size=${pageSize}`, cacheKey: '' });
+  if (!queries.length) return null;
+  let list = [];
+  for (const item of queries) {
+    list = await fetchUsageListForLookup(db, kind, item.query, {
+      timeoutMs,
+      cacheKey: item.cacheKey,
+      cacheMs
+    });
+    if (list.length) break;
+  }
+  if (!list.length) return null;
+  if (meta.knownId != null && meta.knownId !== '') {
+    const hit = list.find((row) => row && String(row.id) === String(meta.knownId));
+    if (hit) return hit;
+  }
+  const usedIds = [
+    ...claimedUpstreamUsageIds,
+    ...(db.logs || []).filter((l) => l.upstreamUsageId != null && !l.pendingActual).map((l) => l.upstreamUsageId)
+  ].filter((id) => meta.knownId == null || meta.knownId === '' || String(id) !== String(meta.knownId));
+  const row = pickUpstreamUsageRow(list, {
+    apiKeyId,
+    model: meta.model,
+    usage,
+    startedAt: meta.started,
+    usedIds,
+    now: Date.now(),
+    clientRequestId: meta.clientRequestId,
+    preferNewest: live === true,
+    lookbackMs: live ? 5000 : 180000
+  });
+  const cost = Number(row?.actual_cost);
+  const localTok = Number(usage?.total_tokens || 0)
+    || ((Number(usage?.prompt_tokens || 0) || 0) + (Number(usage?.completion_tokens || 0) || 0));
+  const upTok = (Number(row?.input_tokens || 0) || 0)
+    + (Number(row?.output_tokens || 0) || 0)
+    + (Number(row?.cache_read_tokens || 0) || 0);
+  if (row && localTok > 0 && upTok === 0 && !(Number.isFinite(cost) && cost > 0)) return null;
+  return row || null;
+}
+
+async function attachActualUpstreamCost(db, provider, apiKeyRec, usage, meta = {}) {
+  if (!usage || typeof usage !== 'object') return usage;
+  try {
+    if (usage.upstreamUsageId != null) {
+      const row = await lookupUpstreamUsageRow(db, provider, apiKeyRec, usage, { ...meta, knownId: usage.upstreamUsageId });
+      if (row && Number.isFinite(Number(row.actual_cost))) {
+        applyUpstreamUsageRow(usage, row);
+        return usage;
+      }
+    }
+    if (extractReportedUpstreamCost(usage) != null && meta.refresh !== true) return usage;
+    const kind = isVip1129Provider(provider) ? 'vip1129' : (isBeibeihaiProvider(provider) ? 'beibeihai' : null);
+    if (!kind) return usage;
+    for (let attempt = 0; attempt < 12; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 300 + 250 * attempt));
+      const row = await lookupUpstreamUsageRow(db, provider, apiKeyRec, usage, meta);
+      const cost = Number(row?.actual_cost);
+      if (row && Number.isFinite(cost) && cost >= 0) {
+        rememberClaimedUsageId(row.id);
+        applyUpstreamUsageRow(usage, row);
+        return usage;
+      }
+    }
+  } catch {
+    return usage;
+  }
+  return usage;
+}
+
+function settleUsage(db, user, provider, usage, rate, tokenReservation, amountReservation, started, model, status = 'success', apiKeyRec = null, extras = {}) {
   const upstreamTokens = Math.max(0, Number(usage.total_tokens || ((usage.prompt_tokens || 0) + (usage.completion_tokens || 0))));
-  const billedTokens = Math.min(upstreamTokens * rate, tokenReservation);
-  const resolvedUp = resolveUpstreamCost(provider, usage, model);
-  const upstreamCost = resolvedUp.cost;
-  const upstreamCostSource = resolvedUp.source;
-  // rate 为上游专用全局倍率（beibeihai→billingMultiplier，vip1129→billingMultiplierVip1129），由 providerMultiplier 选出；渠道 displayMultiplier/billingMultiplier 为摆设，不参与。
-  // upstreamCost 已对齐上游实扣（reported actual_cost，或 base×upstreamRateMultiplier）。
-  const chargedAmount = upstreamCost * rate;
+  const extraTokens = upstreamTokens * rate;
+  const billedTokens = tokenReservation > 0 ? Math.min(extraTokens, tokenReservation) : extraTokens;
+  const allowEstimate = extras.allowEstimate != null ? extras.allowEstimate : allowEstimatedBilling(db);
+  const resolvedUp = resolveUpstreamCost(provider, usage, model, { allowEstimate });
+  const alreadyCharged = Math.max(0, Number(extras.alreadyCharged) || 0);
+  const pending = resolvedUp.source === 'pending' && isPendingBillStatus(status);
+  const upstreamCost = pending ? 0 : resolvedUp.cost;
+  const upstreamCostSource = pending ? 'pending' : resolvedUp.source;
+  const chargedAmount = pending ? alreadyCharged : upstreamCost * rate;
+  const extraCharge = pending ? 0 : settleRemainder(chargedAmount, alreadyCharged);
   user.reservedTokens = Math.max(0, (user.reservedTokens || 0) - tokenReservation);
   user.reservedBalance = Math.max(0, (user.reservedBalance || 0) - amountReservation);
+  if (pending) parkPendingHold(user, apiKeyRec, amountReservation);
+  let collected = extraCharge;
   if (isUnlimited(user)) {
     user.usedTokens = (user.usedTokens || 0) + billedTokens;
-    // Admin / unlimited: do not deduct local balance; upstream billing is the real limit
     user.accountActive = true;
   } else {
+    const bal = Math.max(0, Number(user.balance) || 0);
+    collected = Math.min(bal, extraCharge);
     user.usedTokens = (user.usedTokens || 0) + billedTokens;
-    user.balance = Math.max(0, (user.balance || 0) - chargedAmount);
+    user.balance = Math.max(0, bal - collected);
   }
   if (apiKeyRec && !isUnlimited(user)) {
     apiKeyRec.reservedTokens = Math.max(0, (apiKeyRec.reservedTokens || 0) - tokenReservation);
     apiKeyRec.reservedSpend = Math.max(0, (apiKeyRec.reservedSpend || 0) - amountReservation);
     apiKeyRec.tokenUsed = (apiKeyRec.tokenUsed || 0) + billedTokens;
-    apiKeyRec.spendUsed = (apiKeyRec.spendUsed || 0) + chargedAmount;
+    apiKeyRec.spendUsed = (apiKeyRec.spendUsed || 0) + collected;
     if (apiKeyRec.tokenLimit > 0) apiKeyRec.tokenUsed = Math.min(apiKeyRec.tokenLimit, apiKeyRec.tokenUsed);
     if (apiKeyRec.spendLimit > 0) apiKeyRec.spendUsed = Math.min(apiKeyRec.spendLimit, apiKeyRec.spendUsed);
   } else if (apiKeyRec) {
     apiKeyRec.reservedTokens = Math.max(0, (apiKeyRec.reservedTokens || 0) - tokenReservation);
     apiKeyRec.reservedSpend = Math.max(0, (apiKeyRec.reservedSpend || 0) - amountReservation);
   }
-  // Only lock when nearly empty. Never wipe remaining yuan just to force a top-up.
   if (!isUnlimited(user) && isNearlyEmptyBalance(user, provider, rate, model)) {
     user.accountActive = false;
   }
@@ -1917,13 +2041,19 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
     upstreamCost,
     upstreamCostSource,
     chargedAmount,
+    alreadyCharged,
+    holdAmount: pending ? Math.max(0, Number(amountReservation) || 0) : 0,
+    pendingActual: pending,
     multiplier: rate,
+    upstreamUsageId: usage?.upstreamUsageId ?? null,
+    clientRequestId: extras.clientRequestId || usage?.clientRequestId || null,
     latency: Date.now() - started,
-    status,
+    startedAt: new Date(started).toISOString(),
+    status: pending ? 'pending_actual_cost' : status,
     createdAt: new Date().toISOString()
   });
   db.logs = db.logs.slice(0, 3000);
-  return { billedTokens, chargedAmount, upstreamTokens, upstreamCost, upstreamCostSource };
+  return { billedTokens, chargedAmount, upstreamTokens, upstreamCost, upstreamCostSource, pending };
 }
 function releaseReserve(user, tokenReservation, amountReservation, apiKeyRec = null) {
   user.reservedTokens = Math.max(0, (user.reservedTokens || 0) - tokenReservation);
@@ -1933,6 +2063,181 @@ function releaseReserve(user, tokenReservation, amountReservation, apiKeyRec = n
     apiKeyRec.reservedSpend = Math.max(0, (apiKeyRec.reservedSpend || 0) - amountReservation);
   }
 }
+
+function startLiveBillSession({ db, user, provider, apiKeyRec, model, started, rate, reservation, onBroke, clientRequestId = '' }) {
+  const unlimited = isUnlimited(user);
+  const state = {
+    lastCost: 0,
+    liveCharged: 0,
+    usageId: null,
+    stopped: false,
+    ticking: false,
+    finalized: false,
+    clientRequestId: String(clientRequestId || '')
+  };
+  let persistTimer = null;
+  const persistNow = () => {
+    if (persistTimer) {
+      clearTimeout(persistTimer);
+      persistTimer = null;
+    }
+    writeDb(db);
+  };
+  const persistSoon = () => {
+    if (persistTimer) return;
+    persistTimer = setTimeout(() => {
+      persistTimer = null;
+      if (!state.finalized) writeDb(db);
+    }, 800);
+  };
+  const tick = async () => {
+    if (state.stopped || state.ticking) return;
+    state.ticking = true;
+    try {
+      const hint = state.usageId != null ? { upstreamUsageId: state.usageId, actual_cost: state.lastCost } : {};
+      const row = await lookupUpstreamUsageRow(db, provider, apiKeyRec, hint, {
+        model,
+        started,
+        knownId: state.usageId,
+        live: true,
+        clientRequestId: state.clientRequestId
+      });
+      if (!row) return;
+      const cost = Number(row.actual_cost);
+      if (!Number.isFinite(cost) || cost < 0) return;
+      if (state.usageId == null && row.id != null) {
+        if (!tryClaimUsageId(row.id)) return;
+        state.usageId = row.id;
+      }
+      const deltaCharge = liveChargeDelta(state.lastCost, cost, rate);
+      if (deltaCharge > 0) {
+        const { broke, applied } = applyLiveMoneyCharge(user, apiKeyRec, deltaCharge, reservation, unlimited);
+        state.liveCharged += applied;
+        state.lastCost = cost;
+        if (broke) {
+          user.accountActive = false;
+          persistNow();
+          if (typeof onBroke === 'function') onBroke();
+        } else {
+          persistSoon();
+        }
+      } else if (cost > state.lastCost) {
+        state.lastCost = cost;
+      }
+    } catch {
+      /* ignore poll errors */
+    } finally {
+      state.ticking = false;
+    }
+  };
+  tick();
+  const timer = setInterval(tick, LIVE_POLL_INTERVAL_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  return {
+    state,
+    stop() {
+      state.stopped = true;
+      clearInterval(timer);
+    },
+    async finalize(usage, status = 'success') {
+      this.stop();
+      if (state.finalized) return;
+      state.finalized = true;
+      if (persistTimer) {
+        clearTimeout(persistTimer);
+        persistTimer = null;
+      }
+      const waitUntil = Date.now() + 2500;
+      while (state.ticking && Date.now() < waitUntil) {
+        await new Promise((r) => setTimeout(r, 30));
+      }
+      const billUsage = usage && typeof usage === 'object' ? usage : {};
+      if (state.usageId != null) billUsage.upstreamUsageId = state.usageId;
+      if (state.clientRequestId) billUsage.clientRequestId = state.clientRequestId;
+      if (state.lastCost > 0 && extractReportedUpstreamCost(billUsage) == null) {
+        billUsage.actual_cost = state.lastCost;
+      }
+      await attachActualUpstreamCost(db, provider, apiKeyRec, billUsage, {
+        model,
+        started,
+        refresh: true,
+        clientRequestId: state.clientRequestId,
+        knownId: state.usageId
+      });
+      if (state.usageId != null) billUsage.upstreamUsageId = state.usageId;
+      if (state.lastCost > 0 && extractReportedUpstreamCost(billUsage) == null) {
+        billUsage.actual_cost = state.lastCost;
+      }
+      settleUsage(
+        db, user, provider, billUsage, rate,
+        reservation.tokenReservation, reservation.amountReservation,
+        started, billUsage.model || model, status, apiKeyRec,
+        { alreadyCharged: state.liveCharged, clientRequestId: state.clientRequestId }
+      );
+      writeDb(db);
+    }
+  };
+}
+
+async function reconcilePendingActualCosts(db) {
+  const pending = (db.logs || []).filter((log) => log?.pendingActual === true || log?.status === 'pending_actual_cost');
+  if (!pending.length) return 0;
+  let settled = 0;
+  for (const log of pending) {
+    const user = (db.users || []).find((u) => u.id === log.userId);
+    const provider = (db.settings?.providers || []).find((p) => p.id === log.providerId);
+    if (!user || !provider) continue;
+    const apiKeyRec = (user.apiKeys || []).find((k) => k.id === log.apiKeyId) || null;
+    const created = Date.parse(log.createdAt) || Date.now();
+    const latency = Math.max(0, Number(log.latency) || 0);
+    const started = Date.parse(log.startedAt) || (created - latency) || created;
+    const usage = { upstreamUsageId: log.upstreamUsageId };
+    const row = await lookupUpstreamUsageRow(db, provider, apiKeyRec, usage, {
+      model: log.model,
+      started,
+      knownId: log.upstreamUsageId,
+      clientRequestId: log.clientRequestId
+    });
+    const cost = Number(row?.actual_cost);
+    if (!row || !Number.isFinite(cost) || cost <= 0) continue;
+    const rate = Number(log.multiplier) || providerMultiplier(provider, db);
+    const chargedAmount = cost * rate;
+    const already = Math.max(0, Number(log.alreadyCharged || log.chargedAmount) || 0);
+    const extra = settleRemainder(chargedAmount, already);
+    const hold = Math.max(0, Number(log.holdAmount) || 0);
+    let taken = extra;
+    if (!isUnlimited(user)) {
+      const bal = Math.max(0, Number(user.balance) || 0);
+      taken = Math.min(bal, extra);
+      user.balance = Math.max(0, bal - taken);
+      if (apiKeyRec) {
+        apiKeyRec.spendUsed = (apiKeyRec.spendUsed || 0) + taken;
+        if (apiKeyRec.spendLimit > 0) apiKeyRec.spendUsed = Math.min(apiKeyRec.spendLimit, apiKeyRec.spendUsed);
+      }
+    }
+    if (!isUnlimited(user) && taken + 1e-12 < extra) {
+      log.alreadyCharged = already + taken;
+      log.chargedAmount = already + taken;
+      log.upstreamCost = cost;
+      log.upstreamCostSource = 'reported';
+      log.upstreamUsageId = row.id ?? log.upstreamUsageId;
+      continue;
+    }
+    releasePendingHold(user, apiKeyRec, hold);
+    rememberClaimedUsageId(row.id);
+    log.upstreamCost = cost;
+    log.upstreamCostSource = 'reported';
+    log.chargedAmount = chargedAmount;
+    log.upstreamUsageId = row.id ?? log.upstreamUsageId;
+    log.pendingActual = false;
+    log.status = 'success';
+    log.reconciledAt = new Date().toISOString();
+    log.holdAmount = 0;
+    settled += 1;
+  }
+  return settled;
+}
+
 function estimateTokensFromText(text) {
   if (!text) return 0;
   return Math.max(1, Math.ceil(String(text).length / 4));
@@ -2049,14 +2354,28 @@ async function ensureUpstreamProbeKey(db, provider, { forceNew = false } = {}) {
   return String(provider?.apiKey || '').trim();
 }
 
-async function fetchUpstream(provider, payload, outputBudget, model, overrideApiKey = null) {
+function billingRequestHeaders(bearer, extra = {}, clientRequestId = '') {
+  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer}`, ...extra };
+  const rid = String(clientRequestId || '').trim();
+  if (rid) {
+    headers['X-Request-Id'] = rid;
+    headers['X-Client-Request-Id'] = rid;
+  }
+  return headers;
+}
+
+async function fetchUpstream(provider, payload, outputBudget, model, overrideApiKey = null, abortHolder = null, clientRequestId = '') {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), provider.timeoutMs || 60000);
+  if (abortHolder) abortHolder.abort = () => { try { controller.abort(); } catch { /* ignore */ } };
+  const waitMs = payload && payload.stream
+    ? Math.min(Math.max(Number(provider.timeoutMs) || 0, 180000), 300000)
+    : (provider.timeoutMs || 60000);
+  const timeout = setTimeout(() => controller.abort(), waitMs);
   const bearer = String(overrideApiKey || provider.apiKey || '').trim();
   try {
     const upstream = await fetch(provider.url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer}` },
+      headers: billingRequestHeaders(bearer, {}, clientRequestId),
       body: JSON.stringify({ ...payload, model: model || payload.model || provider.defaultModel, max_tokens: outputBudget }),
       signal: controller.signal
     });
@@ -2125,10 +2444,11 @@ function normalizeResponsesUsage(usage) {
   return out;
 }
 
-async function fetchUpstreamResponses(provider, payload, model, overrideApiKey = null) {
+async function fetchUpstreamResponses(provider, payload, model, overrideApiKey = null, abortHolder = null, clientRequestId = '') {
   const controller = new AbortController();
-  // Responses tool rounds can be longer than chat, but cap so failover stays responsive.
-  const waitMs = Math.min(Math.max(Number(provider.timeoutMs) || 60000, 15000), 90000);
+  if (abortHolder) abortHolder.abort = () => { try { controller.abort(); } catch { /* ignore */ } };
+  // Ignore the 60s chat timeoutMs: Codex tool rounds need several minutes.
+  const waitMs = Math.min(Math.max(Number(provider.timeoutMs) || 0, 180000), 300000);
   const timeout = setTimeout(() => controller.abort(), waitMs);
   const bearer = String(overrideApiKey || provider.apiKey || '').trim();
   const endpoint = responsesEndpointFromChatUrl(provider.url);
@@ -2143,7 +2463,46 @@ async function fetchUpstreamResponses(provider, payload, model, overrideApiKey =
     delete body.messages;
     return await fetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer}` },
+      headers: billingRequestHeaders(bearer, {}, clientRequestId),
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchUpstreamMessages(provider, payload, model, overrideApiKey = null, extraHeaders = {}, abortHolder = null, clientRequestId = '') {
+  const controller = new AbortController();
+  if (abortHolder) abortHolder.abort = () => { try { controller.abort(); } catch { /* ignore */ } };
+  const waitMs = Math.min(Math.max(Number(provider.timeoutMs) || 0, 180000), 300000);
+  const timeout = setTimeout(() => controller.abort(), waitMs);
+  const bearer = String(overrideApiKey || provider.apiKey || '').trim();
+  const endpoint = messagesEndpointFromChatUrl(provider.url);
+  if (!endpoint) {
+    clearTimeout(timeout);
+    throw new Error('missing_messages_endpoint');
+  }
+  try {
+    const body = { ...payload, model: model || payload.model || provider.defaultModel };
+    delete body.max_output_tokens;
+    const headers = {
+      'Content-Type': 'application/json',
+      Accept: extraHeaders.accept || extraHeaders.Accept || 'application/json',
+      Authorization: `Bearer ${bearer}`,
+      'x-api-key': bearer,
+      'anthropic-version': extraHeaders['anthropic-version'] || extraHeaders['Anthropic-Version'] || '2023-06-01'
+    };
+    const beta = extraHeaders['anthropic-beta'] || extraHeaders['Anthropic-Beta'];
+    if (beta) headers['anthropic-beta'] = beta;
+    const rid = String(clientRequestId || '').trim();
+    if (rid) {
+      headers['X-Request-Id'] = rid;
+      headers['X-Client-Request-Id'] = rid;
+    }
+    return await fetch(endpoint, {
+      method: 'POST',
+      headers,
       body: JSON.stringify(body),
       signal: controller.signal
     });
@@ -2284,66 +2643,8 @@ function chatCompletionToResponse(result) {
 }
 
 
-function anthropicContentToText(content) {
-  if (content == null) return '';
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) {
-    if (typeof content === 'object' && typeof content.text === 'string') return content.text;
-    return '';
-  }
-  return content.map((part) => {
-    if (typeof part === 'string') return part;
-    if (!part || typeof part !== 'object') return '';
-    if (part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') {
-      return typeof part.text === 'string' ? part.text : '';
-    }
-    if (typeof part.text === 'string') return part.text;
-    return '';
-  }).join('');
-}
-
-function anthropicToChatPayload(raw) {
-  const messages = [];
-  if (raw && raw.system != null) {
-    const sys = anthropicContentToText(raw.system);
-    if (sys) messages.push({ role: 'system', content: sys });
-  }
-  const src = Array.isArray(raw && raw.messages) ? raw.messages : [];
-  for (const m of src) {
-    if (!m || typeof m !== 'object') continue;
-    const role = m.role === 'assistant' ? 'assistant' : (m.role === 'system' ? 'system' : 'user');
-    const text = anthropicContentToText(m.content);
-    if (!text) continue;
-    messages.push({ role, content: text });
-  }
-  const payload = {
-    model: raw && raw.model,
-    messages,
-    stream: raw && raw.stream === true
-  };
-  if (raw && raw.temperature !== undefined) payload.temperature = raw.temperature;
-  if (raw && raw.max_tokens != null) payload.max_tokens = raw.max_tokens;
-  return payload;
-}
-
 function chatCompletionToAnthropic(result) {
-  const choice = result && result.choices && result.choices[0];
-  const text = anthropicContentToText(choice && choice.message ? choice.message.content : '');
-  const usage = (result && result.usage) || {};
-  const stop = (choice && choice.finish_reason === 'length') ? 'max_tokens' : 'end_turn';
-  return {
-    id: (result && result.id) ? String(result.id).replace(/^chatcmpl[-_]?/i, 'msg_') : id('msg'),
-    type: 'message',
-    role: 'assistant',
-    model: (result && result.model) || '',
-    content: [{ type: 'text', text }],
-    stop_reason: stop,
-    stop_sequence: null,
-    usage: {
-      input_tokens: Number(usage.prompt_tokens) || 0,
-      output_tokens: Number(usage.completion_tokens) || 0
-    }
-  };
+  return chatCompletionToAnthropicWire(result, id);
 }
 
 function writeAnthropicSse(res, event, payload) {
@@ -2399,10 +2700,7 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
     writeDb(db);
   } else {
     // Spending quota is account balance. Token 配额不再单独拦请求。
-    let availableBalance = Math.max(0, (user.balance || 0) - (user.reservedBalance || 0));
-    if (apiKeyRec && apiKeyRec.spendLimit > 0) {
-      availableBalance = Math.min(availableBalance, Math.max(0, apiKeyRec.spendLimit - (apiKeyRec.spendUsed || 0) - (apiKeyRec.reservedSpend || 0)));
-    }
+    let availableBalance = availableUserBalance(user, apiKeyRec);
     const safety = safetyBuffer(primary, rate, model);
     const inputEstimate = estimatedCost(primary, inputReserve, 0, model) * rate;
     const outputUnitPrice = Math.max(modelPrice(primary, model, 'outputPricePer1K') / 1000 * rate, Number.EPSILON);
@@ -2477,7 +2775,9 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
         lastError = new Error('missing_proxy_key');
         continue;
       }
-      const upstream = await fetchUpstream(provider, upstreamPayload, outputBudget, model || provider.defaultModel, proxyKey);
+      const abortHolder = {};
+      const clientRequestId = `client:${id('req')}`;
+      const upstream = await fetchUpstream(provider, upstreamPayload, outputBudget, model || provider.defaultModel, proxyKey, abortHolder, clientRequestId);
       if (!upstream.ok) {
         const errText = await upstream.text().catch(() => '');
         updateProviderHealth(db, provider.id, false, `HTTP ${upstream.status}: ${errText.slice(0, 120)}`);
@@ -2490,9 +2790,17 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
       updateProviderHealth(db, provider.id, true);
       writeDb(db);
 
+      const settledModel = model || provider.defaultModel;
+      const reservation = { tokenReservation, amountReservation };
+      const live = startLiveBillSession({
+        db, user, provider, apiKeyRec, model: settledModel, started, rate, reservation,
+        clientRequestId,
+        onBroke() { try { abortHolder.abort?.(); } catch { /* ignore */ } }
+      });
+
       if (wantStream) {
         return streamChat(req, res, db, user, provider, upstream, {
-          model: model || provider.defaultModel,
+          model: settledModel,
           rate,
           tokenReservation,
           amountReservation,
@@ -2500,7 +2808,11 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
           inputReserve,
           apiKeyRec,
           responsesApi: !!req._responsesApi,
-          anthropicApi: !!req._anthropicApi
+          anthropicApi: !!req._anthropicApi,
+          abortHolder,
+          live,
+          reservation,
+          clientRequestId
         });
       }
 
@@ -2512,12 +2824,13 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
         updateProviderHealth(db, provider.id, false, 'invalid_json');
         writeDb(db);
         lastError = new Error('invalid_json');
-        continue;
+        await live.finalize({}, 'invalid_json');
+        return fail(res, 502, '模型服务暂时不可用，请稍后重试');
       }
 
       const usage = result.usage || {};
-      settleUsage(db, user, provider, usage, providerMultiplier(provider, db), tokenReservation, amountReservation, started, result.model || model || provider.defaultModel, 'success', apiKeyRec);
-      writeDb(db);
+      const billedModel = result.model || settledModel;
+      await live.finalize(usage, 'success');
       if (req._responsesApi) return json(res, 200, chatCompletionToResponse(result));
       if (req._anthropicApi) return json(res, 200, chatCompletionToAnthropic(result));
       if (req._geminiApi) {
@@ -2548,8 +2861,15 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
 async function streamChat(req, res, db, user, provider, upstream, ctx) {
   const {
     model, rate, tokenReservation, amountReservation, started, inputReserve,
-    apiKeyRec = null, responsesApi = false, anthropicApi = false
+    apiKeyRec = null, responsesApi = false, anthropicApi = false,
+    abortHolder = null, live = null, reservation = null, clientRequestId = ''
   } = ctx;
+  const hold = reservation || { tokenReservation, amountReservation };
+  const billing = live || startLiveBillSession({
+    db, user, provider, apiKeyRec, model, started, rate, reservation: hold,
+    clientRequestId,
+    onBroke() { try { abortHolder?.abort?.(); } catch { /* ignore */ } }
+  });
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-store',
@@ -2566,29 +2886,15 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
   const seqRef = { n: 0 };
   let responsesStarted = false;
   let anthropicStarted = false;
+  const toolAcc = [];
+  let streamFinishReason = '';
 
   const cleanup = (reason = 'abort') => {
     if (settled) return;
     settled = true;
     aborted = true;
-    releaseReserve(user, tokenReservation, amountReservation, apiKeyRec);
-    db.logs.unshift({
-      id: id('log'),
-      userId: user.id,
-      apiKeyId: apiKeyRec?.id || null,
-      model,
-      providerId: provider.id,
-      tokens: 0,
-      billedTokens: 0,
-      upstreamCost: 0,
-      chargedAmount: 0,
-      multiplier: rate,
-      latency: Date.now() - started,
-      status: reason,
-      createdAt: new Date().toISOString()
-    });
-    db.logs = db.logs.slice(0, 3000);
-    writeDb(db);
+    try { abortHolder?.abort?.(); } catch { /* ignore */ }
+    Promise.resolve(billing.finalize(usage || {}, reason)).catch(() => {});
     try { res.end(); } catch { /* ignore */ }
   };
 
@@ -2642,6 +2948,18 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
       try {
         const parsed = JSON.parse(data);
         if (parsed.usage) usage = parsed.usage;
+        const finish = parsed.choices?.[0]?.finish_reason;
+        if (finish) streamFinishReason = finish;
+        const tcs = parsed.choices?.[0]?.delta?.tool_calls;
+        if (Array.isArray(tcs)) {
+          for (const tc of tcs) {
+            const idx = Number.isInteger(tc.index) ? tc.index : toolAcc.length;
+            if (!toolAcc[idx]) toolAcc[idx] = { id: '', name: '', arguments: '' };
+            if (tc.id) toolAcc[idx].id = tc.id;
+            if (tc.function?.name) toolAcc[idx].name = tc.function.name;
+            if (typeof tc.function?.arguments === 'string') toolAcc[idx].arguments += tc.function.arguments;
+          }
+        }
         const delta = parsed.choices?.[0]?.delta?.content;
         if (typeof delta === 'string') {
           completionText += delta;
@@ -2735,16 +3053,33 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
   }
 
   settled = true;
-  settleUsage(db, user, provider, usage, providerMultiplier(provider, db), tokenReservation, amountReservation, started, model, 'success', apiKeyRec);
-  writeDb(db);
+  await billing.finalize(usage, 'success');
 
   if (anthropicApi) {
     writeAnthropicSse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+    const tools = toolAcc.filter(Boolean);
+    let nextIndex = 1;
+    for (const tc of tools) {
+      let input = {};
+      try { input = tc.arguments ? JSON.parse(tc.arguments) : {}; } catch { input = { raw: tc.arguments }; }
+      writeAnthropicSse(res, 'content_block_start', {
+        type: 'content_block_start',
+        index: nextIndex,
+        content_block: { type: 'tool_use', id: tc.id || id('toolu'), name: tc.name || 'tool', input: {} }
+      });
+      writeAnthropicSse(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: nextIndex,
+        delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) }
+      });
+      writeAnthropicSse(res, 'content_block_stop', { type: 'content_block_stop', index: nextIndex });
+      nextIndex += 1;
+    }
     const outTok = Number(usage.completion_tokens) || 0;
-    const inTok = Number(usage.prompt_tokens) || 0;
+    const stopReason = tools.length || streamFinishReason === 'tool_calls' ? 'tool_use' : 'end_turn';
     writeAnthropicSse(res, 'message_delta', {
       type: 'message_delta',
-      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      delta: { stop_reason: stopReason, stop_sequence: null },
       usage: { output_tokens: outTok }
     });
     writeAnthropicSse(res, 'message_stop', { type: 'message_stop' });
@@ -3039,30 +3374,35 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/api/dashboard') {
     if (!user) return fail(res, 401, '未登录');
     const logs = db.logs.filter(x => x.userId === user.id && x.status !== 'referral_rebate' && x.status !== CHECKIN_LOG_STATUS);
-    const totalTokens = logs.reduce((sum, x) => sum + Number(x.tokens || 0), 0);
+    const billedTokens = logs.reduce((sum, x) => sum + billedTokensFromLog(x), 0);
     // 累计花销 = 该用户 API 日志 chargedAmount 合计（已是上游成本×对应上游全局倍率后的实扣）
     const totalSpent = logs.reduce((sum, x) => {
       const c = Number(x.chargedAmount || 0);
       return sum + (Number.isFinite(c) && c > 0 ? c : 0);
     }, 0);
     const avgLatency = logs.length ? Math.round(logs.reduce((sum, x) => sum + x.latency, 0) / logs.length) : 0;
-    const displayLogs = logs.slice(0, 30).map(x => ({
-      id: x.id,
-      model: x.model,
-      tokens: Number(x.tokens || 0),
-      latency: x.latency,
-      status: x.status,
-      createdAt: x.createdAt
-    }));
+    const displayLogs = logs.slice(0, 30).map(x => {
+      const billed = billedTokensFromLog(x);
+      return {
+        id: x.id,
+        model: x.model,
+        tokens: billed,
+        billedTokens: billed,
+        chargedAmount: Number(x.chargedAmount || 0),
+        latency: x.latency,
+        status: x.status,
+        createdAt: x.createdAt
+      };
+    });
     return json(res, 200, {
       user: safeUser(user),
       stats: {
         requests: logs.length,
-        tokens: totalTokens,
+        billedTokens: Math.round(billedTokens * 100) / 100,
         avgLatency,
         success: logs.filter(x => x.status === 'success').length,
         quotaTokens: user.quotaTokens || 0,
-        usedTokens: totalTokens,
+        usedTokens: Math.round(billedTokens * 100) / 100,
         availableTokens: availableTokens(user),
         totalSpent: Math.round(totalSpent * 10000) / 10000
       },
@@ -3856,6 +4196,7 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, {
       multiplier: multiplier(db),
       multiplierVip1129: multiplierVip1129(db),
+      allowEstimatedBilling: allowEstimatedBilling(db),
       defaultProviderId: db.settings.defaultProviderId || null,
       providers: (db.settings.providers || []).map(publicProvider),
       healthSummary: (db.settings.providers || []).map(p => ({
@@ -3873,7 +4214,17 @@ const server = http.createServer(async (req, res) => {
     const out = {};
     const hasBeibei = p?.multiplier != null || p?.billingMultiplier != null;
     const hasVip = p?.multiplierVip1129 != null || p?.billingMultiplierVip1129 != null;
-    if (!hasBeibei && !hasVip) return fail(res, 400, '请提供 multiplier 和/或 multiplierVip1129');
+    const hasEstimate = p?.allowEstimatedBilling != null;
+    if (!hasBeibei && !hasVip && !hasEstimate) return fail(res, 400, '请提供 multiplier、multiplierVip1129 或 allowEstimatedBilling');
+    if (hasEstimate) {
+      const next = p.allowEstimatedBilling === true || p.allowEstimatedBilling === 'true' || p.allowEstimatedBilling === 1 || p.allowEstimatedBilling === '1';
+      const prev = db.settings.allowEstimatedBilling === true;
+      db.settings.allowEstimatedBilling = next;
+      if (prev !== next) {
+        audit(db, { actorId: user.id, action: 'pricing.change', target: 'allowEstimatedBilling', detail: { from: prev, to: next } });
+      }
+      out.allowEstimatedBilling = next;
+    }
     if (hasBeibei) {
       const parsed = normalizeBillingMultiplier(p?.multiplier ?? p?.billingMultiplier);
       if (!parsed.ok) return fail(res, 400, parsed.error);
@@ -3895,6 +4246,7 @@ const server = http.createServer(async (req, res) => {
     writeDb(db);
     if (out.multiplier == null) out.multiplier = multiplier(db);
     if (out.multiplierVip1129 == null) out.multiplierVip1129 = multiplierVip1129(db);
+    if (out.allowEstimatedBilling == null) out.allowEstimatedBilling = allowEstimatedBilling(db);
     return json(res, 200, out);
   }
 
@@ -4138,15 +4490,263 @@ const server = http.createServer(async (req, res) => {
   }
 
 
-  if (req.method === 'POST' && (url.pathname === '/v1/messages' || url.pathname === '/v1/messages/')) {
+  if (req.method === 'POST' && (url.pathname === '/v1/messages/count_tokens' || url.pathname === '/v1/messages/count_tokens/')) {
     if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
     const apiKey = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     const found = findByApiSecret(db, apiKey);
     if (!found) return fail(res, 401, '无效的 Relay API Key');
     const raw = await body(req);
     if (raw == null) return fail(res, 400, 'invalid json');
+    const pseudoPayload = { model: raw.model, messages: [{ role: 'user', content: 'x' }] };
+    const provider = (providersForModel(pseudoPayload, db).filter(providerSupportsResponsesPassthrough)[0])
+      || (db.settings.providers || []).find(p => p.enabled !== false && (isBeibeihaiProvider(p) || isVip1129Provider(p)));
+    if (!provider) return json(res, 200, { input_tokens: Math.max(1, Math.ceil(JSON.stringify(raw).length / 4)) });
+    const proxyKey = await ensureProxyApiKey(db, found.user, provider, found.key);
+    const msgEp = messagesEndpointFromChatUrl(provider.url);
+    const countEp = String(msgEp).replace(/\/messages$/i, '/messages/count_tokens');
+    try {
+      const bearer = String(proxyKey || provider.apiKey || '').trim();
+      const upstream = await fetch(countEp, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${bearer}`,
+          'x-api-key': bearer,
+          'anthropic-version': req.headers['anthropic-version'] || '2023-06-01'
+        },
+        body: JSON.stringify(raw),
+        signal: AbortSignal.timeout(15000)
+      });
+      const text = await upstream.text();
+      if (!upstream.ok) {
+        return json(res, 200, { input_tokens: Math.max(1, Math.ceil(JSON.stringify(raw).length / 4)) });
+      }
+      res.writeHead(upstream.status, { 'Content-Type': upstream.headers.get('content-type') || 'application/json; charset=utf-8' });
+      return res.end(text);
+    } catch {
+      return json(res, 200, { input_tokens: Math.max(1, Math.ceil(JSON.stringify(raw).length / 4)) });
+    }
+  }
+
+  if (req.method === 'POST' && /\/messages\/?$/.test(url.pathname) && !/count_tokens/.test(url.pathname)) {
+    if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
+    const apiKey = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const found = findByApiSecret(db, apiKey);
+    if (!found) return fail(res, 401, '无效的 Relay API Key');
+    const raw = await body(req);
+    if (raw == null) return fail(res, 400, 'invalid json');
+    const user = found.user;
+    const apiKeyRec = found.key;
+    if (apiKeyRec && apiKeyRec.enabled === false) return fail(res, 403, '该 API 密钥已停用');
+    if (isBanned(user)) return fail(res, 403, '账号已被封禁');
+    if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
+    scrubStuckReserves(user, apiKeyRec);
+
+    const pseudoPayload = { model: raw.model, messages: [{ role: 'user', content: 'x' }] };
+    const allCandidates = providersForModel(pseudoPayload, db);
+    const passthroughCandidates = allCandidates.filter(providerSupportsResponsesPassthrough).slice(0, 2);
+    const candidates = passthroughCandidates.length ? passthroughCandidates : allCandidates.slice(0, 1);
+    if (!candidates.length) return fail(res, 503, '模型服务暂不可用，请稍后再试');
+    const primary = candidates[0];
+    const model = String(raw.model || primary.defaultModel || '');
+    if (apiKeyRec && Array.isArray(apiKeyRec.models) && apiKeyRec.models.length && model && !apiKeyRec.models.includes(model)) {
+      return fail(res, 400, '该密钥未授权使用此模型');
+    }
+    const rate = providerMultiplier(primary, db);
+    const inputReserve = Math.ceil(JSON.stringify(raw).length / 3) + 256;
+    const requestedOutput = Math.max(1, Math.min(Number(raw.max_tokens) || DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOKENS));
+    if (apiKeyRec && !keyRateOk(res, apiKeyRec, inputReserve + requestedOutput)) return;
+
+    let tokenReservation = 0;
+    let amountReservation = 0;
+    let outputBudget = requestedOutput;
+    if (isUnlimited(user)) {
+      outputBudget = requestedOutput;
+      user.accountActive = true;
+      writeDb(db);
+    } else {
+      let availableBalance = availableUserBalance(user, apiKeyRec);
+      const safety = safetyBuffer(primary, rate, model);
+      const inputEstimate = estimatedCost(primary, inputReserve, 0, model) * rate;
+      const outputUnitPrice = Math.max(modelPrice(primary, model, 'outputPricePer1K') / 1000 * rate, Number.EPSILON);
+      const moneyBudget = Math.floor(Math.max(0, availableBalance - safety - inputEstimate) / outputUnitPrice);
+      outputBudget = Math.min(requestedOutput, moneyBudget);
+      if (apiKeyRec && apiKeyRec.tokenLimit > 0) {
+        const keyLeft = Math.max(0, apiKeyRec.tokenLimit - (apiKeyRec.tokenUsed || 0) - (apiKeyRec.reservedTokens || 0));
+        outputBudget = Math.min(outputBudget, Math.max(0, Math.floor(keyLeft / rate) - inputReserve));
+      }
+      if (outputBudget < 1) {
+        const minCost = minimalReplyCost(primary, rate, model) + estimatedCost(primary, inputReserve, 0, model) * rate + safety;
+        if (availableBalance >= minCost) {
+          outputBudget = MIN_REPLY_TOKENS;
+        } else {
+          const keyTokenBlocked = apiKeyRec?.tokenLimit > 0 && moneyBudget >= 1;
+          if (keyTokenBlocked) return fail(res, 402, '该密钥 Token 额度不足');
+          if (apiKeyRec?.spendLimit > 0) return fail(res, 402, '该密钥花费额度不足');
+          return fail(res, 402, isNearlyEmptyBalance({ balance: availableBalance }, primary, rate, model)
+            ? insufficientBalanceMessage()
+            : requestTooLargeMessage());
+        }
+      }
+      const upstreamReservation = inputReserve + outputBudget;
+      tokenReservation = upstreamReservation * rate;
+      amountReservation = estimatedCost(primary, inputReserve, outputBudget, model) * rate;
+      if (availableBalance < amountReservation + safety) {
+        const affordOut = Math.max(0, Math.floor(Math.max(0, availableBalance - safety - estimatedCost(primary, inputReserve, 0, model) * rate) / outputUnitPrice));
+        if (affordOut >= MIN_REPLY_TOKENS) {
+          outputBudget = Math.min(outputBudget, affordOut);
+          tokenReservation = (inputReserve + outputBudget) * rate;
+          amountReservation = estimatedCost(primary, inputReserve, outputBudget, model) * rate;
+        } else if (apiKeyRec?.spendLimit > 0) {
+          return fail(res, 402, '该密钥花费额度不足');
+        } else {
+          return fail(res, 402, isNearlyEmptyBalance({ balance: availableBalance }, primary, rate, model)
+            ? insufficientBalanceMessage()
+            : requestTooLargeMessage());
+        }
+      }
+      user.reservedTokens = (user.reservedTokens || 0) + tokenReservation;
+      user.reservedBalance = (user.reservedBalance || 0) + amountReservation;
+      if (apiKeyRec) {
+        apiKeyRec.reservedTokens = (apiKeyRec.reservedTokens || 0) + tokenReservation;
+        apiKeyRec.reservedSpend = (apiKeyRec.reservedSpend || 0) + amountReservation;
+      }
+      writeDb(db);
+    }
+
+    const started = Date.now();
+    const wantStream = raw.stream === true;
+    const forward = { ...raw };
+    forward.model = model;
+    forward.max_tokens = outputBudget;
+    delete forward.max_output_tokens;
+    let lastError = null;
+
+    for (const provider of candidates) {
+      try {
+        const proxyKey = await ensureProxyApiKey(db, user, provider, apiKeyRec);
+        if (!proxyKey) {
+          lastError = new Error('missing_proxy_key');
+          continue;
+        }
+        const abortHolder = {};
+        const clientRequestId = `client:${id('req')}`;
+        const upstream = await fetchUpstreamMessages(provider, forward, model, proxyKey, req.headers, abortHolder, clientRequestId);
+        if (!upstream.ok) {
+          const errText = await upstream.text().catch(() => '');
+          updateProviderHealth(db, provider.id, false, `messages HTTP ${upstream.status}: ${errText.slice(0, 120)}`);
+          writeDb(db);
+          lastError = new Error(`messages_${upstream.status}`);
+          if (upstream.status === 404 || upstream.status === 405) break;
+          continue;
+        }
+        updateProviderHealth(db, provider.id, true);
+        writeDb(db);
+
+        const reservation = { tokenReservation, amountReservation };
+        const live = startLiveBillSession({
+          db, user, provider, apiKeyRec, model, started, rate, reservation,
+          clientRequestId,
+          onBroke() { try { abortHolder.abort?.(); } catch { /* ignore */ } }
+        });
+
+        if (wantStream) {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-store',
+            Connection: 'keep-alive'
+          });
+          let settled = false;
+          let usageAcc = {};
+          let buffer = '';
+          let sawCompleted = false;
+          const cleanup = (reason = 'abort') => {
+            if (settled) return;
+            settled = true;
+            try { abortHolder.abort?.(); } catch { /* ignore */ }
+            Promise.resolve(live.finalize(normalizeAnthropicUsage(usageAcc), reason)).catch(() => {});
+            try { res.end(); } catch { /* ignore */ }
+          };
+          req.on('close', () => { if (!settled) cleanup('client_abort'); });
+          const scrape = (chunkText) => {
+            buffer += chunkText;
+            const parts = buffer.split('\n');
+            buffer = parts.pop() || '';
+            for (const line of parts) {
+              const trimmed = line.trim();
+              if (!trimmed.startsWith('data:')) continue;
+              const data = trimmed.slice(5).trim();
+              if (!data) continue;
+              try {
+                const parsed = JSON.parse(data);
+                usageAcc = mergeAnthropicStreamUsage(usageAcc, parsed);
+                if (anthropicStreamFinished(parsed, data)) sawCompleted = true;
+              } catch { /* ignore */ }
+            }
+          };
+          try {
+            const reader = upstream.body?.getReader?.();
+            if (!reader) {
+              for await (const chunk of upstream.body) {
+                if (settled) break;
+                const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+                scrape(text);
+                res.write(typeof chunk === 'string' ? chunk : Buffer.from(chunk));
+              }
+            } else {
+              const decoder = new TextDecoder();
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (settled) break;
+                const text = decoder.decode(value, { stream: true });
+                scrape(text);
+                res.write(Buffer.from(value));
+              }
+            }
+          } catch {
+            if (!settled) cleanup('stream_error');
+            return;
+          }
+          if (settled) return;
+          if (!sawCompleted) {
+            cleanup('stream_incomplete');
+            return;
+          }
+          const usage = normalizeAnthropicUsage(usageAcc);
+          settled = true;
+          await live.finalize(usage, 'success');
+          try { res.end(); } catch { /* ignore */ }
+          return;
+        }
+
+        const text = await upstream.text();
+        let result;
+        try { result = JSON.parse(text); } catch {
+          lastError = new Error('invalid_json');
+          live.stop();
+          continue;
+        }
+        if (result && (result.type === 'error' || result.error)) {
+          lastError = new Error(result.error?.message || result.message || 'anthropic_error');
+          live.stop();
+          continue;
+        }
+        const usage = normalizeAnthropicUsage(result.usage || {});
+        const settledModel = result.model || model;
+        await live.finalize(usage, 'success');
+        return json(res, 200, result);
+      } catch (err) {
+        lastError = err;
+        continue;
+      }
+    }
+
+    releaseReserve(user, tokenReservation, amountReservation, apiKeyRec);
+    writeDb(db);
     const payload = anthropicToChatPayload(raw);
-    if (!payload.messages.length) return fail(res, 400, 'messages 不能为空');
+    if (!payload.messages.length) return fail(res, 400, lastError?.message || 'messages 不能为空');
+    if (outputBudget) payload.max_tokens = outputBudget;
     req._anthropicApi = true;
     return chat(req, res, db, found.user, found.key, payload);
   }
@@ -4215,10 +4815,7 @@ const server = http.createServer(async (req, res) => {
       user.accountActive = true;
       writeDb(db);
     } else {
-      let availableBalance = Math.max(0, (user.balance || 0) - (user.reservedBalance || 0));
-      if (apiKeyRec && apiKeyRec.spendLimit > 0) {
-        availableBalance = Math.min(availableBalance, Math.max(0, apiKeyRec.spendLimit - (apiKeyRec.spendUsed || 0) - (apiKeyRec.reservedSpend || 0)));
-      }
+      let availableBalance = availableUserBalance(user, apiKeyRec);
       const safety = safetyBuffer(primary, rate, model);
       const inputEstimate = estimatedCost(primary, inputReserve, 0, model) * rate;
       const outputUnitPrice = Math.max(modelPrice(primary, model, 'outputPricePer1K') / 1000 * rate, Number.EPSILON);
@@ -4285,7 +4882,9 @@ const server = http.createServer(async (req, res) => {
           lastError = new Error('missing_proxy_key');
           continue;
         }
-        const upstream = await fetchUpstreamResponses(provider, forward, model, proxyKey);
+        const abortHolder = {};
+        const clientRequestId = `client:${id('req')}`;
+        const upstream = await fetchUpstreamResponses(provider, forward, model, proxyKey, abortHolder, clientRequestId);
         if (!upstream.ok) {
           const errText = await upstream.text().catch(() => '');
           updateProviderHealth(db, provider.id, false, `responses HTTP ${upstream.status}: ${errText.slice(0, 120)}`);
@@ -4298,6 +4897,13 @@ const server = http.createServer(async (req, res) => {
         updateProviderHealth(db, provider.id, true);
         writeDb(db);
 
+        const reservation = { tokenReservation, amountReservation };
+        const live = startLiveBillSession({
+          db, user, provider, apiKeyRec, model, started, rate, reservation,
+          clientRequestId,
+          onBroke() { try { abortHolder.abort?.(); } catch { /* ignore */ } }
+        });
+
         if (wantStream) {
           res.writeHead(200, {
             'Content-Type': 'text/event-stream; charset=utf-8',
@@ -4307,17 +4913,12 @@ const server = http.createServer(async (req, res) => {
           let settled = false;
           let usage = null;
           let buffer = '';
+          let sawCompleted = false;
           const cleanup = (reason = 'abort') => {
             if (settled) return;
             settled = true;
-            releaseReserve(user, tokenReservation, amountReservation, apiKeyRec);
-            db.logs.unshift({
-              id: id('log'), userId: user.id, apiKeyId: apiKeyRec?.id || null, model,
-              providerId: provider.id, tokens: 0, billedTokens: 0, upstreamCost: 0, chargedAmount: 0,
-              multiplier: rate, latency: Date.now() - started, status: reason, createdAt: new Date().toISOString()
-            });
-            db.logs = db.logs.slice(0, 3000);
-            writeDb(db);
+            try { abortHolder.abort?.(); } catch { /* ignore */ }
+            Promise.resolve(live.finalize(usage || {}, reason)).catch(() => {});
             try { res.end(); } catch { /* ignore */ }
           };
           req.on('close', () => { if (!settled) cleanup('client_abort'); });
@@ -4329,9 +4930,15 @@ const server = http.createServer(async (req, res) => {
               const trimmed = line.trim();
               if (!trimmed.startsWith('data:')) continue;
               const data = trimmed.slice(5).trim();
-              if (!data || data === '[DONE]') continue;
+              if (!data || data === '[DONE]') {
+                if (data === '[DONE]') sawCompleted = true;
+                continue;
+              }
               try {
                 const parsed = JSON.parse(data);
+                if (parsed.type === 'response.completed' || parsed.response?.status === 'completed') {
+                  sawCompleted = true;
+                }
                 const u = parsed.response?.usage || parsed.usage || (parsed.type === 'response.completed' ? parsed.response?.usage : null);
                 if (u) usage = normalizeResponsesUsage(u);
               } catch { /* ignore */ }
@@ -4362,6 +4969,10 @@ const server = http.createServer(async (req, res) => {
             return;
           }
           if (settled) return;
+          if (!sawCompleted) {
+            cleanup('stream_incomplete');
+            return;
+          }
           if (!usage) {
             usage = {
               prompt_tokens: inputReserve,
@@ -4372,8 +4983,7 @@ const server = http.createServer(async (req, res) => {
             usage = normalizeResponsesUsage(usage);
           }
           settled = true;
-          settleUsage(db, user, provider, usage, providerMultiplier(provider, db), tokenReservation, amountReservation, started, model, 'success', apiKeyRec);
-          writeDb(db);
+          await live.finalize(usage, 'success');
           try { res.end(); } catch { /* ignore */ }
           return;
         }
@@ -4382,11 +4992,12 @@ const server = http.createServer(async (req, res) => {
         let result;
         try { result = JSON.parse(text); } catch {
           lastError = new Error('invalid_json');
+          live.stop();
           continue;
         }
         const usage = normalizeResponsesUsage(result.usage || {});
-        settleUsage(db, user, provider, usage, providerMultiplier(provider, db), tokenReservation, amountReservation, started, result.model || model, 'success', apiKeyRec);
-        writeDb(db);
+        const settledModel = result.model || model;
+        await live.finalize(usage, 'success');
         return json(res, 200, result);
       } catch (err) {
         lastError = err;
@@ -4445,6 +5056,7 @@ initial.siteErrors ??= [];
 ensureSiteErrors(initial);
 initial.settings.billingMultiplier ??= DEFAULT_MULTIPLIER;
 initial.settings.billingMultiplierVip1129 ??= DEFAULT_VIP1129_BILLING_MULTIPLIER;
+initial.settings.allowEstimatedBilling = initial.settings.allowEstimatedBilling === true;
 initial.settings.paymentQrs ??= {};
 ensurePaymentQrs(initial);
 initial.settings.paymentQrMeta ??= {
@@ -4507,6 +5119,7 @@ for (const user of initial.users) {
   user.usedTokens ??= 0;
   user.reservedTokens ??= 0;
   user.reservedBalance ??= 0;
+  user.pendingActualHold ??= 0;
   user.accountActive ??= (user.balance || 0) > 0;
   user.banned ??= false;
   user.checkInBonus ??= 0;
@@ -4531,6 +5144,7 @@ for (const provider of initial.settings.providers) {
     provider.cacheReadPricePer1K = Math.max(0, Number(provider.inputPricePer1K || 0) * 0.1);
   }
 }
+ensureMeasuredPrices(initial);
 if (!initial.settings.providers.length && LEGACY_UPSTREAM.url && LEGACY_UPSTREAM.apiKey) {
   initial.settings.providers.push({
     id: 'primary',
@@ -4574,6 +5188,9 @@ if (process.env.RELAY_TEST_NO_LISTEN !== '1') {
     console.error('[启动失败]', err);
     process.exit(1);
   });
+  server.requestTimeout = 0;
+  server.headersTimeout = 0;
+  server.timeout = 0;
   server.listen(PORT, () => {
     const addr = server.address();
     const actual = typeof addr === 'object' && addr ? addr.port : PORT;
@@ -4595,6 +5212,16 @@ if (process.env.RELAY_TEST_NO_LISTEN !== '1') {
         }
         const healthResults = await probeAllProviderHealth(bootDb);
         writeDb(bootDb);
+        try {
+          const fresh = readDb();
+          const n = await reconcilePendingActualCosts(fresh);
+          if (n) {
+            writeDb(fresh);
+            console.log(`Pending actual_cost reconciled: ${n}`);
+          }
+        } catch (err) {
+          console.warn('Boot actual_cost reconcile skipped:', err.message || err);
+        }
         const ok = healthResults.filter(r => r.ok && !r.skipped).length;
         const bad = healthResults.filter(r => !r.ok);
         console.log(`Channel health probe: ${ok} ok, ${bad.length} down (of ${healthResults.length})`);
@@ -4607,19 +5234,29 @@ if (process.env.RELAY_TEST_NO_LISTEN !== '1') {
     setInterval(async () => {
       try {
         const dbx = readDb();
-        let changed = false;
-        const added = topUpCodePools(dbx, CODE_POOL_TARGET);
-        if (added) {
-          changed = true;
-          console.log(`[pool] periodic refill +${added}`);
+        const n = await reconcilePendingActualCosts(dbx);
+        if (n) {
+          writeDb(dbx);
+          console.log(`[billing] reconciled ${n} pending actual_cost rows`);
         }
+      } catch (err) {
+        console.error('[billing] pending actual_cost reconcile failed:', err);
+      }
+    }, 12 * 1000);
+
+    setInterval(async () => {
+      try {
+        const dbx = readDb();
         const healthResults = await probeAllProviderHealth(dbx);
-        changed = true;
+        const fresh = readDb();
+        copyProviderHealth(dbx, fresh);
+        const added = topUpCodePools(fresh, CODE_POOL_TARGET);
+        if (added) console.log(`[pool] periodic refill +${added}`);
+        writeDb(fresh);
         const ok = healthResults.filter(r => r.ok && !r.skipped).length;
         const bad = healthResults.filter(r => !r.ok);
         console.log(`[health] hourly probe: ${ok} ok, ${bad.length} down`);
         for (const r of bad) console.warn(`[health] down ${r.name}: ${r.error}`);
-        if (changed) writeDb(dbx);
       } catch (err) {
         console.error('[pool/models] periodic job failed:', err);
       }
