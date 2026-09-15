@@ -9,8 +9,8 @@ android {
         applicationId "com.relaystation.admin"
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        versionCode 3
+        versionName "1.2"
     }
     buildTypes {
         release {
@@ -34,3 +34,4 @@ dependencies {
     implementation "androidx.webkit:webkit:1.10.0"
     implementation "com.google.android.material:material:1.11.0"
 }
+

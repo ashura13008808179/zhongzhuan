@@ -7,6 +7,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.webkit.JavascriptInterface
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -47,6 +49,7 @@ class MainActivity : AppCompatActivity() {
         prefs = Prefs(this)
         Notifier.ensureChannels(this)
         requestNotifyPermission()
+        maybeAskBatteryOptimization()
 
         web = WebView(this)
         setContentView(web)
@@ -90,6 +93,11 @@ class MainActivity : AppCompatActivity() {
         else loadApp()
     }
 
+    override fun onResume() {
+        super.onResume()
+        startDuty()
+    }
+
     private fun requestNotifyPermission() {
         if (Build.VERSION.SDK_INT >= 33) {
             val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
@@ -97,9 +105,21 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun maybeAskBatteryOptimization() {
+        if (Build.VERSION.SDK_INT < 23) return
+        try {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            if (pm.isIgnoringBatteryOptimizations(packageName)) return
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                data = Uri.parse("package:$packageName")
+            }
+            startActivity(intent)
+        } catch (_: Exception) { }
+    }
+
     private fun askServerUrl() {
         val input = EditText(this)
-        input.hint = "例如 https://你的域名 或 http://192.168.1.8:8787"
+        input.hint = "例如 http://47.114.44.213:8787"
         input.setText(prefs.baseUrl)
         AlertDialog.Builder(this)
             .setTitle("后端地址")
@@ -116,7 +136,7 @@ class MainActivity : AppCompatActivity() {
                 prefs.baseUrl = url
                 loadApp()
             }
-            .setNeutralButton("修改稍后") { _, _ -> loadApp() }
+            .setNeutralButton("稍后再说") { _, _ -> loadApp() }
             .show()
     }
 
@@ -153,13 +173,23 @@ class MainActivity : AppCompatActivity() {
         }
 
         @JavascriptInterface
+        fun getVibrateEnabled(): String = if (prefs.vibrateEnabled) "1" else "0"
+
+        @JavascriptInterface
+        fun setVibrateEnabled(on: String) {
+            prefs.vibrateEnabled = on == "1" || on.equals("true", true)
+            Notifier.refreshDuty(this@MainActivity)
+            runOnUiThread { startDuty() }
+        }
+
+        @JavascriptInterface
         fun onNewOrders(payload: String) {
             try {
                 val j = JSONObject(payload)
                 Notifier.notifyOrder(
                     this@MainActivity,
                     j.optString("title", "待核对充值"),
-                    j.optString("body", "请打开值班台确认")
+                    j.optString("body", "请到值班台确认")
                 )
             } catch (_: Exception) { }
         }
@@ -171,6 +201,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         if (this::web.isInitialized && web.canGoBack()) web.goBack()
         else super.onBackPressed()

@@ -158,7 +158,11 @@ async function tickInbox() {
           ? `${first.username || first.email || '用户'} ¥${Number(first.amount || 0).toFixed(0)} · ${methodLabel(first.method)} · 备注 ${first.payNote || '-'}`
           : '请打开值班台确认到账';
         tellNative('onNewOrders', JSON.stringify({ title, body, count: fresh.length, ids: fresh }));
-        if (navigator.vibrate) navigator.vibrate([180, 80, 180, 80, 320]);
+        try {
+          const b = bridge();
+          const vibeOn = !(b && typeof b.getVibrateEnabled === 'function') || String(b.getVibrateEnabled()) === '1';
+          if (vibeOn && navigator.vibrate) navigator.vibrate([180, 80, 180, 80, 320]);
+        } catch { /* ignore */ }
         const badge = document.querySelector('[data-tab="orders"]');
         if (badge && tab !== 'orders') badge.textContent = `充值(${inbox.pendingCount})`;
       }
@@ -429,17 +433,25 @@ async function render(preloaded) {
         api('/api/admin/pricing')
       ]);
       pane.innerHTML = `
-        <label>站点公网地址<input id="pubUrl" value="${esc(site.publicBaseUrl || '')}" placeholder="https://你的域名"></label>
-        <label>真实扣费倍率<input id="rate" type="number" min="0.01" max="10" step="0.01" value="${esc(pricing.multiplier)}"></label>
-        <button class="primary" id="saveSet">保存后端设置</button>
+        <label>站点公开地址<input id="pubUrl" value="${esc(site.publicBaseUrl || '')}" placeholder="https://你的域名"></label>
+        <label>贝贝海全局倍率<input id="rate" type="number" min="0.01" max="10" step="0.01" value="${esc(pricing.multiplier)}"></label>
+        <label>vip1129/Codex倍率<input id="rateVip" type="number" min="0.01" max="10" step="0.01" value="${esc(pricing.multiplierVip1129 ?? pricing.multiplier ?? 1.5)}"></label>
+        <p class="sub">渠道旁展示倍率=摆设，不参与扣费。客户花销=上游成本×对应上游全局倍率。</p>
+        <button class="primary" id="saveSet">保存站点设置</button>
         <p class="sub" id="setMsg"></p>
-        <button class="ghost" id="editServer" type="button" style="width:100%;margin-top:12px">更换 APK 连接的网站地址</button>
-        <p class="sub">渠道同步、聚合支付仍可在电脑后台处理。用户余额加减和封号已可在本页「用户」操作。</p>`;
+        <label style="display:flex;align-items:center;gap:10px;margin-top:16px">
+          <input id="vibToggle" type="checkbox" style="width:auto">
+          <span>新订单系统通知时震动（后台也生效）</span>
+        </label>
+        <button class="ghost" id="editServer" type="button" style="width:100%;margin-top:12px">更改 APK 连接的网站地址</button>
+        <p class="sub">关掉震动后仍会弹系统通知；购卡/充值订单在后台由原生服务轮询提醒。</p>`;
       $('#saveSet').onclick = async () => {
         const msg = $('#setMsg');
         try {
           await api('/api/admin/site-settings', { method: 'PUT', body: JSON.stringify({ publicBaseUrl: $('#pubUrl').value.trim() }) });
-          await api('/api/admin/pricing', { method: 'PUT', body: JSON.stringify({ multiplier: Number($('#rate').value) }) });
+          const body = { multiplier: Number($('#rate').value) };
+          if ($('#rateVip')) body.multiplierVip1129 = Number($('#rateVip').value);
+          await api('/api/admin/pricing', { method: 'PUT', body: JSON.stringify(body) });
           msg.textContent = '已保存';
           msg.className = 'sub ok';
         } catch (err) {
@@ -447,6 +459,15 @@ async function render(preloaded) {
           msg.className = 'sub bad';
         }
       };
+      try {
+        const b = bridge();
+        const on = !(b && typeof b.getVibrateEnabled === 'function') || String(b.getVibrateEnabled()) === '1';
+        $('#vibToggle').checked = on;
+        $('#vibToggle').onchange = () => {
+          const v = $('#vibToggle').checked ? '1' : '0';
+          tellNative('setVibrateEnabled', v);
+        };
+      } catch { /* browser without bridge */ }
       $('#editServer')?.addEventListener('click', () => tellNative('editServer'));
     }
   } catch (err) {
@@ -474,3 +495,4 @@ if (token) {
     render();
   }).catch(() => logout());
 }
+

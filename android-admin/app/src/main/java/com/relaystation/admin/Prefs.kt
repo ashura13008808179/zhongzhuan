@@ -1,4 +1,4 @@
-package com.relaystation.admin
+﻿package com.relaystation.admin
 
 import android.content.Context
 
@@ -15,9 +15,14 @@ class Prefs(ctx: Context) {
 
     var lastNotifyIds: Set<String>
         get() = sp.getStringSet("lastNotifyIds", emptySet()) ?: emptySet()
-        set(v) { sp.edit().putStringSet("lastNotifyIds", v).apply() }
+        set(v) { sp.edit().putStringSet("lastNotifyIds", HashSet(v)).apply() }
 
     var seeded: Boolean
         get() = sp.getBoolean("seeded", false)
         set(v) { sp.edit().putBoolean("seeded", v).apply() }
+
+    /** 订单通知是否震动；系统通知始终会发，仅震动受此开关控制。默认开。 */
+    var vibrateEnabled: Boolean
+        get() = sp.getBoolean("vibrateEnabled", true)
+        set(v) { sp.edit().putBoolean("vibrateEnabled", v).apply() }
 }

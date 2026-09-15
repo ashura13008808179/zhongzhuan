@@ -1279,12 +1279,29 @@ function adminUserView(user) {
   };
 }
 function multiplier(db) {
+  // beibeihai / 北海 上游全局倍率（默认 2.5）。真正扣费用此档或 vip1129 档，见 providerMultiplier。
   const parsed = normalizeBillingMultiplier(db.settings?.billingMultiplier ?? DEFAULT_MULTIPLIER);
   return parsed.ok ? parsed.value : DEFAULT_BILLING_MULTIPLIER;
 }
+const DEFAULT_VIP1129_BILLING_MULTIPLIER = 1.5;
+function multiplierVip1129(db) {
+  // vip1129 / Codex 直连中转 上游全局倍率（默认 1.5）
+  const parsed = normalizeBillingMultiplier(db.settings?.billingMultiplierVip1129 ?? DEFAULT_VIP1129_BILLING_MULTIPLIER);
+  return parsed.ok ? parsed.value : DEFAULT_VIP1129_BILLING_MULTIPLIER;
+}
 function providerMultiplier(provider, db) {
-  const parsed = normalizeBillingMultiplier(provider?.billingMultiplier);
-  if (parsed.ok) return parsed.value;
+  // 计费铁律（站长强调，必须写进注释并遵守）：
+  // - 渠道侧 displayMultiplier / billingMultiplier UI 数字 = 摆设文字，绝不参与扣费；
+  // - 真正扣费只用「上游全局倍率」两档：
+  //   * settings.billingMultiplier = beibeihai / 北海 全局倍率（默认 2.5）
+  //   * settings.billingMultiplierVip1129 = vip1129 / Codex 直连中转 全局倍率（默认 1.5）
+  // - 若 provider 为 vip1129（isVip1129Provider / upstreamSync==='vip1129' / url 含 vip1129）→ multiplierVip1129(db)
+  // - 否则（beibeihai 及其他）→ multiplier(db)
+  // - 客户花销 = 上游成本(upstreamCost) × 对应上游全局倍率；绝不读 provider.billingMultiplier / displayMultiplier。
+  const url = String(provider?.url || '');
+  if (typeof isVip1129Provider === 'function' && isVip1129Provider(provider)) return multiplierVip1129(db);
+  if (provider?.upstreamSync === 'vip1129') return multiplierVip1129(db);
+  if (/vip1129/i.test(url)) return multiplierVip1129(db);
   return multiplier(db);
 }
 function normalizeProvider(item, previous = null) {
@@ -1453,10 +1470,15 @@ function providers(db) {
 function providersForModel(payload, db) {
   const list = providers(db);
   const model = String(payload.model || '');
-  const matched = list
-    .filter(p => !Array.isArray(p.models) || !p.models.length || p.models.includes(model))
+  // Exact model match only. Empty models[] must NOT match every request (e.g. Cursor pool).
+  const exact = list
+    .filter(p => Array.isArray(p.models) && p.models.length && p.models.includes(model))
     .sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100));
-  if (matched.length) return matched;
+  if (exact.length) return exact;
+  if (!model) {
+    const any = list.slice().sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100));
+    if (any.length) return any;
+  }
   const fallback = list.find(p => p.id === db.settings.defaultProviderId) || list[0];
   return fallback ? [fallback] : [];
 }
@@ -1665,6 +1687,7 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
   const upstreamTokens = Math.max(0, Number(usage.total_tokens || ((usage.prompt_tokens || 0) + (usage.completion_tokens || 0))));
   const billedTokens = Math.min(upstreamTokens * rate, tokenReservation);
   const upstreamCost = providerCost(provider, usage, model);
+  // rate 为上游专用全局倍率（beibeihai→billingMultiplier，vip1129→billingMultiplierVip1129），由 providerMultiplier 选出；渠道 displayMultiplier/billingMultiplier 为摆设，不参与。
   const chargedAmount = upstreamCost * rate;
   user.reservedTokens = Math.max(0, (user.reservedTokens || 0) - tokenReservation);
   user.reservedBalance = Math.max(0, (user.reservedBalance || 0) - amountReservation);
@@ -1850,8 +1873,266 @@ async function fetchUpstream(provider, payload, outputBudget, model, overrideApi
   }
 }
 
-async function chat(req, res, db, user, apiKeyRec = null) {
-  const payload = await body(req);
+
+
+function responsesEndpointFromChatUrl(url) {
+  const raw = String(url || '').trim().replace(/\/+$/, '');
+  if (!raw) return '';
+  if (/\/chat\/completions$/i.test(raw)) return raw.replace(/\/chat\/completions$/i, '/responses');
+  if (/\/responses$/i.test(raw)) return raw;
+  if (/\/v1$/i.test(raw)) return `${raw}/responses`;
+  const v1 = raw.indexOf('/v1/');
+  if (v1 >= 0) return `${raw.slice(0, v1 + 3)}/responses`;
+  return `${raw}/responses`;
+}
+
+function normalizeResponsesUsage(usage) {
+  if (!usage || typeof usage !== 'object') {
+    return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+  }
+  const prompt = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0) || 0;
+  const completion = Number(usage.completion_tokens ?? usage.output_tokens ?? 0) || 0;
+  const total = Number(usage.total_tokens ?? (prompt + completion)) || (prompt + completion);
+  return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: total };
+}
+
+async function fetchUpstreamResponses(provider, payload, model, overrideApiKey = null) {
+  const controller = new AbortController();
+  // Responses tool rounds can be longer than chat, but cap so failover stays responsive.
+  const waitMs = Math.min(Math.max(Number(provider.timeoutMs) || 60000, 15000), 90000);
+  const timeout = setTimeout(() => controller.abort(), waitMs);
+  const bearer = String(overrideApiKey || provider.apiKey || '').trim();
+  const endpoint = responsesEndpointFromChatUrl(provider.url);
+  if (!endpoint) {
+    clearTimeout(timeout);
+    throw new Error('missing_responses_endpoint');
+  }
+  try {
+    const body = { ...payload, model: model || payload.model || provider.defaultModel };
+    // Never force chat-only fields into responses payload.
+    delete body.max_tokens;
+    delete body.messages;
+    return await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer}` },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function providerSupportsResponsesPassthrough(provider) {
+  const url = String(provider && provider.url || '');
+  if (!url) return false;
+  // Official OpenAI-compatible responses siblings of chat/completions.
+  if (/cursor\.sh/i.test(url)) return false;
+  if (typeof isVip1129Provider === 'function' && isVip1129Provider(provider)) return true;
+  if (/\/v1\/chat\/completions$/i.test(url)) return true;
+  if (/\/v1\/responses$/i.test(url)) return true;
+  return false;
+}
+
+function responsesContentToText(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) {
+    if (typeof content === 'object') {
+      if (typeof content.text === 'string') return content.text;
+      if (typeof content.content === 'string') return content.content;
+    }
+    return '';
+  }
+  return content.map((part) => {
+    if (typeof part === 'string') return part;
+    if (!part || typeof part !== 'object') return '';
+    if (typeof part.text === 'string') return part.text;
+    if (part.type === 'input_text' || part.type === 'output_text' || part.type === 'text') {
+      return typeof part.text === 'string' ? part.text : '';
+    }
+    if (typeof part.content === 'string') return part.content;
+    return '';
+  }).join('');
+}
+
+function responsesInputToMessages(input, instructions) {
+  const messages = [];
+  if (instructions != null && String(instructions).length) {
+    messages.push({ role: 'system', content: String(instructions) });
+  }
+  if (typeof input === 'string') {
+    if (input.length) messages.push({ role: 'user', content: input });
+    return messages;
+  }
+  if (!Array.isArray(input)) return messages;
+  for (const item of input) {
+    if (item == null) continue;
+    if (typeof item === 'string') {
+      if (item.length) messages.push({ role: 'user', content: item });
+      continue;
+    }
+    if (typeof item !== 'object') continue;
+    const type = item.type;
+    // Fallback conversion only: keep tool/function items as text so history is not totally dropped.
+    if (type === 'function_call') {
+      const name = item.name || item.call?.name || 'tool';
+      const args = item.arguments != null ? (typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments)) : '';
+      messages.push({ role: 'assistant', content: `[function_call ${name}] ${args}`.slice(0, 8000) });
+      continue;
+    }
+    if (type === 'function_call_output' || type === 'tool_result' || type === 'computer_call_output') {
+      const out = item.output != null ? (typeof item.output === 'string' ? item.output : JSON.stringify(item.output))
+        : responsesContentToText(item.content != null ? item.content : item);
+      if (out) messages.push({ role: 'tool', content: String(out).slice(0, 12000) });
+      continue;
+    }
+    if (type && type !== 'message' && type !== 'input_text') continue;
+    const role = item.role || 'user';
+    const text = responsesContentToText(
+      item.content != null ? item.content : (item.text != null ? item.text : item)
+    );
+    if (!text) continue;
+    const normalizedRole =
+      role === 'system' || role === 'assistant' || role === 'user' || role === 'tool'
+        ? role
+        : 'user';
+    messages.push({ role: normalizedRole, content: text });
+  }
+  return messages;
+}
+
+function chatCompletionToResponse(result) {
+  const choice = result && result.choices && result.choices[0];
+  const message = choice && choice.message ? choice.message : null;
+  const rawContent = message ? message.content : '';
+  const text = responsesContentToText(rawContent);
+  const usage = (result && result.usage) || {};
+  const prompt = Number(usage.prompt_tokens) || 0;
+  const completion = Number(usage.completion_tokens) || 0;
+  const total = Number(usage.total_tokens) || (prompt + completion);
+  let responseId;
+  if (result && result.id) {
+    responseId = String(result.id).replace(/^chatcmpl[-_]?/i, 'resp_');
+    if (!/^resp/i.test(responseId)) responseId = 'resp_' + responseId;
+  } else {
+    responseId = id('resp');
+  }
+  const output = [];
+  const toolCalls = Array.isArray(message && message.tool_calls) ? message.tool_calls : [];
+  for (const tc of toolCalls) {
+    const fn = tc && tc.function ? tc.function : null;
+    output.push({
+      id: tc.id || id('fc'),
+      type: 'function_call',
+      call_id: tc.id || id('call'),
+      name: (fn && fn.name) || tc.name || 'tool',
+      arguments: (fn && fn.arguments != null) ? (typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments)) : '{}'
+    });
+  }
+  if (text || !output.length) {
+    output.push({
+      id: id('msg'),
+      type: 'message',
+      role: 'assistant',
+      status: 'completed',
+      content: [{ type: 'output_text', text: text || '' }]
+    });
+  }
+  return {
+    id: responseId,
+    object: 'response',
+    created_at: Math.floor(Date.now() / 1000),
+    status: 'completed',
+    model: (result && result.model) || '',
+    output,
+    usage: {
+      input_tokens: prompt,
+      output_tokens: completion,
+      total_tokens: total
+    }
+  };
+}
+
+
+function anthropicContentToText(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) {
+    if (typeof content === 'object' && typeof content.text === 'string') return content.text;
+    return '';
+  }
+  return content.map((part) => {
+    if (typeof part === 'string') return part;
+    if (!part || typeof part !== 'object') return '';
+    if (part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') {
+      return typeof part.text === 'string' ? part.text : '';
+    }
+    if (typeof part.text === 'string') return part.text;
+    return '';
+  }).join('');
+}
+
+function anthropicToChatPayload(raw) {
+  const messages = [];
+  if (raw && raw.system != null) {
+    const sys = anthropicContentToText(raw.system);
+    if (sys) messages.push({ role: 'system', content: sys });
+  }
+  const src = Array.isArray(raw && raw.messages) ? raw.messages : [];
+  for (const m of src) {
+    if (!m || typeof m !== 'object') continue;
+    const role = m.role === 'assistant' ? 'assistant' : (m.role === 'system' ? 'system' : 'user');
+    const text = anthropicContentToText(m.content);
+    if (!text) continue;
+    messages.push({ role, content: text });
+  }
+  const payload = {
+    model: raw && raw.model,
+    messages,
+    stream: raw && raw.stream === true
+  };
+  if (raw && raw.temperature !== undefined) payload.temperature = raw.temperature;
+  if (raw && raw.max_tokens != null) payload.max_tokens = raw.max_tokens;
+  return payload;
+}
+
+function chatCompletionToAnthropic(result) {
+  const choice = result && result.choices && result.choices[0];
+  const text = anthropicContentToText(choice && choice.message ? choice.message.content : '');
+  const usage = (result && result.usage) || {};
+  const stop = (choice && choice.finish_reason === 'length') ? 'max_tokens' : 'end_turn';
+  return {
+    id: (result && result.id) ? String(result.id).replace(/^chatcmpl[-_]?/i, 'msg_') : id('msg'),
+    type: 'message',
+    role: 'assistant',
+    model: (result && result.model) || '',
+    content: [{ type: 'text', text }],
+    stop_reason: stop,
+    stop_sequence: null,
+    usage: {
+      input_tokens: Number(usage.prompt_tokens) || 0,
+      output_tokens: Number(usage.completion_tokens) || 0
+    }
+  };
+}
+
+function writeAnthropicSse(res, event, payload) {
+  res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+}
+
+
+function writeResponsesSse(res, type, payload, seqRef) {
+  const body = Object.assign({ type }, payload);
+  if (seqRef) {
+    body.sequence_number = seqRef.n;
+    seqRef.n += 1;
+  }
+  res.write(`event: ${type}\ndata: ${JSON.stringify(body)}\n\n`);
+}
+
+async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
+  const payload = prePayload || await body(req);
   if (!payload || !Array.isArray(payload.messages) || !payload.messages.length) return fail(res, 400, 'messages 不能为空');
   if (apiKeyRec && apiKeyRec.enabled === false) return fail(res, 403, '该 API 密钥已停用');
 
@@ -1965,7 +2246,9 @@ async function chat(req, res, db, user, apiKeyRec = null) {
           amountReservation,
           started,
           inputReserve,
-          apiKeyRec
+          apiKeyRec,
+          responsesApi: !!req._responsesApi,
+          anthropicApi: !!req._anthropicApi
         });
       }
 
@@ -1983,6 +2266,20 @@ async function chat(req, res, db, user, apiKeyRec = null) {
       const usage = result.usage || {};
       settleUsage(db, user, provider, usage, providerMultiplier(provider, db), tokenReservation, amountReservation, started, result.model || model || provider.defaultModel, 'success', apiKeyRec);
       writeDb(db);
+      if (req._responsesApi) return json(res, 200, chatCompletionToResponse(result));
+      if (req._anthropicApi) return json(res, 200, chatCompletionToAnthropic(result));
+      if (req._geminiApi) {
+        const choice = result && result.choices && result.choices[0];
+        const text = responsesContentToText(choice && choice.message ? choice.message.content : '');
+        return json(res, 200, {
+          candidates: [{ content: { role: 'model', parts: [{ text }] }, finishReason: 'STOP' }],
+          usageMetadata: {
+            promptTokenCount: Number(result && result.usage && result.usage.prompt_tokens) || 0,
+            candidatesTokenCount: Number(result && result.usage && result.usage.completion_tokens) || 0,
+            totalTokenCount: Number(result && result.usage && result.usage.total_tokens) || 0
+          }
+        });
+      }
       return json(res, 200, result);
     } catch (err) {
       updateProviderHealth(db, provider.id, false, err?.message || 'fetch_failed');
@@ -1997,7 +2294,10 @@ async function chat(req, res, db, user, apiKeyRec = null) {
 }
 
 async function streamChat(req, res, db, user, provider, upstream, ctx) {
-  const { model, rate, tokenReservation, amountReservation, started, inputReserve, apiKeyRec = null } = ctx;
+  const {
+    model, rate, tokenReservation, amountReservation, started, inputReserve,
+    apiKeyRec = null, responsesApi = false, anthropicApi = false
+  } = ctx;
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-store',
@@ -2009,6 +2309,11 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
   let usage = null;
   let completionText = '';
   let buffer = '';
+  const responseId = id('resp');
+  const itemId = id('msg');
+  const seqRef = { n: 0 };
+  let responsesStarted = false;
+  let anthropicStarted = false;
 
   const cleanup = (reason = 'abort') => {
     if (settled) return;
@@ -2038,32 +2343,40 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
   req.on('close', () => { if (!settled) cleanup('client_abort'); });
   req.on('aborted', () => { if (!settled) cleanup('client_abort'); });
 
-  try {
-    const reader = upstream.body?.getReader?.();
-    if (!reader) {
-      // Fallback for environments without getReader: read as text stream via async iterator
-      for await (const chunk of upstream.body) {
-        if (aborted) break;
-        const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
-        buffer += text;
-        res.write(text);
-        processSseBuffer();
+  function ensureResponsesHeaders() {
+    if (!responsesApi || responsesStarted) return;
+    responsesStarted = true;
+    writeResponsesSse(res, 'response.created', {
+      response: {
+        id: responseId,
+        object: 'response',
+        created_at: Math.floor(Date.now() / 1000),
+        status: 'in_progress',
+        model,
+        output: []
       }
-    } else {
-      const decoder = new TextDecoder();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (aborted) break;
-        const text = decoder.decode(value, { stream: true });
-        buffer += text;
-        res.write(text);
-        processSseBuffer();
-      }
-    }
-  } catch {
-    if (!settled) cleanup('stream_error');
-    return;
+    }, seqRef);
+    writeResponsesSse(res, 'response.output_item.added', {
+      output_index: 0,
+      item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] }
+    }, seqRef);
+    writeResponsesSse(res, 'response.content_part.added', {
+      item_id: itemId,
+      output_index: 0,
+      content_index: 0,
+      part: { type: 'output_text', text: '' }
+    }, seqRef);
+  }
+
+  function emitResponsesDelta(delta) {
+    if (!delta) return;
+    ensureResponsesHeaders();
+    writeResponsesSse(res, 'response.output_text.delta', {
+      item_id: itemId,
+      output_index: 0,
+      content_index: 0,
+      delta
+    }, seqRef);
   }
 
   function processSseBuffer() {
@@ -2078,11 +2391,64 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
         const parsed = JSON.parse(data);
         if (parsed.usage) usage = parsed.usage;
         const delta = parsed.choices?.[0]?.delta?.content;
-        if (typeof delta === 'string') completionText += delta;
+        if (typeof delta === 'string') {
+          completionText += delta;
+          if (responsesApi) emitResponsesDelta(delta);
+          if (anthropicApi) {
+            if (!anthropicStarted) {
+              anthropicStarted = true;
+              writeAnthropicSse(res, 'message_start', {
+                type: 'message_start',
+                message: { id: responseId, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } }
+              });
+              writeAnthropicSse(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+            }
+            writeAnthropicSse(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: delta } });
+          }
+        }
         const messageContent = parsed.choices?.[0]?.message?.content;
-        if (typeof messageContent === 'string') completionText += messageContent;
+        if (typeof messageContent === 'string') {
+          completionText += messageContent;
+          if (responsesApi) emitResponsesDelta(messageContent);
+        }
       } catch { /* ignore partial json */ }
     }
+  }
+
+  try {
+    if (responsesApi) ensureResponsesHeaders();
+    if (anthropicApi && !anthropicStarted) {
+      anthropicStarted = true;
+      writeAnthropicSse(res, 'message_start', {
+        type: 'message_start',
+        message: { id: responseId, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } }
+      });
+      writeAnthropicSse(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+    }
+    const reader = upstream.body?.getReader?.();
+    if (!reader) {
+      for await (const chunk of upstream.body) {
+        if (aborted) break;
+        const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+        buffer += text;
+        if (!responsesApi && !anthropicApi) res.write(text);
+        processSseBuffer();
+      }
+    } else {
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (aborted) break;
+        const text = decoder.decode(value, { stream: true });
+        buffer += text;
+        if (!responsesApi && !anthropicApi) res.write(text);
+        processSseBuffer();
+      }
+    }
+  } catch {
+    if (!settled) cleanup('stream_error');
+    return;
   }
 
   // Flush remaining buffer
@@ -2095,7 +2461,10 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
           const parsed = JSON.parse(data);
           if (parsed.usage) usage = parsed.usage;
           const delta = parsed.choices?.[0]?.delta?.content;
-          if (typeof delta === 'string') completionText += delta;
+          if (typeof delta === 'string') {
+            completionText += delta;
+            if (responsesApi) emitResponsesDelta(delta);
+          }
         } catch { /* ignore */ }
       }
     }
@@ -2116,6 +2485,69 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
   settled = true;
   settleUsage(db, user, provider, usage, providerMultiplier(provider, db), tokenReservation, amountReservation, started, model, 'success', apiKeyRec);
   writeDb(db);
+
+  if (anthropicApi) {
+    writeAnthropicSse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+    const outTok = Number(usage.completion_tokens) || 0;
+    const inTok = Number(usage.prompt_tokens) || 0;
+    writeAnthropicSse(res, 'message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: outTok }
+    });
+    writeAnthropicSse(res, 'message_stop', { type: 'message_stop' });
+  }
+
+  if (responsesApi) {
+    writeResponsesSse(res, 'response.output_text.done', {
+      item_id: itemId,
+      output_index: 0,
+      content_index: 0,
+      text: completionText
+    }, seqRef);
+    writeResponsesSse(res, 'response.content_part.done', {
+      item_id: itemId,
+      output_index: 0,
+      content_index: 0,
+      part: { type: 'output_text', text: completionText }
+    }, seqRef);
+    writeResponsesSse(res, 'response.output_item.done', {
+      output_index: 0,
+      item: {
+        id: itemId,
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: completionText }]
+      }
+    }, seqRef);
+    const prompt = Number(usage.prompt_tokens) || 0;
+    const completion = Number(usage.completion_tokens) || 0;
+    const total = Number(usage.total_tokens) || (prompt + completion);
+    writeResponsesSse(res, 'response.completed', {
+      response: {
+        id: responseId,
+        object: 'response',
+        created_at: Math.floor(Date.now() / 1000),
+        status: 'completed',
+        model,
+        output: [{
+          id: itemId,
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          content: [{ type: 'output_text', text: completionText }]
+        }],
+        usage: {
+          input_tokens: prompt,
+          output_tokens: completion,
+          total_tokens: total
+        }
+      }
+    }, seqRef);
+    try { res.write('data: [DONE]\n\n'); } catch { /* ignore */ }
+  }
+
   try { res.end(); } catch { /* ignore */ }
 }
 
@@ -2356,6 +2788,11 @@ const server = http.createServer(async (req, res) => {
     if (!user) return fail(res, 401, '未登录');
     const logs = db.logs.filter(x => x.userId === user.id && x.status !== 'referral_rebate' && x.status !== CHECKIN_LOG_STATUS);
     const totalTokens = logs.reduce((sum, x) => sum + Number(x.tokens || 0), 0);
+    // 累计花销 = 该用户 API 日志 chargedAmount 合计（已是上游成本×对应上游全局倍率后的实扣）
+    const totalSpent = logs.reduce((sum, x) => {
+      const c = Number(x.chargedAmount || 0);
+      return sum + (Number.isFinite(c) && c > 0 ? c : 0);
+    }, 0);
     const avgLatency = logs.length ? Math.round(logs.reduce((sum, x) => sum + x.latency, 0) / logs.length) : 0;
     const displayLogs = logs.slice(0, 30).map(x => ({
       id: x.id,
@@ -2374,7 +2811,8 @@ const server = http.createServer(async (req, res) => {
         success: logs.filter(x => x.status === 'success').length,
         quotaTokens: user.quotaTokens || 0,
         usedTokens: totalTokens,
-        availableTokens: availableTokens(user)
+        availableTokens: availableTokens(user),
+        totalSpent: Math.round(totalSpent * 10000) / 10000
       },
       logs: displayLogs,
       inviteCode: user.inviteCode,
@@ -3143,6 +3581,7 @@ const server = http.createServer(async (req, res) => {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
     return json(res, 200, {
       multiplier: multiplier(db),
+      multiplierVip1129: multiplierVip1129(db),
       defaultProviderId: db.settings.defaultProviderId || null,
       providers: (db.settings.providers || []).map(publicProvider),
       healthSummary: (db.settings.providers || []).map(p => ({
@@ -3157,14 +3596,32 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'PUT' && url.pathname === '/api/admin/pricing') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
     const p = await body(req);
-    const parsed = normalizeBillingMultiplier(p?.multiplier);
-    if (!parsed.ok) return fail(res, 400, parsed.error);
-    const value = parsed.value;
-    const prev = db.settings.billingMultiplier;
-    db.settings.billingMultiplier = value;
-    audit(db, { actorId: user.id, action: 'pricing.change', target: 'billingMultiplier', detail: { from: prev, to: value } });
+    const out = {};
+    const hasBeibei = p?.multiplier != null || p?.billingMultiplier != null;
+    const hasVip = p?.multiplierVip1129 != null || p?.billingMultiplierVip1129 != null;
+    if (!hasBeibei && !hasVip) return fail(res, 400, '请提供 multiplier 和/或 multiplierVip1129');
+    if (hasBeibei) {
+      const parsed = normalizeBillingMultiplier(p?.multiplier ?? p?.billingMultiplier);
+      if (!parsed.ok) return fail(res, 400, parsed.error);
+      const value = parsed.value;
+      const prev = db.settings.billingMultiplier;
+      db.settings.billingMultiplier = value;
+      audit(db, { actorId: user.id, action: 'pricing.change', target: 'billingMultiplier', detail: { from: prev, to: value } });
+      out.multiplier = value;
+    }
+    if (hasVip) {
+      const parsedVip = normalizeBillingMultiplier(p?.multiplierVip1129 ?? p?.billingMultiplierVip1129);
+      if (!parsedVip.ok) return fail(res, 400, parsedVip.error);
+      const valueVip = parsedVip.value;
+      const prevVip = db.settings.billingMultiplierVip1129;
+      db.settings.billingMultiplierVip1129 = valueVip;
+      audit(db, { actorId: user.id, action: 'pricing.change', target: 'billingMultiplierVip1129', detail: { from: prevVip, to: valueVip } });
+      out.multiplierVip1129 = valueVip;
+    }
     writeDb(db);
-    return json(res, 200, { multiplier: value });
+    if (out.multiplier == null) out.multiplier = multiplier(db);
+    if (out.multiplierVip1129 == null) out.multiplierVip1129 = multiplierVip1129(db);
+    return json(res, 200, out);
   }
 
 
@@ -3406,6 +3863,258 @@ const server = http.createServer(async (req, res) => {
     return chat(req, res, db, found.user, found.key);
   }
 
+
+  if (req.method === 'POST' && (url.pathname === '/v1/messages' || url.pathname === '/v1/messages/')) {
+    if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
+    const apiKey = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const found = findByApiSecret(db, apiKey);
+    if (!found) return fail(res, 401, '无效的 Relay API Key');
+    const raw = await body(req);
+    if (raw == null) return fail(res, 400, 'invalid json');
+    const payload = anthropicToChatPayload(raw);
+    if (!payload.messages.length) return fail(res, 400, 'messages 不能为空');
+    req._anthropicApi = true;
+    return chat(req, res, db, found.user, found.key, payload);
+  }
+
+
+  if (req.method === 'POST' && /^\/v1beta\/models\/[^/]+:(generateContent|streamGenerateContent)$/.test(url.pathname)) {
+    if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
+    const apiKey = req.headers['x-api-key'] || req.headers['x-goog-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const found = findByApiSecret(db, apiKey);
+    if (!found) return fail(res, 401, '无效的 Relay API Key');
+    const m = url.pathname.match(/^\/v1beta\/models\/([^/:]+):(generateContent|streamGenerateContent)$/);
+    const model = decodeURIComponent(m[1]);
+    const stream = m[2] === 'streamGenerateContent';
+    const raw = await body(req);
+    const contents = (raw && raw.contents) || [];
+    const messages = [];
+    const sys = raw && raw.systemInstruction && anthropicContentToText(raw.systemInstruction.parts || raw.systemInstruction);
+    if (sys) messages.push({ role: 'system', content: sys });
+    for (const c of contents) {
+      const role = (c.role === 'model') ? 'assistant' : 'user';
+      const text = anthropicContentToText(c.parts || c);
+      if (text) messages.push({ role, content: text });
+    }
+    if (!messages.length) return fail(res, 400, 'messages 不能为空');
+    req._geminiApi = true;
+    return chat(req, res, db, found.user, found.key, { model, messages, stream: false });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/v1/responses') {
+    if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
+    const apiKey = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const found = findByApiSecret(db, apiKey);
+    if (!found) return fail(res, 401, '无效的 Relay API Key');
+    const raw = await body(req);
+    if (raw == null) return fail(res, 400, 'invalid json');
+    const user = found.user;
+    const apiKeyRec = found.key;
+    if (apiKeyRec && apiKeyRec.enabled === false) return fail(res, 403, '该 API 密钥已停用');
+    if (isBanned(user)) return fail(res, 403, '账号已被封禁');
+    if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
+
+    // Prefer native /v1/responses passthrough (keeps tools / function_call for Codex).
+    // Fall back to lossy chat/completions conversion only if every upstream rejects responses.
+    const pseudoPayload = { model: raw.model, messages: [{ role: 'user', content: 'x' }] };
+    const allCandidates = providersForModel(pseudoPayload, db);
+    // Codex/tools need native /v1/responses — prefer vip1129 / OpenAI-compatible only.
+    const passthroughCandidates = allCandidates.filter(providerSupportsResponsesPassthrough).slice(0, 2);
+    const candidates = passthroughCandidates.length ? passthroughCandidates : allCandidates.slice(0, 1);
+    if (!candidates.length) return fail(res, 503, '模型服务暂不可用，请稍后再试');
+    const primary = candidates[0];
+    const model = String(raw.model || primary.defaultModel || '');
+    if (apiKeyRec && Array.isArray(apiKeyRec.models) && apiKeyRec.models.length && model && !apiKeyRec.models.includes(model)) {
+      return fail(res, 400, '该密钥未授权使用此模型');
+    }
+    const rate = providerMultiplier(primary, db);
+    const inputReserve = Math.ceil(JSON.stringify(raw).length / 3) + 256;
+    const requestedOutput = Math.max(1, Math.min(Number(raw.max_output_tokens || raw.max_tokens) || DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOKENS));
+    if (apiKeyRec && !keyRateOk(res, apiKeyRec, inputReserve + requestedOutput)) return;
+
+    let tokenReservation = 0;
+    let amountReservation = 0;
+    let outputBudget = requestedOutput;
+    if (isUnlimited(user)) {
+      outputBudget = requestedOutput;
+      user.accountActive = true;
+      writeDb(db);
+    } else {
+      let availableBalance = Math.max(0, (user.balance || 0) - (user.reservedBalance || 0));
+      if (apiKeyRec && apiKeyRec.spendLimit > 0) {
+        availableBalance = Math.min(availableBalance, Math.max(0, apiKeyRec.spendLimit - (apiKeyRec.spendUsed || 0) - (apiKeyRec.reservedSpend || 0)));
+      }
+      const safety = safetyBuffer(primary, rate, model);
+      const inputEstimate = estimatedCost(primary, inputReserve, 0, model) * rate;
+      const outputUnitPrice = Math.max(modelPrice(primary, model, 'outputPricePer1K') / 1000 * rate, Number.EPSILON);
+      const moneyBudget = Math.floor(Math.max(0, availableBalance - safety - inputEstimate) / outputUnitPrice);
+      outputBudget = Math.min(requestedOutput, moneyBudget);
+      if (apiKeyRec && apiKeyRec.tokenLimit > 0) {
+        const keyLeft = Math.max(0, apiKeyRec.tokenLimit - (apiKeyRec.tokenUsed || 0) - (apiKeyRec.reservedTokens || 0));
+        outputBudget = Math.min(outputBudget, Math.max(0, Math.floor(keyLeft / rate) - inputReserve));
+      }
+      if (outputBudget < 1) {
+        const keyTokenBlocked = apiKeyRec?.tokenLimit > 0 && moneyBudget >= 1;
+        return fail(res, 402, keyTokenBlocked ? '该密钥 Token 额度不足' : (apiKeyRec?.spendLimit > 0 ? '该密钥花费额度不足' : insufficientBalanceMessage()));
+      }
+      const upstreamReservation = inputReserve + outputBudget;
+      tokenReservation = upstreamReservation * rate;
+      amountReservation = estimatedCost(primary, inputReserve, outputBudget, model) * rate;
+      if (availableBalance < amountReservation + safety) {
+        return fail(res, 402, apiKeyRec?.spendLimit > 0 ? '该密钥花费额度不足' : insufficientBalanceMessage());
+      }
+      user.reservedTokens = (user.reservedTokens || 0) + tokenReservation;
+      user.reservedBalance = (user.reservedBalance || 0) + amountReservation;
+      if (apiKeyRec) {
+        apiKeyRec.reservedTokens = (apiKeyRec.reservedTokens || 0) + tokenReservation;
+        apiKeyRec.reservedSpend = (apiKeyRec.reservedSpend || 0) + amountReservation;
+      }
+      writeDb(db);
+    }
+
+    const started = Date.now();
+    const wantStream = raw.stream === true;
+    const forward = { ...raw };
+    forward.model = model;
+    forward.max_output_tokens = outputBudget;
+    delete forward.max_tokens;
+    let lastError = null;
+
+    for (const provider of candidates) {
+      try {
+        const proxyKey = await ensureProxyApiKey(db, user, provider, apiKeyRec);
+        if (!proxyKey) {
+          lastError = new Error('missing_proxy_key');
+          continue;
+        }
+        const upstream = await fetchUpstreamResponses(provider, forward, model, proxyKey);
+        if (!upstream.ok) {
+          const errText = await upstream.text().catch(() => '');
+          updateProviderHealth(db, provider.id, false, `responses HTTP ${upstream.status}: ${errText.slice(0, 120)}`);
+          writeDb(db);
+          lastError = new Error(`responses_${upstream.status}`);
+          // No responses endpoint on this upstream — stop passthrough and use chat fallback.
+          if (upstream.status === 404 || upstream.status === 405) break;
+          continue;
+        }
+        updateProviderHealth(db, provider.id, true);
+        writeDb(db);
+
+        if (wantStream) {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-store',
+            Connection: 'keep-alive'
+          });
+          let settled = false;
+          let usage = null;
+          let buffer = '';
+          const cleanup = (reason = 'abort') => {
+            if (settled) return;
+            settled = true;
+            releaseReserve(user, tokenReservation, amountReservation, apiKeyRec);
+            db.logs.unshift({
+              id: id('log'), userId: user.id, apiKeyId: apiKeyRec?.id || null, model,
+              providerId: provider.id, tokens: 0, billedTokens: 0, upstreamCost: 0, chargedAmount: 0,
+              multiplier: rate, latency: Date.now() - started, status: reason, createdAt: new Date().toISOString()
+            });
+            db.logs = db.logs.slice(0, 3000);
+            writeDb(db);
+            try { res.end(); } catch { /* ignore */ }
+          };
+          req.on('close', () => { if (!settled) cleanup('client_abort'); });
+          const scrapeUsage = (chunkText) => {
+            buffer += chunkText;
+            const parts = buffer.split('\n');
+            buffer = parts.pop() || '';
+            for (const line of parts) {
+              const trimmed = line.trim();
+              if (!trimmed.startsWith('data:')) continue;
+              const data = trimmed.slice(5).trim();
+              if (!data || data === '[DONE]') continue;
+              try {
+                const parsed = JSON.parse(data);
+                const u = parsed.response?.usage || parsed.usage || (parsed.type === 'response.completed' ? parsed.response?.usage : null);
+                if (u) usage = normalizeResponsesUsage(u);
+              } catch { /* ignore */ }
+            }
+          };
+          try {
+            const reader = upstream.body?.getReader?.();
+            if (!reader) {
+              for await (const chunk of upstream.body) {
+                if (settled) break;
+                const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+                scrapeUsage(text);
+                res.write(typeof chunk === 'string' ? chunk : Buffer.from(chunk));
+              }
+            } else {
+              const decoder = new TextDecoder();
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (settled) break;
+                const text = decoder.decode(value, { stream: true });
+                scrapeUsage(text);
+                res.write(Buffer.from(value));
+              }
+            }
+          } catch {
+            if (!settled) cleanup('stream_error');
+            return;
+          }
+          if (settled) return;
+          if (!usage) {
+            usage = {
+              prompt_tokens: inputReserve,
+              completion_tokens: estimateTokensFromText(buffer),
+              total_tokens: inputReserve + estimateTokensFromText(buffer)
+            };
+          } else {
+            usage = normalizeResponsesUsage(usage);
+          }
+          settled = true;
+          settleUsage(db, user, provider, usage, providerMultiplier(provider, db), tokenReservation, amountReservation, started, model, 'success', apiKeyRec);
+          writeDb(db);
+          try { res.end(); } catch { /* ignore */ }
+          return;
+        }
+
+        const text = await upstream.text();
+        let result;
+        try { result = JSON.parse(text); } catch {
+          lastError = new Error('invalid_json');
+          continue;
+        }
+        const usage = normalizeResponsesUsage(result.usage || {});
+        settleUsage(db, user, provider, usage, providerMultiplier(provider, db), tokenReservation, amountReservation, started, result.model || model, 'success', apiKeyRec);
+        writeDb(db);
+        return json(res, 200, result);
+      } catch (err) {
+        lastError = err;
+        continue;
+      }
+    }
+
+    // Fallback: old lossy chat conversion. Release reservation then re-enter chat().
+    releaseReserve(user, tokenReservation, amountReservation, apiKeyRec);
+    writeDb(db);
+    const messages = responsesInputToMessages(raw.input, raw.instructions);
+    if (!messages.length) return fail(res, 400, lastError?.message || 'messages 不能为空');
+    const payload = {
+      model: raw.model,
+      messages,
+      stream: raw.stream === true
+    };
+    if (raw.temperature !== undefined) payload.temperature = raw.temperature;
+    if (Array.isArray(raw.tools)) payload.tools = raw.tools;
+    if (raw.tool_choice !== undefined) payload.tool_choice = raw.tool_choice;
+    const maxTok = raw.max_output_tokens != null ? raw.max_output_tokens : raw.max_tokens;
+    if (maxTok != null) payload.max_tokens = maxTok;
+    req._responsesApi = true;
+    return chat(req, res, db, found.user, found.key, payload);
+  }
+
   if (req.method !== 'GET' && req.method !== 'HEAD') return fail(res, 405, 'Method not allowed');
 
   if (url.pathname === '/admin-app' || url.pathname === '/admin-app/') {
@@ -3437,6 +4146,7 @@ initial.checkIns ??= [];
 initial.siteErrors ??= [];
 ensureSiteErrors(initial);
 initial.settings.billingMultiplier ??= DEFAULT_MULTIPLIER;
+initial.settings.billingMultiplierVip1129 ??= DEFAULT_VIP1129_BILLING_MULTIPLIER;
 initial.settings.paymentQrs ??= {};
 ensurePaymentQrs(initial);
 initial.settings.paymentQrMeta ??= {
