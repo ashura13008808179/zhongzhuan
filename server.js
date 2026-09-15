@@ -34,6 +34,7 @@ import { ensureSiteErrors, recordSiteError, clearSiteErrors, tipsForCode, failPa
 import { runDiagnosticSuite } from './diagnostics/run-suite.js';
 import { claimCheckIn, checkInStatus, checkInAdminStats, CHECKIN_LOG_STATUS, money2 } from './lib/checkin.js';
 import { buildMobileInbox, parseUpstreamAccount } from './lib/admin-mobile.js';
+import { pushPaymentEvent, waitForEvents, currentSeq, publicPaymentEvent } from './lib/payment-events.js';
 import {
   compactGroupMap,
   normalizeAvailableGroups,
@@ -177,6 +178,36 @@ function fulfillPaymentOrder(db, order, meta = {}) {
   if (!order.userReportedAt) order.userReportedAt = order.confirmedAt;
   audit(db, { actorId: meta.confirmedBy || 'gateway', action: 'payment.order.confirm', target: order.id, detail: { amount: order.amount, method: order.method, code: card.code, userId: order.userId, tradeNo: order.gatewayTradeNo, via: meta.via || 'gateway' } });
   return { ok: true, order, card };
+}
+
+function emitPayment(order, kind) {
+  if (!order) return;
+  pushPaymentEvent({
+    kind,
+    orderId: order.id,
+    userId: order.userId,
+    username: order.username || '',
+    amount: order.amount,
+    method: order.method,
+    payNote: order.payNote,
+    status: order.status,
+    code: kind === 'confirmed' ? (order.code || null) : null
+  });
+}
+
+function mobileInboxPayload(db, user) {
+  const inbox = buildMobileInbox(db);
+  const meta = paymentQrMeta(db);
+  return {
+    ...inbox,
+    finance: poolStats(db),
+    me: safeUser(user),
+    paymentQr: {
+      wechat: paymentQrStatus(meta.wechatExpiresAt),
+      alipay: paymentQrStatus(meta.alipayExpiresAt),
+      note: meta.note || ''
+    }
+  };
 }
 
 
@@ -366,6 +397,8 @@ function poolStats(db) {
   let upstreamCostToday = 0;
   let chargedToday = 0;
   let requestCountToday = 0;
+  let upstreamCostEstimatedCount = 0;
+  let upstreamCostReportedCount = 0;
   for (const log of db.logs || []) {
     if (!log?.createdAt || localDay(new Date(log.createdAt)) !== day) continue;
     if (log.status === 'referral_rebate' || log.status === CHECKIN_LOG_STATUS) continue;
@@ -380,6 +413,8 @@ function poolStats(db) {
       upstreamByProvider[pid].chargedAmount += Number.isFinite(charged) ? charged : 0;
       upstreamByProvider[pid].requests += 1;
     }
+    if (log.upstreamCostSource === 'reported') upstreamCostReportedCount += 1;
+    else if (Number.isFinite(up) && up > 0) upstreamCostEstimatedCount += 1;
     if (Number.isFinite(charged) && charged > 0) chargedToday += charged;
   }
 
@@ -397,6 +432,9 @@ function poolStats(db) {
     upstreamCostToday: Math.round(upstreamCostToday * 10000) / 10000,
     chargedToday: Math.round(chargedToday * 10000) / 10000,
     requestCountToday,
+    upstreamCostEstimatedCount,
+    upstreamCostReportedCount,
+    upstreamCostIsEstimate: upstreamCostReportedCount === 0,
     upstreamByProvider: Object.values(upstreamByProvider).sort((a, b) => b.upstreamCost - a.upstreamCost)
   };
 }
@@ -569,7 +607,31 @@ async function autofillBeibeihaiGroupMap(db, token = null) {
     cfg.groupMap = nextMap;
     saveBeibeihaiConfig(db, cfg);
   }
+  applyUpstreamGroupRates(db, 'beibeihai', groups);
   return cfg;
+}
+
+function applyUpstreamGroupRates(db, kind, groups) {
+  const list = Array.isArray(groups) ? groups : [];
+  const byId = new Map(list.map(g => [Number(g.id), g]));
+  const cfg = kind === 'vip1129' ? getVip1129Config(db) : getBeibeihaiConfig(db);
+  const map = cfg?.groupMap || {};
+  let changed = 0;
+  for (const provider of db.settings?.providers || []) {
+    const sync = provider.upstreamSync || (kind === 'vip1129' && isVip1129Provider(provider) ? 'vip1129' : (kind === 'beibeihai' && isBeibeihaiProvider(provider) ? 'beibeihai' : null));
+    if (sync !== kind) continue;
+    const upId = map[provider.id];
+    if (upId == null || upId === '') continue;
+    const g = byId.get(Number(upId));
+    if (!g) continue;
+    const rate = Number(g.rate_multiplier);
+    if (!Number.isFinite(rate) || rate < 0) continue;
+    if (Number(provider.upstreamRateMultiplier) !== rate) {
+      provider.upstreamRateMultiplier = rate;
+      changed += 1;
+    }
+  }
+  return changed;
 }
 
 async function autofillVip1129GroupMap(db, token = null) {
@@ -589,6 +651,7 @@ async function autofillVip1129GroupMap(db, token = null) {
     cfg.groupMap = nextMap;
     saveVip1129Config(db, cfg);
   }
+  applyUpstreamGroupRates(db, 'vip1129', groups);
   return cfg;
 }
 
@@ -1311,7 +1374,8 @@ function normalizeProvider(item, previous = null) {
     if (!price || typeof price !== 'object') continue;
     modelPrices[model] = {
       inputPricePer1K: Math.max(0, Number(price.inputPricePer1K || 0)),
-      outputPricePer1K: Math.max(0, Number(price.outputPricePer1K || 0))
+      outputPricePer1K: Math.max(0, Number(price.outputPricePer1K || 0)),
+      cacheReadPricePer1K: Math.max(0, Number(price.cacheReadPricePer1K ?? price.cache_read_price_per_1k ?? (Number(price.inputPricePer1K || 0) * 0.1)))
     };
   }
   const upstreamSync = item.upstreamSync || previous?.upstreamSync || null;
@@ -1325,6 +1389,12 @@ function normalizeProvider(item, previous = null) {
     models: Array.isArray(item.models) ? item.models.map(String) : (previous?.models || []),
     inputPricePer1K: Math.max(0, Number(item.inputPricePer1K ?? previous?.inputPricePer1K ?? 0)),
     outputPricePer1K: Math.max(0, Number(item.outputPricePer1K ?? previous?.outputPricePer1K ?? 0)),
+    cacheReadPricePer1K: Math.max(0, Number(item.cacheReadPricePer1K ?? previous?.cacheReadPricePer1K ?? ((Number(item.inputPricePer1K ?? previous?.inputPricePer1K ?? 0) || 0) * 0.1))),
+    upstreamRateMultiplier: (() => {
+      const raw = item.upstreamRateMultiplier ?? previous?.upstreamRateMultiplier;
+      const n = Number(raw);
+      return Number.isFinite(n) && n >= 0 ? n : 1;
+    })(),
     enabled: item.enabled !== false,
     priority: Number.isFinite(Number(item.priority)) ? Number(item.priority) : (Number(previous?.priority) || 100),
     billingMultiplier: (() => {
@@ -1493,13 +1563,94 @@ function modelPrice(provider, model, kind) {
   }
   const fallback = Number(provider.pricePer1K || 0);
   if (kind === 'inputPricePer1K') return Number(provider.inputPricePer1K ?? fallback);
+  if (kind === 'outputPricePer1K') return Number(provider.outputPricePer1K ?? fallback);
+  if (kind === 'cacheReadPricePer1K') {
+    const explicit = Number(provider.cacheReadPricePer1K);
+    if (Number.isFinite(explicit) && explicit >= 0) return explicit;
+    // OpenAI-style cache read ≈ 10% of input when upstream omits a dedicated price.
+    return modelPrice(provider, model, 'inputPricePer1K') * 0.1;
+  }
   return Number(provider.outputPricePer1K ?? fallback);
 }
-function providerCost(provider, usage, model) {
+/** Prefer real upstream bill fields when present (vip1129/beibeihai usage.*_cost). */
+function extractReportedUpstreamCost(usage) {
+  if (!usage || typeof usage !== 'object') return null;
+  const candidates = [
+    usage.actual_cost, usage.actualCost,
+    usage.total_cost, usage.totalCost,
+    usage.cost, usage.upstream_cost, usage.upstreamCost,
+    usage.billing_amount, usage.billingAmount,
+    usage.quota_cost, usage.quotaCost
+  ];
+  for (const c of candidates) {
+    const n = Number(c);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return null;
+}
+/** Group rate_multiplier from vip1129/beibeihai; 1 when unset (prices already effective). */
+function providerUpstreamRate(provider) {
+  const n = Number(provider?.upstreamRateMultiplier);
+  return Number.isFinite(n) && n >= 0 ? n : 1;
+}
+/**
+ * Base token cost BEFORE group rate_multiplier.
+ * Uses prompt_tokens_details.cached_tokens when present (chat usage often folds cache into prompt_tokens).
+ */
+function estimateBaseUpstreamCost(provider, usage, model) {
   const resolvedModel = model || provider.defaultModel || '';
   const inputPrice = modelPrice(provider, resolvedModel, 'inputPricePer1K');
   const outputPrice = modelPrice(provider, resolvedModel, 'outputPricePer1K');
-  return ((Number(usage.prompt_tokens || 0) / 1000) * inputPrice) + ((Number(usage.completion_tokens || 0) / 1000) * outputPrice);
+  const cachePrice = modelPrice(provider, resolvedModel, 'cacheReadPricePer1K');
+  const cacheWritePrice = modelPrice(provider, resolvedModel, 'cacheWritePricePer1K');
+  const prompt = Math.max(0, Number(usage?.prompt_tokens ?? usage?.input_tokens ?? 0) || 0);
+  const completion = Math.max(0, Number(usage?.completion_tokens ?? usage?.output_tokens ?? 0) || 0);
+  const cachedRaw = Number(
+    usage?.prompt_tokens_details?.cached_tokens ??
+    usage?.input_tokens_details?.cached_tokens ??
+    usage?.cache_read_input_tokens ??
+    usage?.cache_read_tokens ??
+    usage?.cached_tokens ??
+    0
+  ) || 0;
+  const cacheWriteRaw = Number(
+    usage?.cache_creation_input_tokens ??
+    usage?.cache_creation_tokens ??
+    usage?.cache_write_tokens ??
+    usage?.input_tokens_details?.cache_write_tokens ??
+    usage?.input_tokens_details?.cache_creation_tokens ??
+    usage?.prompt_tokens_details?.cache_write_tokens ??
+    0
+  ) || 0;
+  // OpenAI-style: cache is folded into prompt/input_tokens → subtract.
+  // vip1129 usage-style: input_tokens is fresh-only and cache_read_tokens is separate → add.
+  let cacheTokens;
+  let freshInput;
+  if (cachedRaw > prompt && prompt > 0) {
+    freshInput = prompt;
+    cacheTokens = cachedRaw;
+  } else {
+    cacheTokens = Math.min(prompt, Math.max(0, cachedRaw));
+    freshInput = Math.max(0, prompt - cacheTokens);
+  }
+  const writeTokens = Math.max(0, cacheWriteRaw);
+  const writePrice = Number.isFinite(Number(cacheWritePrice)) && Number(cacheWritePrice) > 0
+    ? Number(cacheWritePrice)
+    : inputPrice;
+  return (freshInput / 1000) * inputPrice
+    + (cacheTokens / 1000) * cachePrice
+    + (writeTokens / 1000) * writePrice
+    + (completion / 1000) * outputPrice;
+}
+/** Real upstream bill when reported; else base×upstreamRateMultiplier (NOT displayMultiplier). */
+function resolveUpstreamCost(provider, usage, model) {
+  const reported = extractReportedUpstreamCost(usage);
+  if (reported != null) return { cost: reported, source: 'reported' };
+  const cost = estimateBaseUpstreamCost(provider, usage, model) * providerUpstreamRate(provider);
+  return { cost, source: 'estimated' };
+}
+function providerCost(provider, usage, model) {
+  return resolveUpstreamCost(provider, usage, model).cost;
 }
 function estimatedCost(provider, inputTokens, outputTokens, model) {
   return providerCost(provider, { prompt_tokens: inputTokens, completion_tokens: outputTokens }, model);
@@ -1507,8 +1658,44 @@ function estimatedCost(provider, inputTokens, outputTokens, model) {
 function safetyBuffer(provider, rate, model) {
   const input = modelPrice(provider, model || provider.defaultModel || '', 'inputPricePer1K');
   const output = modelPrice(provider, model || provider.defaultModel || '', 'outputPricePer1K');
-  const minCost = Math.max(input, output) / 1000 * rate;
+  const upRate = providerUpstreamRate(provider);
+  const minCost = Math.max(input, output) / 1000 * upRate * rate;
   return Math.max(BALANCE_SAFETY_BUFFER, minCost);
+}
+
+// Only treat balance as nearly empty when it cannot cover a tiny reply.
+// Do NOT nag / lock accounts while they still have a few yuan left.
+const MIN_REPLY_TOKENS = Math.max(32, Number(process.env.MIN_REPLY_TOKENS || 64));
+const LOW_BALANCE_FLOOR = Math.max(0.01, Number(process.env.LOW_BALANCE_FLOOR || 0.05));
+function minimalReplyCost(provider, rate, model) {
+  return estimatedCost(provider, 0, MIN_REPLY_TOKENS, model) * rate;
+}
+function isNearlyEmptyBalance(user, provider, rate, model) {
+  const bal = Math.max(0, Number(user?.balance || 0));
+  const need = Math.max(LOW_BALANCE_FLOOR, minimalReplyCost(provider, rate, model) * 2);
+  return bal < need;
+}
+function requestTooLargeMessage() {
+  return '当前余额不够完成本次较大请求，请缩短上下文或稍后再试；余额快用完时才会提示充值。';
+}
+function scrubStuckReserves(user, apiKeyRec = null) {
+  if (!user) return;
+  const bal = Math.max(0, Number(user.balance || 0));
+  const reservedBal = Math.max(0, Number(user.reservedBalance || 0));
+  const reservedTok = Math.max(0, Number(user.reservedTokens || 0));
+  // Stuck pre-auth leftovers should not fake "no money".
+  if (reservedBal > bal || reservedTok > 20000) {
+    user.reservedBalance = 0;
+    user.reservedTokens = 0;
+  }
+  if (apiKeyRec) {
+    const rSpend = Math.max(0, Number(apiKeyRec.reservedSpend || 0));
+    const rTok = Math.max(0, Number(apiKeyRec.reservedTokens || 0));
+    if (rSpend > bal || rTok > 20000) {
+      apiKeyRec.reservedSpend = 0;
+      apiKeyRec.reservedTokens = 0;
+    }
+  }
 }
 function publicProvider(provider) {
   return {
@@ -1522,6 +1709,8 @@ function publicProvider(provider) {
     enabled: provider.enabled !== false,
     inputPricePer1K: Number(provider.inputPricePer1K ?? provider.pricePer1K ?? 0),
     outputPricePer1K: Number(provider.outputPricePer1K ?? provider.pricePer1K ?? 0),
+    cacheReadPricePer1K: Number(provider.cacheReadPricePer1K ?? ((Number(provider.inputPricePer1K ?? provider.pricePer1K ?? 0) || 0) * 0.1)),
+    upstreamRateMultiplier: providerUpstreamRate(provider),
     priority: Number(provider.priority ?? 100),
     billingMultiplier: (() => {
       const parsed = normalizeBillingMultiplier(provider.billingMultiplier);
@@ -1686,8 +1875,11 @@ async function probeProviderChat(db, provider) {
 function settleUsage(db, user, provider, usage, rate, tokenReservation, amountReservation, started, model, status = 'success', apiKeyRec = null) {
   const upstreamTokens = Math.max(0, Number(usage.total_tokens || ((usage.prompt_tokens || 0) + (usage.completion_tokens || 0))));
   const billedTokens = Math.min(upstreamTokens * rate, tokenReservation);
-  const upstreamCost = providerCost(provider, usage, model);
+  const resolvedUp = resolveUpstreamCost(provider, usage, model);
+  const upstreamCost = resolvedUp.cost;
+  const upstreamCostSource = resolvedUp.source;
   // rate 为上游专用全局倍率（beibeihai→billingMultiplier，vip1129→billingMultiplierVip1129），由 providerMultiplier 选出；渠道 displayMultiplier/billingMultiplier 为摆设，不参与。
+  // upstreamCost 已对齐上游实扣（reported actual_cost，或 base×upstreamRateMultiplier）。
   const chargedAmount = upstreamCost * rate;
   user.reservedTokens = Math.max(0, (user.reservedTokens || 0) - tokenReservation);
   user.reservedBalance = Math.max(0, (user.reservedBalance || 0) - amountReservation);
@@ -1710,8 +1902,8 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
     apiKeyRec.reservedTokens = Math.max(0, (apiKeyRec.reservedTokens || 0) - tokenReservation);
     apiKeyRec.reservedSpend = Math.max(0, (apiKeyRec.reservedSpend || 0) - amountReservation);
   }
-  if (!isUnlimited(user) && user.balance <= safetyBuffer(provider, rate, model)) {
-    user.balance = 0;
+  // Only lock when nearly empty. Never wipe remaining yuan just to force a top-up.
+  if (!isUnlimited(user) && isNearlyEmptyBalance(user, provider, rate, model)) {
     user.accountActive = false;
   }
   db.logs.unshift({
@@ -1723,6 +1915,7 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
     tokens: upstreamTokens,
     billedTokens,
     upstreamCost,
+    upstreamCostSource,
     chargedAmount,
     multiplier: rate,
     latency: Date.now() - started,
@@ -1730,7 +1923,7 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
     createdAt: new Date().toISOString()
   });
   db.logs = db.logs.slice(0, 3000);
-  return { billedTokens, chargedAmount, upstreamTokens, upstreamCost };
+  return { billedTokens, chargedAmount, upstreamTokens, upstreamCost, upstreamCostSource };
 }
 function releaseReserve(user, tokenReservation, amountReservation, apiKeyRec = null) {
   user.reservedTokens = Math.max(0, (user.reservedTokens || 0) - tokenReservation);
@@ -1892,8 +2085,44 @@ function normalizeResponsesUsage(usage) {
   }
   const prompt = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0) || 0;
   const completion = Number(usage.completion_tokens ?? usage.output_tokens ?? 0) || 0;
+  const cached = Number(
+    usage.prompt_tokens_details?.cached_tokens ??
+    usage.input_tokens_details?.cached_tokens ??
+    usage.cache_read_input_tokens ??
+    usage.cache_read_tokens ??
+    usage.cached_tokens ??
+    0
+  ) || 0;
+  const cacheCreation = Number(
+    usage.cache_creation_input_tokens ??
+    usage.cache_creation_tokens ??
+    usage.cache_write_tokens ??
+    usage.input_tokens_details?.cache_write_tokens ??
+    usage.input_tokens_details?.cache_creation_tokens ??
+    usage.prompt_tokens_details?.cache_write_tokens ??
+    0
+  ) || 0;
   const total = Number(usage.total_tokens ?? (prompt + completion)) || (prompt + completion);
-  return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: total };
+  const out = {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: total,
+    input_tokens: prompt,
+    output_tokens: completion,
+    // Preserve for estimateBaseUpstreamCost (folded or separate cache).
+    cache_read_tokens: cached,
+    cached_tokens: cached,
+    cache_creation_tokens: cacheCreation,
+  };
+  if (cached > 0) {
+    out.prompt_tokens_details = { cached_tokens: cached, ...(usage.prompt_tokens_details || {}) };
+    out.input_tokens_details = { cached_tokens: cached, ...(usage.input_tokens_details || {}) };
+  }
+  // Pass through reported bill fields if upstream ever includes them.
+  for (const k of ['actual_cost', 'actualCost', 'total_cost', 'totalCost', 'cost', 'upstream_cost', 'billing_amount', 'quota_cost']) {
+    if (usage[k] != null) out[k] = usage[k];
+  }
+  return out;
 }
 
 async function fetchUpstreamResponses(provider, payload, model, overrideApiKey = null) {
@@ -2142,6 +2371,7 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
   }
   if (isBanned(user)) return fail(res, 403, '账号已被封禁');
   if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
+  scrubStuckReserves(user, apiKeyRec);
 
   const candidates = providersForModel(payload, db);
   if (!candidates.length) return fail(res, 503, '模型服务暂不可用，请稍后重试');
@@ -2182,16 +2412,38 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
       const keyLeft = Math.max(0, apiKeyRec.tokenLimit - (apiKeyRec.tokenUsed || 0) - (apiKeyRec.reservedTokens || 0));
       outputBudget = Math.min(outputBudget, Math.max(0, Math.floor(keyLeft / rate) - inputReserve));
     }
+    // If the full requested size does not fit, still allow a small reply when balance is not nearly empty.
     if (outputBudget < 1) {
-      const keyTokenBlocked = apiKeyRec?.tokenLimit > 0 && moneyBudget >= 1;
-      return fail(res, 402, keyTokenBlocked ? '该密钥 Token 额度不足' : (apiKeyRec?.spendLimit > 0 ? '该密钥消费额度不足' : insufficientBalanceMessage()));
+      const minCost = minimalReplyCost(primary, rate, model) + estimatedCost(primary, inputReserve, 0, model) * rate + safety;
+      if (availableBalance >= minCost) {
+        outputBudget = MIN_REPLY_TOKENS;
+      } else {
+        const keyTokenBlocked = apiKeyRec?.tokenLimit > 0 && moneyBudget >= 1;
+        if (keyTokenBlocked) return fail(res, 402, '该密钥 Token 额度不足');
+        if (apiKeyRec?.spendLimit > 0) return fail(res, 402, '该密钥花费额度不足');
+        return fail(res, 402, isNearlyEmptyBalance({ balance: availableBalance }, primary, rate, model)
+          ? insufficientBalanceMessage()
+          : requestTooLargeMessage());
+      }
     }
 
     const upstreamReservation = inputReserve + outputBudget;
     tokenReservation = upstreamReservation * rate;
     amountReservation = estimatedCost(primary, inputReserve, outputBudget, model) * rate;
     if (availableBalance < amountReservation + safety) {
-      return fail(res, 402, apiKeyRec?.spendLimit > 0 ? '该密钥消费额度不足' : insufficientBalanceMessage());
+      // Shrink output once more instead of immediately nagging for a top-up.
+      const affordOut = Math.max(0, Math.floor(Math.max(0, availableBalance - safety - estimatedCost(primary, inputReserve, 0, model) * rate) / outputUnitPrice));
+      if (affordOut >= MIN_REPLY_TOKENS) {
+        outputBudget = Math.min(outputBudget, affordOut);
+        tokenReservation = (inputReserve + outputBudget) * rate;
+        amountReservation = estimatedCost(primary, inputReserve, outputBudget, model) * rate;
+      } else if (apiKeyRec?.spendLimit > 0) {
+        return fail(res, 402, '该密钥花费额度不足');
+      } else {
+        return fail(res, 402, isNearlyEmptyBalance({ balance: availableBalance }, primary, rate, model)
+          ? insufficientBalanceMessage()
+          : requestTooLargeMessage());
+      }
     }
 
     user.reservedTokens = (user.reservedTokens || 0) + tokenReservation;
@@ -2908,6 +3160,7 @@ const server = http.createServer(async (req, res) => {
     db.paymentOrders.unshift(order);
     audit(db, { actorId: user.id, action: 'payment.order.prepare', target: order.id, detail: { amount, method, payNote: order.payNote, payMode: order.payMode } });
     writeDb(db);
+    emitPayment(order, 'placed');
     if (useGateway) {
       return json(res, 200, {
         orderId: order.id,
@@ -2962,6 +3215,7 @@ const server = http.createServer(async (req, res) => {
     order.userReportedAt = new Date().toISOString();
     audit(db, { actorId: user.id, action: 'payment.order.claim', target: order.id, detail: { amount: order.amount, method: order.method, payNote: order.payNote } });
     writeDb(db);
+    emitPayment(order, 'paid');
     return json(res, 200, {
       orderId: order.id,
       status: order.status,
@@ -2974,6 +3228,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/recharge/orders') {
     if (!user) return fail(res, 401, '未登录');
+    if (isBanned(user)) return fail(res, 403, '账号已被封禁');
     db.paymentOrders ??= [];
     const orders = db.paymentOrders
       .filter(o => o.userId === user.id)
@@ -2992,6 +3247,19 @@ const server = http.createServer(async (req, res) => {
         rejectReason: o.rejectReason || null
       }));
     return json(res, 200, { orders });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/recharge/wait') {
+    if (!user) return fail(res, 401, '未登录');
+    if (isBanned(user)) return fail(res, 403, '账号已被封禁');
+    const rawAfter = url.searchParams.get('after');
+    const after = rawAfter == null || rawAfter === '' ? -1 : Number(rawAfter);
+    const timeoutMs = Number(url.searchParams.get('timeoutMs') || 25000);
+    const evs = await waitForEvents(after, { userId: user.id, timeoutMs });
+    return json(res, 200, {
+      seq: currentSeq(),
+      events: evs.map(e => publicPaymentEvent(e, { includeCode: true }))
+    });
   }
 
   if (req.method === 'GET' && url.pathname === '/api/admin/payment-orders') {
@@ -3051,6 +3319,7 @@ const server = http.createServer(async (req, res) => {
     if (!order.userReportedAt) order.userReportedAt = order.confirmedAt;
     audit(db, { actorId: user.id, action: 'payment.order.confirm', target: order.id, detail: { amount: order.amount, method: order.method, code: card.code, userId: order.userId, payNote: order.payNote } });
     writeDb(db);
+    emitPayment(order, 'confirmed');
     return json(res, 200, { order, message: '已确认到账并发放卡密' });
   }
 
@@ -3068,6 +3337,7 @@ const server = http.createServer(async (req, res) => {
     order.confirmedBy = user.id;
     audit(db, { actorId: user.id, action: 'payment.order.reject', target: order.id, detail: { reason: order.rejectReason, payNote: order.payNote } });
     writeDb(db);
+    emitPayment(order, 'rejected');
     return json(res, 200, { order, message: '已拒绝该付款确认' });
   }
 
@@ -3141,20 +3411,23 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { last: db.settings?.lastDiagnostics || null });
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/admin/mobile/inbox/wait') {
+    if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
+    const rawAfter = url.searchParams.get('after');
+    const after = rawAfter == null || rawAfter === '' ? -1 : Number(rawAfter);
+    const timeoutMs = Number(url.searchParams.get('timeoutMs') || 25000);
+    const evs = await waitForEvents(after, { timeoutMs });
+    const dbNow = readDb();
+    return json(res, 200, {
+      seq: currentSeq(),
+      events: evs.map(e => publicPaymentEvent(e, { includeCode: false })),
+      inbox: mobileInboxPayload(dbNow, user)
+    });
+  }
+
   if (req.method === 'GET' && (url.pathname === '/api/admin/mobile/inbox' || url.pathname === '/api/admin/inbox')) {
     if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
-    const inbox = buildMobileInbox(db);
-    const meta = paymentQrMeta(db);
-    return json(res, 200, {
-      ...inbox,
-      finance: poolStats(db),
-      me: safeUser(user),
-      paymentQr: {
-        wechat: paymentQrStatus(meta.wechatExpiresAt),
-        alipay: paymentQrStatus(meta.alipayExpiresAt),
-        note: meta.note || ''
-      }
-    });
+    return json(res, 200, mobileInboxPayload(db, user));
   }
 
   if (req.method === 'GET' && url.pathname === '/api/admin/upstream-accounts') {
@@ -3388,6 +3661,7 @@ const server = http.createServer(async (req, res) => {
       confirmedBy: 'epay'
     });
     writeDb(db2);
+    if (result.ok && !result.already) emitPayment(order, 'confirmed');
     res.writeHead(result.ok ? 200 : 500, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end(result.ok ? 'success' : 'fail');
     return;
@@ -3913,6 +4187,7 @@ const server = http.createServer(async (req, res) => {
     if (apiKeyRec && apiKeyRec.enabled === false) return fail(res, 403, '该 API 密钥已停用');
     if (isBanned(user)) return fail(res, 403, '账号已被封禁');
     if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
+    scrubStuckReserves(user, apiKeyRec);
 
     // Prefer native /v1/responses passthrough (keeps tools / function_call for Codex).
     // Fall back to lossy chat/completions conversion only if every upstream rejects responses.
@@ -3953,16 +4228,39 @@ const server = http.createServer(async (req, res) => {
         const keyLeft = Math.max(0, apiKeyRec.tokenLimit - (apiKeyRec.tokenUsed || 0) - (apiKeyRec.reservedTokens || 0));
         outputBudget = Math.min(outputBudget, Math.max(0, Math.floor(keyLeft / rate) - inputReserve));
       }
-      if (outputBudget < 1) {
+      // If the full requested size does not fit, still allow a small reply when balance is not nearly empty.
+    if (outputBudget < 1) {
+      const minCost = minimalReplyCost(primary, rate, model) + estimatedCost(primary, inputReserve, 0, model) * rate + safety;
+      if (availableBalance >= minCost) {
+        outputBudget = MIN_REPLY_TOKENS;
+      } else {
         const keyTokenBlocked = apiKeyRec?.tokenLimit > 0 && moneyBudget >= 1;
-        return fail(res, 402, keyTokenBlocked ? '该密钥 Token 额度不足' : (apiKeyRec?.spendLimit > 0 ? '该密钥花费额度不足' : insufficientBalanceMessage()));
+        if (keyTokenBlocked) return fail(res, 402, '该密钥 Token 额度不足');
+        if (apiKeyRec?.spendLimit > 0) return fail(res, 402, '该密钥花费额度不足');
+        return fail(res, 402, isNearlyEmptyBalance({ balance: availableBalance }, primary, rate, model)
+          ? insufficientBalanceMessage()
+          : requestTooLargeMessage());
       }
-      const upstreamReservation = inputReserve + outputBudget;
-      tokenReservation = upstreamReservation * rate;
-      amountReservation = estimatedCost(primary, inputReserve, outputBudget, model) * rate;
-      if (availableBalance < amountReservation + safety) {
-        return fail(res, 402, apiKeyRec?.spendLimit > 0 ? '该密钥花费额度不足' : insufficientBalanceMessage());
+    }
+
+    const upstreamReservation = inputReserve + outputBudget;
+    tokenReservation = upstreamReservation * rate;
+    amountReservation = estimatedCost(primary, inputReserve, outputBudget, model) * rate;
+    if (availableBalance < amountReservation + safety) {
+      // Shrink output once more instead of immediately nagging for a top-up.
+      const affordOut = Math.max(0, Math.floor(Math.max(0, availableBalance - safety - estimatedCost(primary, inputReserve, 0, model) * rate) / outputUnitPrice));
+      if (affordOut >= MIN_REPLY_TOKENS) {
+        outputBudget = Math.min(outputBudget, affordOut);
+        tokenReservation = (inputReserve + outputBudget) * rate;
+        amountReservation = estimatedCost(primary, inputReserve, outputBudget, model) * rate;
+      } else if (apiKeyRec?.spendLimit > 0) {
+        return fail(res, 402, '该密钥花费额度不足');
+      } else {
+        return fail(res, 402, isNearlyEmptyBalance({ balance: availableBalance }, primary, rate, model)
+          ? insufficientBalanceMessage()
+          : requestTooLargeMessage());
       }
+    }
       user.reservedTokens = (user.reservedTokens || 0) + tokenReservation;
       user.reservedBalance = (user.reservedBalance || 0) + amountReservation;
       if (apiKeyRec) {
@@ -4228,6 +4526,10 @@ for (const provider of initial.settings.providers) {
   provider.modelPrices ??= {};
   provider.health ??= { ok: true, lastCheckedAt: null, lastError: null };
   provider.displayMultiplier = resolveDisplayMultiplier(provider);
+  if (!Number.isFinite(Number(provider.upstreamRateMultiplier))) provider.upstreamRateMultiplier = 1;
+  if (!Number.isFinite(Number(provider.cacheReadPricePer1K))) {
+    provider.cacheReadPricePer1K = Math.max(0, Number(provider.inputPricePer1K || 0) * 0.1);
+  }
 }
 if (!initial.settings.providers.length && LEGACY_UPSTREAM.url && LEGACY_UPSTREAM.apiKey) {
   initial.settings.providers.push({

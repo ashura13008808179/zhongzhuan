@@ -21,6 +21,10 @@ class Prefs(ctx: Context) {
         get() = sp.getBoolean("seeded", false)
         set(v) { sp.edit().putBoolean("seeded", v).apply() }
 
+    var lastEventSeq: Long
+        get() = sp.getLong("lastEventSeq", -1L)
+        set(v) { sp.edit().putLong("lastEventSeq", v).apply() }
+
     /** 订单通知是否震动；系统通知始终会发，仅震动受此开关控制。默认开。 */
     var vibrateEnabled: Boolean
         get() = sp.getBoolean("vibrateEnabled", true)

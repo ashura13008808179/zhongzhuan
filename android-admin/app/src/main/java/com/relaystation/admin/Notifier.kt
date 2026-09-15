@@ -87,11 +87,15 @@ object Notifier {
         } catch (_: SecurityException) { }
     }
 
-    fun notifyOrder(ctx: Context, title: String, body: String) {
+    fun notifyOrder(ctx: Context, title: String, body: String, tag: String = "") {
         ensureChannels(ctx)
         val vibe = Prefs(ctx).vibrateEnabled
         val channel = if (vibe) CHANNEL_ORDER_VIBE else CHANNEL_ORDER_QUIET
-        val notifId = (System.currentTimeMillis() and 0x7fffffff).toInt().let { if (it == ID_DUTY) it + 1 else it }
+        val notifId = if (tag.isNotBlank()) {
+            tag.hashCode().and(0x7fffffff).let { if (it == ID_DUTY || it == 0) it + 2 else it }
+        } else {
+            (System.currentTimeMillis() and 0x7fffffff).toInt().let { if (it == ID_DUTY) it + 1 else it }
+        }
 
         val builder = NotificationCompat.Builder(ctx, channel)
             .setSmallIcon(R.drawable.ic_launcher)

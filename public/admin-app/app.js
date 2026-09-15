@@ -2,8 +2,8 @@ const TOKEN_KEY = 'relay_admin_app_token';
 const $ = (s) => document.querySelector(s);
 let token = localStorage.getItem(TOKEN_KEY) || '';
 let tab = 'home';
-let lastNotifyIds = JSON.parse(localStorage.getItem('relay_admin_notify_ids') || '[]');
 let pollTimer = null;
+let pollCtl = null;
 
 function bridge() {
   return window.AdminBridge || window.Android || null;
@@ -131,48 +131,62 @@ function logout() {
 
 function startPoll() {
   stopPoll();
-  tickInbox();
-  pollTimer = setInterval(tickInbox, 15000);
+  const ctl = new AbortController();
+  pollCtl = ctl;
+  let afterRaw = localStorage.getItem('relay_admin_event_seq');
+  let after = afterRaw == null || afterRaw === '' ? -1 : Number(afterRaw);
+  (async () => {
+    while (token && pollCtl === ctl && !ctl.signal.aborted) {
+      try {
+        const r = await fetch('/api/admin/mobile/inbox/wait?after=' + after, {
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {})
+          },
+          signal: ctl.signal
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw Error(j.error || '请求失败');
+        after = Number.isFinite(Number(j.seq)) ? Number(j.seq) : after;
+        localStorage.setItem('relay_admin_event_seq', String(after));
+        const events = j.events || [];
+        const alertable = events.filter(ev => ev.kind === 'placed' || ev.kind === 'paid');
+        if (alertable.length) {
+          const first = alertable.find(e => e.kind === 'paid') || alertable[0];
+          const title = alertable.some(e => e.kind === 'paid')
+            ? `待核对充值 ${alertable.length} 笔`
+            : `有人发起充值 ${alertable.length} 笔`;
+          const body = first
+            ? `${first.username || '用户'} ¥${Number(first.amount || 0).toFixed(0)} · ${methodLabel(first.method)} · 备注 ${first.payNote || '-'}`
+            : '请打开值班台确认到账';
+          try {
+            const b = bridge();
+            const vibeOn = !(b && typeof b.getVibrateEnabled === 'function') || String(b.getVibrateEnabled()) === '1';
+            if (vibeOn && navigator.vibrate) navigator.vibrate([180, 80, 180, 80, 320]);
+          } catch { /* ignore */ }
+          const badge = document.querySelector('[data-tab="orders"]');
+          const inbox = j.inbox || {};
+          if (badge && tab !== 'orders') badge.textContent = `充值(${inbox.pendingCount ?? alertable.length})`;
+        }
+        if ((tab === 'home' || tab === 'orders') && j.inbox) render(j.inbox);
+      } catch (err) {
+        if (ctl.signal.aborted) return;
+        if (String(err.message || '').includes('未登录') || String(err.message || '').includes('需要管理员')) {
+          logout();
+          return;
+        }
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    }
+  })();
 }
 function stopPoll() {
+  if (pollCtl) {
+    try { pollCtl.abort(); } catch { /* ignore */ }
+    pollCtl = null;
+  }
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = null;
-}
-
-async function tickInbox() {
-  if (!token) return;
-  try {
-    const inbox = await api('/api/admin/mobile/inbox');
-    const ids = inbox.notifyIds || [];
-    const seeded = localStorage.getItem('relay_admin_notify_seeded') === '1';
-    if (!seeded) {
-      lastNotifyIds = ids;
-      localStorage.setItem('relay_admin_notify_ids', JSON.stringify(ids));
-      localStorage.setItem('relay_admin_notify_seeded', '1');
-    } else {
-      const fresh = ids.filter(id => !lastNotifyIds.includes(id));
-      if (fresh.length) {
-        const first = (inbox.pending || []).find(o => o.id === fresh[0]);
-        const title = `待核对充值 ${fresh.length} 笔`;
-        const body = first
-          ? `${first.username || first.email || '用户'} ¥${Number(first.amount || 0).toFixed(0)} · ${methodLabel(first.method)} · 备注 ${first.payNote || '-'}`
-          : '请打开值班台确认到账';
-        tellNative('onNewOrders', JSON.stringify({ title, body, count: fresh.length, ids: fresh }));
-        try {
-          const b = bridge();
-          const vibeOn = !(b && typeof b.getVibrateEnabled === 'function') || String(b.getVibrateEnabled()) === '1';
-          if (vibeOn && navigator.vibrate) navigator.vibrate([180, 80, 180, 80, 320]);
-        } catch { /* ignore */ }
-        const badge = document.querySelector('[data-tab="orders"]');
-        if (badge && tab !== 'orders') badge.textContent = `充值(${inbox.pendingCount})`;
-      }
-      lastNotifyIds = ids;
-      localStorage.setItem('relay_admin_notify_ids', JSON.stringify(ids));
-    }
-    if (tab === 'home' || tab === 'orders') render(inbox);
-  } catch (err) {
-    if (String(err.message).includes('未登录') || String(err.message).includes('需要管理员')) logout();
-  }
 }
 
 async function render(preloaded) {
@@ -444,7 +458,7 @@ async function render(preloaded) {
           <span>新订单系统通知时震动（后台也生效）</span>
         </label>
         <button class="ghost" id="editServer" type="button" style="width:100%;margin-top:12px">更改 APK 连接的网站地址</button>
-        <p class="sub">关掉震动后仍会弹系统通知；购卡/充值订单在后台由原生服务轮询提醒。</p>`;
+        <p class="sub">关掉震动后仍会弹系统通知。购卡/付款确认由原生服务长连接立即提醒，挂后台也会震动。</p>`;
       $('#saveSet').onclick = async () => {
         const msg = $('#setMsg');
         try {

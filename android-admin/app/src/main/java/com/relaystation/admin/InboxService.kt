@@ -4,6 +4,7 @@ import android.app.Service
 import android.content.Intent
 import android.os.IBinder
 import android.os.PowerManager
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -47,14 +48,74 @@ class InboxService : Service() {
     private fun loop() {
         while (running) {
             try {
-                pollOnce()
+                val prefs = Prefs(this)
+                if (prefs.baseUrl.isBlank() || prefs.token.isBlank()) {
+                    Thread.sleep(2000)
+                    continue
+                }
+                waitOnce()
                 try { if (wakeLock?.isHeld != true) wakeLock?.acquire(10 * 60 * 1000L) } catch (_: Exception) { }
-            } catch (_: Exception) { }
-            try { Thread.sleep(15_000) } catch (_: InterruptedException) { break }
+            } catch (_: Exception) {
+                try { Thread.sleep(2000) } catch (_: InterruptedException) { break }
+            }
         }
     }
 
-    private fun pollOnce() {
+    private fun waitOnce() {
+        val prefs = Prefs(this)
+        val base = prefs.baseUrl
+        val token = prefs.token
+        if (base.isBlank() || token.isBlank()) return
+        val after = prefs.lastEventSeq
+        val url = URL("$base/api/admin/mobile/inbox/wait?after=$after")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 8000
+            readTimeout = 32000
+            useCaches = false
+            setRequestProperty("Authorization", "Bearer $token")
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("Cache-Control", "no-cache")
+        }
+        val code = conn.responseCode
+        val text = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.readText().orEmpty()
+        conn.disconnect()
+        if (code == 404) {
+            pollLegacyInbox()
+            Thread.sleep(2000)
+            return
+        }
+        if (code != 200) throw RuntimeException("inbox wait $code")
+        val json = JSONObject(text)
+        val seq = json.optLong("seq", after)
+        prefs.lastEventSeq = seq
+        val events = json.optJSONArray("events") ?: JSONArray()
+        notifyFromEvents(events)
+    }
+
+    private fun notifyFromEvents(events: JSONArray) {
+        if (events.length() == 0) return
+        for (i in 0 until events.length()) {
+            val ev = events.optJSONObject(i) ?: continue
+            val kind = ev.optString("kind")
+            if (kind != "placed" && kind != "paid") continue
+            val who = ev.optString("username").ifBlank { "用户" }
+            val amount = ev.optDouble("amount", 0.0).toInt()
+            val note = ev.optString("payNote", "-").ifBlank { "-" }
+            val method = ev.optString("method")
+            val methodLabel = when (method) {
+                "wechat" -> "微信"
+                "alipay" -> "支付宝"
+                else -> method.ifBlank { "付款" }
+            }
+            val title = if (kind == "paid") "待核对充值" else "有人发起充值"
+            val body = "$who · ¥$amount · $methodLabel · 备注 $note"
+            val tag = "$kind:${ev.optString("orderId")}:${ev.opt("seq")}"
+            Notifier.notifyOrder(this, title, body, tag)
+        }
+    }
+
+    private fun pollLegacyInbox() {
         val prefs = Prefs(this)
         val base = prefs.baseUrl
         val token = prefs.token
@@ -83,16 +144,26 @@ class InboxService : Service() {
         prefs.lastNotifyIds = ids
         if (fresh.isEmpty()) return
         val pending = json.optJSONArray("pending")
-        var body = "请到值班台确认到账并发卡"
-        if (pending != null && pending.length() > 0) {
-            val first = pending.optJSONObject(0)
-            if (first != null) {
-                val who = first.optString("username").ifBlank { first.optString("email", "用户") }
-                val amount = first.optDouble("amount", 0.0).toInt()
-                val note = first.optString("payNote", "-")
-                body = "$who · ¥$amount · 备注 $note"
+        val awaiting = json.optJSONArray("awaiting")
+        fun findOrder(src: JSONArray?): JSONObject? {
+            if (src == null) return null
+            for (i in 0 until src.length()) {
+                val o = src.optJSONObject(i) ?: continue
+                if (o.optString("id") in fresh) return o
             }
+            return null
         }
-        Notifier.notifyOrder(this, "待核对充值 ${fresh.size} 笔", body)
+        val first = findOrder(pending) ?: findOrder(awaiting)
+        var body = "有新的充值动态，请打开值班台查看"
+        var title = "充值提醒 ${fresh.size} 笔"
+        if (first != null) {
+            val who = first.optString("username").ifBlank { first.optString("email", "用户") }
+            val amount = first.optDouble("amount", 0.0).toInt()
+            val note = first.optString("payNote", "-")
+            val st = first.optString("status")
+            body = "$who · ¥$amount · 备注 $note"
+            title = if (st == "pending") "待核对充值 ${fresh.size} 笔" else "有人发起充值 ${fresh.size} 笔"
+        }
+        Notifier.notifyOrder(this, title, body)
     }
 }

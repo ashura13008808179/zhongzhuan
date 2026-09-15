@@ -322,18 +322,40 @@ try {
 
   const newbieTok = { Authorization: `Bearer ${okLogin.body.token}` };
   const invitedTok = { Authorization: `Bearer ${validInvite.body.token}` };
+
+  const guestWait = await req('/api/admin/mobile/inbox/wait?after=0&timeoutMs=200');
+  assert.equal(guestWait.status, 403);
+
+  const snap = await req('/api/admin/mobile/inbox/wait?after=-1&timeoutMs=400', { headers: auth });
+  assert.equal(snap.status, 200, JSON.stringify(snap.body));
+  let adminSeq = snap.body.seq || 0;
+  const userSnap = await req('/api/recharge/wait?after=-1&timeoutMs=400', { headers: newbieTok });
+  assert.equal(userSnap.status, 200, JSON.stringify(userSnap.body));
+  let userSeq = userSnap.body.seq || 0;
+
   const prep = await req('/api/recharge/prepare', {
     method: 'POST',
     headers: newbieTok,
     body: JSON.stringify({ amount: 10, method: 'wechat' })
   });
   assert.equal(prep.status, 200, JSON.stringify(prep.body));
+  const waitPlaced = await req(`/api/admin/mobile/inbox/wait?after=${adminSeq}&timeoutMs=2000`, { headers: auth });
+  assert.equal(waitPlaced.status, 200, JSON.stringify(waitPlaced.body));
+  assert.ok((waitPlaced.body.events || []).some(e => e.kind === 'placed' && e.orderId === prep.body.orderId), JSON.stringify(waitPlaced.body.events));
+  assert.ok((waitPlaced.body.events || []).every(e => e.code == null));
+  adminSeq = waitPlaced.body.seq || adminSeq;
+
   const claimed = await req('/api/recharge/claim', {
     method: 'POST',
     headers: newbieTok,
     body: JSON.stringify({ orderId: prep.body.orderId })
   });
   assert.equal(claimed.status, 200, JSON.stringify(claimed.body));
+  const waitPaid = await req(`/api/admin/mobile/inbox/wait?after=${adminSeq}&timeoutMs=2000`, { headers: auth });
+  assert.equal(waitPaid.status, 200, JSON.stringify(waitPaid.body));
+  assert.ok((waitPaid.body.events || []).some(e => e.kind === 'paid' && e.orderId === prep.body.orderId), JSON.stringify(waitPaid.body.events));
+  adminSeq = waitPaid.body.seq || adminSeq;
+
   const confirmedPay = await req(`/api/admin/payment-orders/${encodeURIComponent(prep.body.orderId)}/confirm`, {
     method: 'POST',
     headers: auth,
@@ -342,6 +364,18 @@ try {
   assert.equal(confirmedPay.status, 200, JSON.stringify(confirmedPay.body));
   const issuedCode = confirmedPay.body.order?.code;
   assert.ok(issuedCode);
+  const waitUser = await req(`/api/recharge/wait?after=${userSeq}&timeoutMs=2000`, { headers: newbieTok });
+  assert.equal(waitUser.status, 200, JSON.stringify(waitUser.body));
+  const confirmedEv = (waitUser.body.events || []).find(e => e.kind === 'confirmed' && e.orderId === prep.body.orderId);
+  assert.ok(confirmedEv, JSON.stringify(waitUser.body.events));
+  assert.equal(confirmedEv.code, issuedCode);
+  const waitAdminConfirm = await req(`/api/admin/mobile/inbox/wait?after=${adminSeq}&timeoutMs=2000`, { headers: auth });
+  assert.ok((waitAdminConfirm.body.events || []).some(e => e.kind === 'confirmed' && e.orderId === prep.body.orderId));
+  assert.ok((waitAdminConfirm.body.events || []).every(e => e.code == null));
+  const liveOrders = await req('/api/recharge/orders', { headers: newbieTok });
+  assert.equal(liveOrders.status, 200);
+  const live = (liveOrders.body.orders || []).find(o => o.id === prep.body.orderId);
+  assert.equal(live?.code, issuedCode);
   const steal = await req('/api/recharge/redeem', {
     method: 'POST',
     headers: invitedTok,
@@ -355,7 +389,7 @@ try {
     body: JSON.stringify({ code: '' })
   });
   assert.equal(emptyCode.status, 400);
-  const stockList = await req('/api/admin/codes', { headers: auth });
+  const stockList = await req('/api/admin/codes?limit=200&offset=0', { headers: auth });
   const stock = (stockList.body.codes || []).find(c => !c.usedAt && !c.issuedTo && Number(c.amount) === 10 && c.code !== issuedCode);
   assert.ok(stock, 'expected unused pool code');
   const stockTry = await req('/api/recharge/redeem', {

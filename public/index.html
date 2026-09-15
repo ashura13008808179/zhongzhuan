@@ -119,6 +119,18 @@
     <p class="eyebrow">选择头像</p>
     <div class="avatar-grid" id="avatarGrid"></div>
   </div>
+  <div id="payLiveModal" class="modal" hidden>
+    <div class="modal-card">
+      <p class="eyebrow" id="payLiveEyebrow">CARD CODE</p>
+      <h2 id="payLiveTitle">付款已确认，卡密已发放</h2>
+      <p class="sub" id="payLiveSub">管理员已确认到账。请复制卡密并兑换，无需刷新页面。</p>
+      <div class="key-box"><code id="payLiveCode"></code><button type="button" id="payLiveCopy">复制</button></div>
+      <div class="ops-cell" style="margin-top:14px">
+        <button class="primary-btn" type="button" id="payLiveGo">去兑换</button>
+        <button class="ghost-btn" type="button" id="payLiveClose">关闭</button>
+      </div>
+    </div>
+  </div>
   <script src="/app.js"></script>
 </body>
 </html>

@@ -189,7 +189,23 @@ setAuthMode('login');
 rememberPrefill();
 $('#loginForm').onsubmit=async e=>{e.preventDefault();try{const identifier=$('#loginIdentifier').value.trim();const remember=!!$('#rememberMe')?.checked;const j=await api('/api/auth/login',{method:'POST',body:JSON.stringify({login:identifier,password:$('#loginPassword').value})});token=j.token;localStorage.setItem(REMEMBER_KEY,remember?'1':'0');if(remember) localStorage.setItem(LOGIN_KEY,identifier);else localStorage.removeItem(LOGIN_KEY);persistToken(token,remember);await boot()}catch(err){msg(err.message)}};
 $('#registerForm').onsubmit=async e=>{e.preventDefault();try{const j=await api('/api/auth/register',{method:'POST',body:JSON.stringify({email:$('#regEmail').value.trim(),username:$('#regUsername').value.trim(),name:$('#regName').value.trim(),password:$('#regPassword').value,inviteCode:$('#regInvite').value.trim()})});token=j.token;persistToken(token,true);localStorage.setItem(REMEMBER_KEY,'1');const ident=$('#regUsername').value.trim()||$('#regEmail').value.trim();if(ident) localStorage.setItem(LOGIN_KEY,ident);await boot()}catch(err){msg(err.message)}};
-$('#logoutBtn').onclick=async()=>{try{if(token)await api('/api/auth/logout',{method:'POST'});}catch{}persistToken(null);location.reload()};
+$('#logoutBtn').onclick=async()=>{try{if(token)await api('/api/auth/logout',{method:'POST'});}catch{}stopPayLive();persistToken(null);location.reload()};
+$('#payLiveCopy')?.addEventListener('click',async()=>{
+  const code=$('#payLiveCode')?.textContent||'';
+  if(!code) return;
+  try{
+    await navigator.clipboard.writeText(code);
+    $('#payLiveCopy').textContent='已复制 ✓';
+    setTimeout(()=>{ const b=$('#payLiveCopy'); if(b) b.textContent='复制'; },1200);
+  }catch(_e){}
+});
+$('#payLiveClose')?.addEventListener('click',()=>{ const m=$('#payLiveModal'); if(m) m.hidden=true; });
+$('#payLiveGo')?.addEventListener('click',()=>{
+  const code=$('#payLiveCode')?.textContent||'';
+  const m=$('#payLiveModal'); if(m) m.hidden=true;
+  window.__pendingRedeemCode=code;
+  render('billing');
+});
 async function boot(){try{data=await api('/api/dashboard');me=data.user;try{checkin=await api('/api/checkin/status')}catch{checkin=null}authView.hidden=true;dash.hidden=false;$('#sideName').textContent=me.name;$('#sideEmail').textContent=me.username?`@${me.username}`:me.email;paintUserAvatars();render('overview')}catch{persistToken(null);token=null}}
 $('#helpTip')?.addEventListener('click',()=>{ closeMobileNav(); render('contact'); });
 ['#topAvatar','#sideAvatar'].forEach(sel=>{
@@ -206,9 +222,82 @@ document.addEventListener('click', e=>{
   if(menu.contains(e.target) || e.target.closest('#topAvatar,#sideAvatar')) return;
   closeAvatarMenu();
 });
-document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeAvatarMenu(); });
+  document.addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeAvatarMenu(); const m=$('#payLiveModal'); if(m && !m.hidden) m.hidden=true; } });
 function shell(title,kicker,html){$('#pageTitle').textContent=title;page.innerHTML=`<div class="page-head"><div><p class="eyebrow">${kicker}</p><h1>${title}</h1><p class="sub">管理你的 Relay Station 账户与 API 服务</p></div></div>${html}`}
+let myPayOrdersPollTimer=null;
+let myPayOrdersPrevSnap={};
+let payLiveAbort=null;
+let payLiveSeq=-1;
+const shownPayCodes=new Set();
+function stopMyPayOrdersPoll(){
+  if(myPayOrdersPollTimer){ clearInterval(myPayOrdersPollTimer); myPayOrdersPollTimer=null; }
+}
+function stopPayLive(){
+  if(payLiveAbort){ try{ payLiveAbort.abort(); }catch(_e){} payLiveAbort=null; }
+}
+function showIssuedCodeLive(code, amount){
+  if(!code || shownPayCodes.has(code)) return;
+  shownPayCodes.add(code);
+  const input=$('#redeemCode');
+  if(input) input.value=code;
+  const billingModal=$('#codeModal');
+  const billingCode=$('#modalCode');
+  if(billingModal && billingCode){
+    const eyebrow=$('#modalEyebrow');
+    const title=$('#modalTitle');
+    const sub=$('#modalSub');
+    const codeBox=billingModal.querySelector('.key-box');
+    if(eyebrow) eyebrow.textContent='CARD CODE';
+    if(title) title.textContent='付款已确认，卡密已发放';
+    if(sub) sub.textContent='请复制卡密并兑换；也可一键填入左侧兑换框。无需刷新页面。';
+    if(codeBox) codeBox.hidden=false;
+    billingCode.textContent=code;
+    const fill=$('#modalFill');
+    if(fill) fill.hidden=false;
+    billingModal.hidden=false;
+    return;
+  }
+  const modal=$('#payLiveModal');
+  if(!modal) return;
+  $('#payLiveCode').textContent=code;
+  $('#payLiveSub').textContent=`¥${Number(amount||0).toFixed(0)} 已确认到账并发放卡密。请复制后兑换，无需刷新页面。`;
+  modal.hidden=false;
+}
+function startPayLive(){
+  stopPayLive();
+  if(!token) return;
+  payLiveAbort=new AbortController();
+  const signal=payLiveAbort.signal;
+  (async()=>{
+    while(token && !signal.aborted){
+      try{
+        const r=await fetch('/api/recharge/wait?after='+payLiveSeq,{
+          headers:{ Authorization:'Bearer '+token },
+          signal
+        });
+        const j=await r.json().catch(()=>({}));
+        if(r.status===401){ stopPayLive(); return; }
+        if(!r.ok){
+          await new Promise(res=>setTimeout(res,1500));
+          continue;
+        }
+        if(Number.isFinite(Number(j.seq))) payLiveSeq=Number(j.seq);
+        for(const ev of j.events||[]){
+          if(ev.kind==='confirmed' && ev.code){
+            showIssuedCodeLive(ev.code, ev.amount);
+            const refresh=$('#refreshPayOrders');
+            if(refresh) refresh.click();
+          }
+        }
+      }catch(e){
+        if(signal.aborted) return;
+        await new Promise(res=>setTimeout(res,1500));
+      }
+    }
+  })();
+}
 function render(name){
+  stopMyPayOrdersPoll();
   document.querySelectorAll('[data-page]').forEach(a=>a.classList.toggle('active',a.dataset.page===name));
   if(name==='overview')shell('数据概览','ACCOUNT OVERVIEW',`<div class="metric-grid"><article><small>账户余额</small><strong>${me.unlimited||me.isAdmin?'无限':('¥'+Number(me.balance||0).toFixed(2))}</strong><span class="green">${me.unlimited||me.isAdmin?'管理员不扣本地余额':'可用于 API 调用'}</span></article><article><small>累计请求</small><strong>${data.stats.requests.toLocaleString()}</strong><span>成功率 ${data.stats.requests?Math.round(data.stats.success/data.stats.requests*100):100}%</span></article><article><small>累计用量</small><strong>${data.stats.usedTokens.toLocaleString()}</strong><span>按账户余额扣费</span></article><article><small>累计花销</small><strong>¥${Number(data.stats.totalSpent||0).toFixed(2)}</strong><span>API 实际扣费合计</span></article></div><div class="content-grid"><section class="card"><div class="card-head"><div><p class="eyebrow">RECENT REQUESTS</p><h2>最近请求</h2></div><button class="link-btn" data-page="logs">查看全部 →</button></div><table><thead><tr><th>模型</th><th>Token</th><th>延迟</th><th>状态</th><th>时间</th></tr></thead><tbody>${data.logs.slice(0,8).map(l=>`<tr><td>${esc(l.model)}</td><td>${l.tokens}</td><td>${l.latency}ms</td><td><span class="tag success">成功</span></td><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无请求记录</td></tr>'}</tbody></table></section><section class="card balance-card"><p class="eyebrow">QUICK ACTIONS</p><h2>快捷操作</h2><button class="action" data-page="checkin"><span>✦</span><div><b>每日签到</b><small>${checkin?.checkedInToday?`今日已领 ¥${Number(checkin.todayAmount||0).toFixed(2)}`:'随机领取 ¥0.05–¥0.50'}</small></div><i>→</i></button><button class="action" data-page="api"><span>◈</span><div><b>查看 API 接入</b><small>复制你的专属调用密钥</small></div><i>→</i></button><button class="action" data-page="billing"><span>◇</span><div><b>卡密充值</b><small>充值后立即到账</small></div><i>→</i></button><button class="action" data-page="referral"><span>♧</span><div><b>邀请好友</b><small>好友付费后返利 5%</small></div><i>→</i></button></section></div>`);
   if(name==='checkin'){renderCheckIn();return;}
@@ -216,6 +305,15 @@ function render(name){
   if(name==='api'){renderApiKeys();return;}
   if(name==='logs')shell('使用日志','REQUEST LOGS',`<section class="card"><div class="card-head"><div><p class="eyebrow">AUDIT TRAIL</p><h2>全部请求记录</h2></div><span class="sub">最近 30 条</span></div><table><thead><tr><th>时间</th><th>模型</th><th>Token</th><th>延迟</th><th>状态</th></tr></thead><tbody>${data.logs.map(l=>`<tr><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td><td>${esc(l.model)}</td><td>${l.tokens}</td><td>${l.latency}ms</td><td><span class="tag success">成功</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无日志</td></tr>'}</tbody></table></section>`);
   if(name==='billing'){
+  shell('智能充值','BILLING & RECHARGE','<section class="card"><p class="sub">正在加载充值方案…</p></section>');
+  (async () => {
+    await ensureAppConfig();
+    renderBillingContent();
+  })();
+  return;
+}
+function renderBillingContent(){
+
   const plans=(window.appConfig?.paymentPlans||[{amount:10,qr:''},{amount:30,qr:''},{amount:50,qr:''},{amount:100,qr:''}]);
   shell('卡密充值','BILLING & RECHARGE',`<div class="billing-grid">
     <section class="card recharge-card"><p class="eyebrow">REDEEM CODE</p><h2>使用充值卡密</h2><p class="sub">每张卡密只能兑换一次。付款确认后发给你的卡密仅本人可用，别人乱试兑不了。</p><form id="redeemForm"><input id="redeemCode" placeholder="例如：R10-XXXX" required><button class="primary-btn">立即充值 ↗</button></form><div id="redeemMsg" class="inline-msg"></div></section>
@@ -254,6 +352,11 @@ function render(name){
       </div>
     </div>
   </div>`);
+  if(window.__pendingRedeemCode){
+    const input=$('#redeemCode');
+    if(input) input.value=window.__pendingRedeemCode;
+    window.__pendingRedeemCode='';
+  }
   let selectedAmount=null;
   let selectedMethod='wechat';
   let currentPayOrderId=null;
@@ -292,12 +395,22 @@ function render(name){
   };
   const loadMyPayOrders=async()=>{
     const box=$('#myPayOrders');
-    if(!box) return;
+    if(!box){ stopMyPayOrdersPoll(); return; }
     try{
       const j=await api('/api/recharge/orders');
+      const orders=j.orders||[];
       const statusText={awaiting_payment:'待支付',pending:'待核对',confirmed:'已确认',rejected:'已拒绝'};
       const methodText={wechat:'微信',alipay:'支付宝'};
-      const rows=(j.orders||[]).map(o=>{
+      const nextSnap={};
+      for(const o of orders){
+        const prev=myPayOrdersPrevSnap[o.id];
+        if(prev && (prev==='awaiting_payment'||prev==='pending') && o.status==='confirmed' && o.code){
+          try{ showIssuedCodeLive(o.code, o.amount); }catch(_e){}
+        }
+        nextSnap[o.id]=o.status;
+      }
+      myPayOrdersPrevSnap=nextSnap;
+      const rows=orders.map(o=>{
         const st=statusText[o.status]||o.status;
         let extra='';
         if(o.status==='confirmed' && o.code){
@@ -333,6 +446,9 @@ function render(name){
           if(input){ input.value=btn.dataset.code||''; input.focus(); }
         };
       });
+      const hasOpen=orders.some(o=>o.status==='awaiting_payment'||o.status==='pending');
+      stopMyPayOrdersPoll();
+      if(hasOpen) myPayOrdersPollTimer=setInterval(()=>{ loadMyPayOrders(); }, 2000);
     }catch(err){
       box.innerHTML=`<p class="inline-msg">${esc(err.message||'加载失败')}</p>`;
     }
@@ -371,6 +487,9 @@ function render(name){
   });
   confirmBtn?.addEventListener('click',async()=>{
     if(!selectedAmount)return;
+    if(!(plans.find(p=>Number(p.amount)===selectedAmount && qrFor(p, selectedMethod)))){
+      try { await ensureAppConfig(); const fresh=window.appConfig?.paymentPlans; if(Array.isArray(fresh)&&fresh.length){ plans.splice(0, plans.length, ...fresh); } } catch(_e){}
+    }
     const plan=plans.find(p=>Number(p.amount)===selectedAmount)||{};
     const qr=qrFor(plan, selectedMethod);
     const mLabel=methodLabels[selectedMethod]||'微信';
@@ -473,6 +592,7 @@ function render(name){
 
   modal?.addEventListener('click',e=>{if(e.target===modal)modal.hidden=true;});
   $('#redeemForm')?.addEventListener('submit',async e=>{e.preventDefault();try{const j=await api('/api/recharge/redeem',{method:'POST',body:JSON.stringify({code:$('#redeemCode').value.trim()})});me=j.user;$('#redeemMsg').textContent=j.message;$('#redeemMsg').className='inline-msg ok'}catch(err){$('#redeemMsg').textContent=err.message;$('#redeemMsg').className='inline-msg'}});
+
 }
   if(name==='referral'){shell('邀请返利','REFERRAL PROGRAM',`<section class="card referral-card"><div class="referral-hero"><div><p class="eyebrow">YOUR INVITE CODE</p><h2>邀请好友，一起获得奖励</h2><p class="sub">好友使用你的邀请码注册后，每当好友充值付费，你获得其充值金额的 5% 返利。</p></div><div class="reward">5%<span>/ 充值</span></div></div><div class="invite-box"><code>${data.inviteCode}</code><button id="copyInvite">复制邀请码</button></div><div class="ref-stats"><div><b>${data.inviteCount}</b><span>已邀请好友</span></div><div><b>¥${me.bonusBalance.toFixed(2)}</b><span>累计奖励</span></div></div></section>`);$('#copyInvite')?.addEventListener('click',()=>{navigator.clipboard.writeText(data.inviteCode);$('#copyInvite').textContent='已复制 ✓'});}
   if(name==='contact')shell('联系支持','SUPPORT CENTER',`<div class="contact-grid"><section class="card"><p class="eyebrow">WE ARE HERE TO HELP</p><h2>需要帮助？</h2><p class="sub">遇到接入、充值或账单问题，工作日我们会尽快回复。</p><div class="contact-item"><span>◎</span><div><small>客服 QQ</small><b>${esc(window.appConfig?.contactQq||'3845440106')}</b></div></div><div class="contact-item"><span>♧</span><div><small>QQ 群</small><b>${esc(window.appConfig?.contactQqGroup||'1061247399')}</b></div></div><div class="contact-item"><span>✉</span><div><small>支持邮箱</small><b>${esc(window.appConfig?.contactEmail||'3845440106@qq.com')}</b></div></div></section><section class="card"><p class="eyebrow">ACCOUNT</p><h2>账号信息</h2><div class="account-row"><span>用户名</span><b>@${esc(me.username||'-')}</b></div><div class="account-row"><span>显示名称</span><b>${esc(me.name)}</b></div><div class="account-row"><span>登录邮箱</span><b>${esc(me.email)}</b></div><div class="account-row"><span>注册时间</span><b>${new Date(me.createdAt).toLocaleDateString('zh-CN')}</b></div></section></div>`);
@@ -755,7 +875,21 @@ const r = await client.chat.completions.create({
   }
 }
 
-fetch('/api/config').then(r=>r.json()).then(c=>window.appConfig=c);
+window.appConfigReady = fetch('/api/config').then(r=>r.json()).then(c=>{ window.appConfig=c; return c; }).catch(err=>{ console.warn('config_load_failed', err); return window.appConfig || {}; });
+async function ensureAppConfig(){
+  if (window.appConfig && Array.isArray(window.appConfig.paymentPlans) && window.appConfig.paymentPlans.length) return window.appConfig;
+  if (window.appConfigReady) {
+    try { return await window.appConfigReady; } catch { /* fall through */ }
+  }
+  try {
+    const c = await fetch('/api/config').then(r=>r.json());
+    window.appConfig = c;
+    return c;
+  } catch (err) {
+    console.warn('config_reload_failed', err);
+    return window.appConfig || {};
+  }
+}
 
 const baseRender = render;
 render = function(name) {
@@ -1191,7 +1325,7 @@ async function renderOperations() {
       <div class="metric-grid admin-finance">
         <article><small>今日收入</small><strong>¥${Number(stats.incomeToday||0).toFixed(2)}</strong><span class="green">付款领取卡密面额</span></article>
         <article><small>卡密支出</small><strong>¥${Number(stats.cardSpendToday||0).toFixed(2)}</strong><span>今日兑换成余额</span></article>
-        <article><small>上游 API 开销</small><strong>¥${Number(stats.upstreamCostToday||0).toFixed(4)}</strong><span>今日上游成本 · ${Number(stats.requestCountToday||0)} 次请求</span></article>
+        <article><small>上游 API 开销${stats.upstreamCostIsEstimate===false?"（实扣）":"（估算）"}</small><strong>¥${Number(stats.upstreamCostToday||0).toFixed(4)}</strong><span>今日上游成本 · ${Number(stats.requestCountToday||0)} 次请求${stats.upstreamCostReportedCount?` · 实扣${stats.upstreamCostReportedCount}`:""}</span></article>
         <article><small>客户实扣</small><strong>¥${Number(stats.chargedToday||0).toFixed(4)}</strong><span>今日向用户扣费</span></article>
       </div>
       <section class="card" id="payMetaCard"><div class="card-head"><div><p class="eyebrow">PAYMENT QR</p><h2>付款码有效期</h2><p class="sub">微信/支付宝不会回调本站。可在此登记预计到期日；到期或临近时，用户付款页与此处都会提示。</p></div></div>
@@ -1205,7 +1339,7 @@ async function renderOperations() {
         <div id="payMetaMsg" class="inline-msg"></div>
       </section>
       <section class="card"><div class="card-head"><div><p class="eyebrow">TODAY ISSUE</p><h2>今日发卡统计</h2><p class="sub">仅管理员可见。日期：${esc(stats.day)} · 库存目标每档 ${stats.target} 张</p></div><div><b>今日发放 ${stats.issuedTodayCount} 张 / ¥${Number(stats.issuedTodaySum).toFixed(0)}</b><br><span class="sub">今日兑换 ${stats.redeemedTodayCount} 张 / ¥${Number(stats.redeemedTodaySum).toFixed(0)}</span></div></div><table class="admin-table"><thead><tr><th>金额</th><th>可用库存</th><th>今日发放</th><th>今日发放金额</th><th>今日兑换</th><th>今日兑换金额</th></tr></thead><tbody>${(stats.byAmount||[]).map(r=>`<tr><td>¥${r.amount}</td><td>${r.available}</td><td>${r.issuedToday}</td><td>¥${r.issuedTodaySum}</td><td>${r.redeemedToday}</td><td>¥${r.redeemedTodaySum}</td></tr>`).join('')}</tbody></table></section>
-      <section class="card" style="margin-top:16px"><div class="card-head"><div><p class="eyebrow">UPSTREAM COST</p><h2>今日上游开销明细</h2><p class="sub">按渠道汇总当日 upstreamCost</p></div></div><table class="admin-table"><thead><tr><th>渠道</th><th>请求数</th><th>上游开销</th><th>客户实扣</th></tr></thead><tbody>${(stats.upstreamByProvider||[]).map(r=>`<tr><td>${esc(r.providerName||r.providerId)}</td><td>${r.requests}</td><td>¥${Number(r.upstreamCost).toFixed(4)}</td><td>¥${Number(r.chargedAmount).toFixed(4)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">今日暂无上游调用</td></tr>'}</tbody></table></section>`);
+      <section class="card" style="margin-top:16px"><div class="card-head"><div><p class="eyebrow">UPSTREAM COST</p><h2>今日上游开销明细</h2><p class="sub">按渠道汇总当日 upstreamCost（优先上游返回实扣；否则为单价×token×渠道上游倍率，非 displayMultiplier）</p></div></div><table class="admin-table"><thead><tr><th>渠道</th><th>请求数</th><th>上游开销</th><th>客户实扣</th></tr></thead><tbody>${(stats.upstreamByProvider||[]).map(r=>`<tr><td>${esc(r.providerName||r.providerId)}</td><td>${r.requests}</td><td>¥${Number(r.upstreamCost).toFixed(4)}</td><td>¥${Number(r.chargedAmount).toFixed(4)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">今日暂无上游调用</td></tr>'}</tbody></table></section>`);
 
       // payment QR expiry settings
       (async () => {
@@ -1553,6 +1687,7 @@ function wireProviderEditor() {
 const bootBase = boot;
 boot = async function() {
   await bootBase();
+  startPayLive();
   if (me?.isAdmin && !$('#operationsNav')) {
     const nav = document.querySelector('.sidebar nav');
     const group = document.createElement('span');

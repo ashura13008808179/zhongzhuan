@@ -35,7 +35,8 @@ const inbox = buildMobileInbox({
 });
 assert.equal(inbox.pendingCount, 1);
 assert.equal(inbox.awaitingCount, 1);
-assert.deepEqual(inbox.notifyIds, ['a']);
+assert.deepEqual(inbox.notifyIds, ['a', 'b']);
+assert.equal(inbox.recent.find(o => o.id === 'c')?.code, null);
 assert.equal(inbox.providers[0].healthOk, false);
 assert.equal(inbox.diagnostics.summary.failed, 2);
 
