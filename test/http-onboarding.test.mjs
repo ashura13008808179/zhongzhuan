@@ -133,9 +133,12 @@ try {
   assert.ok(Array.isArray(alias.body.providers));
   const byId = Object.fromEntries(alias.body.providers.map(p => [p.id, p]));
   assert.equal(byId.grp_deepseek?.upstreamSync, 'beibeihai');
-  assert.equal(byId.grp_grok?.upstreamSync, 'beibeihai');
+  assert.equal(byId.grp_grok_heavy?.upstreamSync, 'beibeihai');
   assert.equal(byId.grp_cc_max?.upstreamSync, 'beibeihai');
   assert.equal(byId.grp_claude_cursor, undefined);
+  assert.equal(byId.grp_grok, undefined);
+  assert.equal(byId.grp_grok_vip, undefined);
+  assert.equal(byId.grp_cn_models, undefined);
   assert.equal(byId.grp_gpt_pro?.upstreamSync, 'vip1129');
   assert.equal(byId.grp_cursor_pool?.maintenance, true);
   assert.match(String(byId.grp_deepseek?.url || ''), /beibeihai\.xyz/);
@@ -145,14 +148,20 @@ try {
   assert.equal(pricing.body.providers.length, alias.body.providers.length);
   assert.equal(pricing.body.multiplier, 2.5);
 
+  const upstreamLedgerSync = await req('/api/admin/upstream-billing/sync', {
+    method: 'POST', headers: auth, body: JSON.stringify({ fullBackfill: false })
+  });
+  assert.equal(upstreamLedgerSync.status, 200, JSON.stringify(upstreamLedgerSync.body));
+  assert.equal(typeof upstreamLedgerSync.body.synced?.rows, 'number');
+
   const settings = await req('/api/admin/site-settings', { headers: auth });
   assert.equal(settings.status, 200);
   assert.equal(settings.body.trialBalance, undefined);
-  assert.equal(settings.body.recommendedModel, 'gpt-5.6-sol');
+  assert.equal(settings.body.recommendedModel, 'gpt-5.6-terra');
 
   const cfg = await req('/api/config');
   assert.equal(cfg.status, 200);
-  assert.equal(cfg.body.recommendedModel, 'gpt-5.6-sol');
+  assert.equal(cfg.body.recommendedModel, 'gpt-5.6-terra');
   assert.equal(cfg.body.trialBalance, undefined);
 
   const updated = await req('/api/admin/site-settings', {
@@ -164,6 +173,32 @@ try {
   assert.equal(updated.body.recommendedModel, 'gpt-5.6-terra');
   const cfg2 = await req('/api/config');
   assert.equal(cfg2.body.recommendedModel, 'gpt-5.6-terra');
+  assert.equal(cfg2.body.welfareBanner, null);
+
+  const welfareOff = await req('/api/admin/welfare', { headers: auth });
+  assert.equal(welfareOff.status, 200, JSON.stringify(welfareOff.body));
+  assert.equal(welfareOff.body.promo.enabled, false);
+
+  const welfareOn = await req('/api/admin/welfare', {
+    method: 'PUT',
+    headers: auth,
+    body: JSON.stringify({ enabled: true, multiplier: 1.1, text: '付10得{ten}' })
+  });
+  assert.equal(welfareOn.status, 200, JSON.stringify(welfareOn.body));
+  assert.equal(welfareOn.body.active, true);
+  assert.equal(welfareOn.body.promo.multiplier, 1.1);
+  const cfgW = await req('/api/config');
+  assert.equal(cfgW.body.welfareBanner?.text, '付10得11');
+  assert.equal(cfgW.body.welfareBanner?.multiplier, undefined);
+  const plan10 = (cfgW.body.paymentPlans || []).find((p) => p.amount === 10);
+  assert.equal(plan10?.creditAmount, 11);
+  const welfareStop = await req('/api/admin/welfare', {
+    method: 'PUT',
+    headers: auth,
+    body: JSON.stringify({ enabled: false })
+  });
+  assert.equal(welfareStop.body.active, false);
+  assert.equal((await req('/api/config')).body.welfareBanner, null);
 
   const meBefore = await req('/api/me', { headers: auth });
   assert.equal(meBefore.status, 200);

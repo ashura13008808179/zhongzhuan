@@ -134,7 +134,6 @@ export function isBeibeihaiProvider(provider) {
 export function defaultGroupMap() {
   return {
     grp_deepseek: 77,
-    grp_grok: 43,
     grp_cc_max: 56,
     grp_glm: 79,
     grp_kimi: 81,
@@ -144,8 +143,7 @@ export function defaultGroupMap() {
     grp_grok_heavy: 80,
     grp_grok_image: 68,
     grp_claude_kiro: 89,
-    grp_claude_kiro_welfare: 33,
-    grp_cn_models: 47
+    grp_claude_kiro_welfare: 33
   };
 }
 

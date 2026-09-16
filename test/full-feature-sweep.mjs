@@ -211,9 +211,9 @@ try {
   const sitePut = await req('/api/admin/site-settings', {
     method: 'PUT',
     headers: adminTok,
-    body: JSON.stringify({ publicBaseUrl: 'https://example.test', recommendedModel: 'gpt-5.6-sol' })
+    body: JSON.stringify({ publicBaseUrl: 'https://example.test', recommendedModel: 'gpt-5.6-terra' })
   });
-  check('PUT site-settings', sitePut.status === 200 && sitePut.body.recommendedModel === 'gpt-5.6-sol', JSON.stringify(sitePut.body));
+  check('PUT site-settings', sitePut.status === 200 && sitePut.body.recommendedModel === 'gpt-5.6-terra', JSON.stringify(sitePut.body));
 
   const prep = await req('/api/recharge/prepare', {
     method: 'POST',

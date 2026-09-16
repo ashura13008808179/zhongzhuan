@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { liveChargeDelta, applyLiveMoneyCharge, settleRemainder, parkPendingHold, releasePendingHold, LIVE_POLL_INTERVAL_MS, exactUserCharge } from '../lib/live-billing.js';
+import { liveChargeDelta, applyLiveMoneyCharge, applyLiveMoneyRefund, settleRemainder, parkPendingHold, releasePendingHold, LIVE_POLL_INTERVAL_MS, exactUserCharge, liveBillTarget, TOKEN_HOLD_MARKUP } from '../lib/live-billing.js';
 
 assert.equal(LIVE_POLL_INTERVAL_MS, 500);
 
@@ -58,5 +58,17 @@ assert.equal(parkedKey.pendingActualHold, 1.25);
 releasePendingHold(parked, parkedKey, 0.25);
 assert.equal(parked.pendingActualHold, 1);
 assert.equal(parkedKey.pendingActualHold, 1);
+
+assert.equal(TOKEN_HOLD_MARKUP, 1.2);
+assert.equal(liveBillTarget(1, 9, 1.1), 1.1);
+assert.equal(liveBillTarget(0, 1, 2), 1 * 1.2 * 2);
+assert.equal(liveBillTarget(0, 0, 2), 0);
+
+const refundUser = { balance: 8 };
+const refundKey = { spendUsed: 3 };
+assert.equal(applyLiveMoneyRefund(refundUser, refundKey, 1.25), 1.25);
+assert.equal(refundUser.balance, 9.25);
+assert.equal(refundKey.spendUsed, 1.75);
+assert.equal(applyLiveMoneyRefund({ balance: 1 }, null, 2, true), 0);
 
 console.log('live-billing.test.mjs: all assertions passed');

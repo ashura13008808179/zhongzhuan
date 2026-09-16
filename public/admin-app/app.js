@@ -398,6 +398,8 @@ async function render(preloaded) {
         <p class="sub">会真实探测各渠道对话、延迟、倍率和充值逻辑，大约需要一分钟。</p>
         <button class="primary" id="runDiag">一键测试全部渠道</button>
         <p class="sub" id="diagSum">${last ? `上次 ${when(last.at)} · 通过 ${s.passed || 0} / 警告 ${s.warned || 0} / 失败 ${s.failed || 0}` : '尚未运行'}</p>
+        <button class="primary" id="calibratePrices" type="button" style="margin-top:10px">对照账单校准估价</button>
+        <p class="sub" id="calibrateMsg"></p>
         <div id="diagList" class="list"></div>`;
       const paint = (report) => {
         const rows = (report.results || []).map(r => {
@@ -427,6 +429,26 @@ async function render(preloaded) {
           btn.textContent = '一键测试全部渠道';
         }
       };
+      $('#calibratePrices').onclick = async () => {
+        const msg = $('#calibrateMsg');
+        const btn = $('#calibratePrices');
+        btn.disabled = true;
+        msg.textContent = '正在对照账单校准…';
+        try {
+          const j = await api('/api/admin/providers/calibrate-prices', { method: 'POST', body: '{}' });
+          const lines = (j.results || []).slice(0, 8).map(r => {
+            const models = (r.models || []).map(m => `${m.model} 入${Number(m.inputPer1K||0).toFixed(4)}/1K`).join('，');
+            return `${r.name}：${models || '未测到'}`;
+          });
+          msg.textContent = j.message + (lines.length ? '\n' + lines.join('\n') : '');
+          msg.className = 'sub ok';
+        } catch (err) {
+          msg.textContent = err.message;
+          msg.className = 'sub bad';
+        } finally {
+          btn.disabled = false;
+        }
+      };
     } else if (tab === 'up') {
       pane.innerHTML = '<p class="sub">正在读取上游账号余额…</p>';
       const acc = await api('/api/admin/upstream-accounts');
@@ -442,10 +464,12 @@ async function render(preloaded) {
       pane.innerHTML = `<div class="list">${card('vip1129', acc.vip1129)}${card('Beibeihai', acc.beibeihai)}</div>
         <p class="sub">这是上游站账号余额，不是本站用户余额。</p>`;
     } else if (tab === 'set') {
-      const [site, pricing] = await Promise.all([
+      const [site, pricing, welfare] = await Promise.all([
         api('/api/admin/site-settings'),
-        api('/api/admin/pricing')
+        api('/api/admin/pricing'),
+        api('/api/admin/welfare')
       ]);
+      const promo = welfare.promo || {};
       pane.innerHTML = `
         <label>站点公开地址<input id="pubUrl" value="${esc(site.publicBaseUrl || '')}" placeholder="https://你的域名"></label>
         <label>贝贝海全局倍率<input id="rate" type="number" min="0.01" max="10" step="0.01" value="${esc(pricing.multiplier)}"></label>
@@ -454,6 +478,14 @@ async function render(preloaded) {
         <p class="sub">默认关闭估价。关闭后只按上游 actual_cost 实时扣费；实扣未到会挂起对齐，不会用价表定稿。</p>
         <button class="primary" id="saveSet">保存站点设置</button>
         <p class="sub" id="setMsg"></p>
+        <h3 style="margin:22px 0 8px">充值福利</h3>
+        <p class="sub">只在后台改。用户端只看到横幅和购卡到账金额。到今晚 24:00 截止。</p>
+        <label style="display:flex;align-items:center;gap:10px"><input id="welfareOn" type="checkbox" style="width:auto" ${promo.enabled ? 'checked' : ''}><span>开启今日福利</span></label>
+        <label>福利倍率<input id="welfareMul" type="number" min="1" max="10" step="0.01" value="${esc(promo.multiplier ?? 1.1)}"></label>
+        <label>横幅文案（可留空）<input id="welfareText" value="${esc(promo.text || '')}" placeholder="今日充值福利开启！卡密按 {mul} 倍到账…"></label>
+        <p class="sub">${(welfare.preview || []).map(p => `付${p.amount}→到账${p.creditAmount}`).join(' · ')}</p>
+        <button class="primary" id="saveWelfare" type="button">保存福利</button>
+        <p class="sub" id="welfareMsg"></p>
         <label style="display:flex;align-items:center;gap:10px;margin-top:16px">
           <input id="vibToggle" type="checkbox" style="width:auto">
           <span>新订单系统通知时震动（后台也生效）</span>
@@ -469,6 +501,24 @@ async function render(preloaded) {
           body.allowEstimatedBilling = !!$('#allowEstimate')?.checked;
           await api('/api/admin/pricing', { method: 'PUT', body: JSON.stringify(body) });
           msg.textContent = '已保存';
+          msg.className = 'sub ok';
+        } catch (err) {
+          msg.textContent = err.message;
+          msg.className = 'sub bad';
+        }
+      };
+      $('#saveWelfare').onclick = async () => {
+        const msg = $('#welfareMsg');
+        try {
+          const j = await api('/api/admin/welfare', {
+            method: 'PUT',
+            body: JSON.stringify({
+              enabled: !!$('#welfareOn')?.checked,
+              multiplier: Number($('#welfareMul')?.value),
+              text: $('#welfareText')?.value || ''
+            })
+          });
+          msg.textContent = j.active ? '福利已开启' : '已保存（当前未生效）';
           msg.className = 'sub ok';
         } catch (err) {
           msg.textContent = err.message;

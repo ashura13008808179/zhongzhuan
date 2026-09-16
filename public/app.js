@@ -121,6 +121,20 @@ function spentTokens(l){
   const n=Number(l?.billedTokens ?? l?.tokens ?? 0);
   return Math.round(Number.isFinite(n)?n:0);
 }
+function logIsPending(l){
+  return !!(l?.pendingActual || l?.status==='pending_actual_cost');
+}
+function logStatusTag(l){
+  if(logIsPending(l)) return '<span class="tag warn">待对齐账单</span>';
+  if(l?.status==='stream_incomplete' || l?.status==='client_abort') return '<span class="tag warn">未完成</span>';
+  if(l?.status && l.status!=='success') return `<span class="tag danger">${esc(l.status)}</span>`;
+  return '<span class="tag success">成功</span>';
+}
+function logChargeText(l){
+  const amt=Number(l?.collectedAmount ?? l?.alreadyCharged ?? l?.chargedAmount ?? 0);
+  if(logIsPending(l)) return '¥'+amt.toFixed(4)+' · 对齐中';
+  return '¥'+Number(l?.chargedAmount||0).toFixed(4);
+}
 function groupRateSuffix(g){
   const n=Number(g?.displayMultiplier);
   if(!Number.isFinite(n)) return '';
@@ -303,11 +317,11 @@ function startPayLive(){
 function render(name){
   stopMyPayOrdersPoll();
   document.querySelectorAll('[data-page]').forEach(a=>a.classList.toggle('active',a.dataset.page===name));
-  if(name==='overview')shell('数据概览','ACCOUNT OVERVIEW',`<div class="metric-grid"><article><small>账户余额</small><strong>${me.unlimited||me.isAdmin?'无限':('¥'+Number(me.balance||0).toFixed(2))}</strong><span class="green">${me.unlimited||me.isAdmin?'管理员不扣本地余额':'可用于 API 调用'}</span></article><article><small>累计请求</small><strong>${data.stats.requests.toLocaleString()}</strong><span>成功率 ${data.stats.requests?Math.round(data.stats.success/data.stats.requests*100):100}%</span></article><article><small>累计用量</small><strong>${Number(data.stats.usedTokens||data.stats.billedTokens||0).toLocaleString()}</strong><span>账户已计费用量</span></article><article><small>累计花销</small><strong>¥${Number(data.stats.totalSpent||0).toFixed(2)}</strong><span>API 调用累计扣费</span></article></div><div class="content-grid"><section class="card"><div class="card-head"><div><p class="eyebrow">RECENT REQUESTS</p><h2>最近请求</h2></div><button class="link-btn" data-page="logs">查看全部 →</button></div><table><thead><tr><th>模型</th><th>Token</th><th>花销</th><th>延迟</th><th>状态</th><th>时间</th></tr></thead><tbody>${data.logs.slice(0,8).map(l=>`<tr><td>${esc(l.model)}</td><td>${spentTokens(l)}</td><td>¥${Number(l.chargedAmount||0).toFixed(4)}</td><td>${l.latency}ms</td><td><span class="tag success">成功</span></td><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">暂无请求记录</td></tr>'}</tbody></table></section><section class="card balance-card"><p class="eyebrow">QUICK ACTIONS</p><h2>快捷操作</h2><button class="action" data-page="checkin"><span>✦</span><div><b>每日签到</b><small>${checkin?.checkedInToday?`今日已领 ¥${Number(checkin.todayAmount||0).toFixed(2)}`:'随机领取 ¥0.05–¥0.50'}</small></div><i>→</i></button><button class="action" data-page="api"><span>◈</span><div><b>查看 API 接入</b><small>复制你的专属调用密钥</small></div><i>→</i></button><button class="action" data-page="billing"><span>◇</span><div><b>卡密充值</b><small>充值后立即到账</small></div><i>→</i></button><button class="action" data-page="referral"><span>♧</span><div><b>邀请好友</b><small>好友付费后返利 5%</small></div><i>→</i></button></section></div>`);
+  if(name==='overview')shell('数据概览','ACCOUNT OVERVIEW',`<div class="metric-grid"><article><small>账户余额</small><strong>${me.unlimited||me.isAdmin?'无限':('¥'+Number(me.balance||0).toFixed(2))}</strong><span class="green">${me.unlimited||me.isAdmin?'管理员不扣本地余额':'可用于 API 调用'}</span></article><article><small>累计请求</small><strong>${data.stats.requests.toLocaleString()}</strong><span>成功率 ${data.stats.requests?Math.round(data.stats.success/data.stats.requests*100):100}%</span></article><article><small>累计用量</small><strong>${Number(data.stats.usedTokens||data.stats.billedTokens||0).toLocaleString()}</strong><span>账户已计费用量</span></article><article><small>累计花销</small><strong>¥${Number(data.stats.totalSpent||0).toFixed(2)}</strong><span>API 调用累计扣费</span></article></div><div class="content-grid"><section class="card"><div class="card-head"><div><p class="eyebrow">RECENT REQUESTS</p><h2>最近请求</h2></div><button class="link-btn" data-page="logs">查看全部 →</button></div><table><thead><tr><th>模型</th><th>Token</th><th>花销</th><th>延迟</th><th>状态</th><th>时间</th></tr></thead><tbody>${data.logs.slice(0,8).map(l=>`<tr><td>${esc(l.model)}</td><td>${spentTokens(l)}</td><td>${logChargeText(l)}</td><td>${l.latency}ms</td><td>${logStatusTag(l)}</td><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">暂无请求记录</td></tr>'}</tbody></table></section><section class="card balance-card"><p class="eyebrow">QUICK ACTIONS</p><h2>快捷操作</h2><button class="action" data-page="checkin"><span>✦</span><div><b>每日签到</b><small>${checkin?.checkedInToday?`今日已领 ¥${Number(checkin.todayAmount||0).toFixed(2)}`:'随机领取 ¥0.05–¥0.50'}</small></div><i>→</i></button><button class="action" data-page="api"><span>◈</span><div><b>查看 API 接入</b><small>复制你的专属调用密钥</small></div><i>→</i></button><button class="action" data-page="billing"><span>◇</span><div><b>卡密充值</b><small>充值后立即到账</small></div><i>→</i></button><button class="action" data-page="referral"><span>♧</span><div><b>邀请好友</b><small>好友付费后返利 5%</small></div><i>→</i></button></section></div>`);
   if(name==='checkin'){renderCheckIn();return;}
   if(name==='operations'){renderOperations();return;}
   if(name==='api'){renderApiKeys();return;}
-  if(name==='logs')shell('使用日志','REQUEST LOGS',`<section class="card"><div class="card-head"><div><p class="eyebrow">AUDIT TRAIL</p><h2>全部请求记录</h2></div></div><table><thead><tr><th>时间</th><th>模型</th><th>Token</th><th>花销</th><th>延迟</th><th>状态</th></tr></thead><tbody>${data.logs.map(l=>`<tr><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td><td>${esc(l.model)}</td><td>${spentTokens(l)}</td><td>¥${Number(l.chargedAmount||0).toFixed(4)}</td><td>${l.latency}ms</td><td><span class="tag success">成功</span></td></tr>`).join('')||'<tr><td colspan="6" class="empty">暂无日志</td></tr>'}</tbody></table></section>`);
+  if(name==='logs')shell('使用日志','REQUEST LOGS',`<section class="card"><div class="card-head"><div><p class="eyebrow">AUDIT TRAIL</p><h2>全部请求记录</h2></div></div><table><thead><tr><th>时间</th><th>模型</th><th>Token</th><th>花销</th><th>延迟</th><th>状态</th></tr></thead><tbody>${data.logs.map(l=>`<tr><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td><td>${esc(l.model)}</td><td>${spentTokens(l)}</td><td>${logChargeText(l)}</td><td>${l.latency}ms</td><td>${logStatusTag(l)}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">暂无日志</td></tr>'}</tbody></table></section>`);
   if(name==='billing'){
   shell('卡密充值','BILLING & RECHARGE','<section class="card"><p class="sub">正在加载充值方案…</p></section>');
   (async () => {
@@ -326,7 +340,11 @@ function renderBillingContent(){
         <button type="button" class="pay-method-btn active" data-method="wechat">微信支付</button>
         <button type="button" class="pay-method-btn" data-method="alipay">支付宝</button>
       </div>
-      <div class="amount-grid" id="amountGrid">${plans.map(p=>`<button type="button" class="amount-btn" data-amount="${p.amount}">¥${p.amount}</button>`).join('')}</div>
+      <div class="amount-grid" id="amountGrid">${plans.map(p=>{
+        const credit=Number(p.creditAmount||p.amount);
+        const bonus=credit>Number(p.amount);
+        return `<button type="button" class="amount-btn" data-amount="${p.amount}">¥${p.amount}${bonus?`<small>到账 ¥${credit}</small>`:''}</button>`;
+      }).join('')}</div>
       <button class="primary-btn" id="confirmPayBtn" type="button" disabled style="margin-top:14px;width:100%">确认购买</button>
       <div id="payPanel" class="pay-panel" hidden>
         <p class="sub" id="payHint"></p>
@@ -709,7 +727,7 @@ async function renderApiKeys(){
     const models=options.models||[];
     const first=keys[0];
     const sample=first?.key||'rk_your_key';
-    const recommendedModel=(window.appConfig?.recommendedModel)||'gpt-5.6-sol';
+    const recommendedModel=(window.appConfig?.recommendedModel)||'gpt-5.6-terra';
     const modelSample=esc(recommendedModel);
     const configured=(window.appConfig?.publicBaseUrl||'').replace(/\/$/,'');
     const origin=(configured||location.origin).replace(/\/$/,'');
@@ -738,7 +756,7 @@ async function renderApiKeys(){
         <div class="code-box"><b>基础 URL（Base URL）</b><pre id="baseUrlText">${esc(baseUrl)}</pre><button type="button" class="link-btn" id="copyBaseUrl">复制</button></div>
         <div class="code-box"><b>完整对话地址</b><pre id="chatUrlText">${esc(chatUrl)}</pre><button type="button" class="link-btn" id="copyChatUrl">复制</button></div>
       </div>
-      <p class="sub" style="margin-bottom:14px">客户端请填写<strong>本站</strong>地址（上线后为你的域名），不要填 OpenAI 或其他第三方地址。</p>
+      <p class="sub" style="margin-bottom:14px">客户端请填写<strong>本站</strong>地址（上线后为你的域名）和 <code>rk_</code> 开头的密钥。不要填上游网站，也不要把密钥填到 OpenAI / Claude 官方。</p>
       <div class="key-list">${keys.map(k=>`<article class="key-card" data-key-id="${esc(k.id)}">
         <div class="card-head">
           <div><h2>${esc(k.name)}</h2><p class="sub">${esc(keyLimitLabel(k))}${k.groupId?` · 组 ${esc(groupName(k.groupId))}`:''}</p></div>
@@ -877,7 +895,7 @@ claude</pre></div>
     page.querySelectorAll('[data-copy-key]').forEach(btn=>btn.onclick=()=>copyText(btn.dataset.copyKey,btn));
     page.querySelectorAll('[data-copy-text]').forEach(btn=>btn.onclick=()=>copyText(btn.dataset.copyText,btn));
     page.querySelectorAll('[data-rotate-key]').forEach(btn=>btn.onclick=async()=>{
-      try{await api(`/api/keys/${btn.dataset.rotateKey}/rotate`,{method:'POST'});flash('密钥已轮换，请使用新密钥',true);renderApiKeys();}
+      try{await api(`/api/keys/${btn.dataset.rotateKey}/rotate`,{method:'POST'});flash('密钥已轮换。请用 rk_ 新密钥，并把客户端地址填成本站 /v1，不要填上游。',true);renderApiKeys();}
       catch(err){flash(err.message);}
     });
     page.querySelectorAll('[data-delete-key]').forEach(btn=>btn.onclick=async()=>{
@@ -893,15 +911,32 @@ claude</pre></div>
   }
 }
 
-window.appConfigReady = fetch('/api/config').then(r=>r.json()).then(c=>{ window.appConfig=c; return c; }).catch(err=>{ console.warn('config_load_failed', err); return window.appConfig || {}; });
+window.appConfigReady = fetch('/api/config').then(r=>r.json()).then(c=>{ window.appConfig=c; paintWelfareBanner(c.welfareBanner); return c; }).catch(err=>{ console.warn('config_load_failed', err); return window.appConfig || {}; });
+function paintWelfareBanner(banner){
+  const el=document.getElementById('welfareBanner');
+  if(!el) return;
+  if(!banner || !banner.text){
+    el.hidden=true;
+    el.innerHTML='';
+    return;
+  }
+  const imgs=(banner.images||[]).map(u=>`<img src="${esc(u)}" alt="">`).join('');
+  const item=`<span class="welfare-item">${imgs}<b>${esc(banner.text)}</b></span>`;
+  el.innerHTML=`<div class="welfare-track">${item}${item}${item}${item}</div>`;
+  el.hidden=false;
+}
 async function ensureAppConfig(){
-  if (window.appConfig && Array.isArray(window.appConfig.paymentPlans) && window.appConfig.paymentPlans.length) return window.appConfig;
+  if (window.appConfig && Array.isArray(window.appConfig.paymentPlans) && window.appConfig.paymentPlans.length) {
+    paintWelfareBanner(window.appConfig.welfareBanner);
+    return window.appConfig;
+  }
   if (window.appConfigReady) {
     try { return await window.appConfigReady; } catch { /* fall through */ }
   }
   try {
     const c = await fetch('/api/config').then(r=>r.json());
     window.appConfig = c;
+    paintWelfareBanner(c.welfareBanner);
     return c;
   } catch (err) {
     console.warn('config_reload_failed', err);
@@ -936,7 +971,8 @@ function adminTabsHtml() {
     ['errors', '网站错误'],
     ['diag', '诊断测试'],
     ['pool', '今日财务'],
-    ['checkin', '签到']
+    ['checkin', '签到'],
+    ['welfare', '福利']
   ];
   return `<div class="admin-tabs">${tabs.map(([id, label]) => `<button class="admin-tab ${adminTab===id?'active':''}" data-admin-tab="${id}">${label}</button>`).join('')}</div>`;
 }
@@ -1092,7 +1128,8 @@ async function renderOperations() {
 <div class="rate-block" style="margin:1rem 0;padding:1rem;border:1px solid rgba(255,255,255,.08);border-radius:12px"><h3 style="margin:0 0 .5rem">扣费方式</h3><label style="display:flex;align-items:flex-start;gap:.6rem;margin:.5rem 0"><input id="allowEstimate" type="checkbox" ${settings.allowEstimatedBilling ? 'checked' : ''}><span>允许估价结算（仅当拿不到上游 <code>actual_cost</code> 时）。<br><small class="sub">关闭时：只认上游实时实扣；实扣未到会挂起继续对齐，不会用价表定稿。</small></span></label><button class="primary-btn" id="saveEstimateMode">保存扣费方式</button></div>
 <div class="rate-block" style="margin:1rem 0;padding:1rem;border:1px solid rgba(255,255,255,.08);border-radius:12px"><h3 style="margin:0 0 .5rem">beibeihai / 北海 全局倍率</h3><p class="sub">绑定 <code>settings.billingMultiplier</code>，默认 <b>2.5x</b>。当前 <b>${esc(fmtRate(settings.multiplier))}x</b></p><div class="inline-form"><input id="customRate" type="number" min="0.01" max="10" step="0.01" value="${esc(fmtRate(settings.multiplier))}"><button class="primary-btn" id="saveCustomRate">保存北海倍率</button></div><p class="sub">快捷选择：</p><div class="rate-buttons" id="beibeiRates">${[1,1.5,2,2.5,3,4].map(rate=>`<button class="rate-btn ${rateEquals(settings.multiplier,rate)?'selected':''}" data-rate="${rate}" data-which="beibei">${fmtRate(rate)}x <small>北海</small></button>`).join('')}</div></div>
 <div class="rate-block" style="margin:1rem 0;padding:1rem;border:1px solid rgba(255,255,255,.08);border-radius:12px"><h3 style="margin:0 0 .5rem">vip1129 / Codex 直连中转 全局倍率</h3><p class="sub">绑定 <code>settings.billingMultiplierVip1129</code> / <code>settings.multiplierVip1129</code>，默认 <b>1.5x</b>。当前 <b>${esc(fmtRate(settings.multiplierVip1129 ?? 1.5))}x</b></p><div class="inline-form"><input id="customRateVip" type="number" min="0.01" max="10" step="0.01" value="${esc(fmtRate(settings.multiplierVip1129 ?? 1.5))}"><button class="primary-btn" id="saveCustomRateVip">保存 vip1129 倍率</button></div><p class="sub">快捷选择：</p><div class="rate-buttons" id="vipRates">${[1,1.5,2,2.5,3,4].map(rate=>`<button class="rate-btn ${rateEquals(settings.multiplierVip1129 ?? 1.5,rate)?'selected':''}" data-rate="${rate}" data-which="vip">${fmtRate(rate)}x <small>vip1129</small></button>`).join('')}</div></div>
-<p id="rateResult" class="inline-msg"></p><p class="sub">渠道列表（仅展示摆设倍率；真实扣费看上方对应上游全局倍率）：</p><div class="health-summary">${(settings.providers||[]).map(p=>`<div class="account-row"><span>${esc(p.name)}</span><b>展示倍率 ${esc(fmtRate(p.displayMultiplier))}x（摆设）· 真实扣费看上游全局倍率</b></div>`).join('')||'<p class="sub">暂无渠道。</p>'}</div></section>`);
+<p id="rateResult" class="inline-msg"></p><p class="sub">渠道列表（仅展示摆设倍率；真实扣费看上方对应上游全局倍率）：</p><div class="health-summary">${(settings.providers||[]).map(p=>`<div class="account-row"><span>${esc(p.name)}</span><b>展示倍率 ${esc(fmtRate(p.displayMultiplier))}x（摆设）· 真实扣费看上游全局倍率</b></div>`).join('')||'<p class="sub">暂无渠道。</p>'}</div>
+<div class="rate-block" style="margin:1rem 0;padding:1rem;border:1px solid rgba(255,255,255,.08);border-radius:12px"><h3 style="margin:0 0 .5rem">对照账单校准估价</h3><p class="sub">用近期账单反推每个渠道组、每个模型的 Token 单价（元/1K），用于没拉到实扣时的 1.2 倍占位。不会改历史账单、也不会改全局扣费倍率。</p><button class="primary-btn" type="button" id="calibrateRates">立即校准</button><div id="calibrateRatesMsg" class="inline-msg"></div></div></section>`);
         page.querySelectorAll('[data-rate]').forEach(button => button.onclick = async () => {
           try {
             const which = button.dataset.which;
@@ -1127,9 +1164,30 @@ async function renderOperations() {
         });
         $('#customRate')?.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); $('#saveCustomRate')?.click(); } });
         $('#customRateVip')?.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); $('#saveCustomRateVip')?.click(); } });
+        $('#calibrateRates')?.addEventListener('click', async () => {
+          const msg = $('#calibrateRatesMsg');
+          if (msg) { msg.textContent = '正在对照账单校准…'; msg.className = 'inline-msg'; }
+          try {
+            const j = await api('/api/admin/providers/calibrate-prices', { method: 'POST', body: '{}' });
+            if (msg) { msg.textContent = j.message || '已校准'; msg.className = 'inline-msg ok'; }
+          } catch (err) {
+            if (msg) { msg.textContent = err.message || '校准失败'; msg.className = 'inline-msg'; }
+          }
+        });
       } else {
-        shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<div class="admin-actions-bar"><div><p class="eyebrow">CHANNEL POOL</p><h2 style="margin:0">渠道管理</h2><p class="sub">填写上游地址和 API Key 后会自动同步模型；后台每小时自动探测渠道是否可用。</p></div><button class="primary-btn" id="addProvider">+ 添加渠道</button><button class="ghost-btn" id="probeHealth">立即探测渠道</button><button class="ghost-btn" id="syncAllModels">同步全部上游模型</button><button class="primary-btn" id="saveProviders">保存全部渠道</button><span id="providerResult" class="inline-msg"></span></div><div id="providersList">${adminProvidersCache.map((p, i) => providerFormHtml(p, i, settings)).join('') || '<section class="card"><p class="sub">尚未配置渠道，请点击添加。</p></section>'}</div>`);
+        shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<div class="admin-actions-bar"><div><p class="eyebrow">CHANNEL POOL</p><h2 style="margin:0">渠道管理</h2><p class="sub">填写上游地址和 API Key 后会自动同步模型；后台每小时自动探测渠道是否可用。</p></div><button class="primary-btn" id="addProvider">+ 添加渠道</button><button class="ghost-btn" id="probeHealth">立即探测渠道</button><button class="ghost-btn" id="syncAllModels">同步全部上游模型</button><button class="ghost-btn" id="calibratePrices">对照账单校准估价</button><button class="primary-btn" id="saveProviders">保存全部渠道</button><span id="providerResult" class="inline-msg"></span></div><div id="providersList">${adminProvidersCache.map((p, i) => providerFormHtml(p, i, settings)).join('') || '<section class="card"><p class="sub">尚未配置渠道，请点击添加。</p></section>'}</div>`);
         wireProviderEditor();
+        $('#calibratePrices')?.addEventListener('click', async () => {
+          const msg = $('#providerResult');
+          if (msg) { msg.textContent = '正在对照账单校准…'; msg.className = 'inline-msg'; }
+          try {
+            const j = await api('/api/admin/providers/calibrate-prices', { method: 'POST', body: '{}' });
+            if (msg) { msg.textContent = j.message || '已校准'; msg.className = 'inline-msg ok'; }
+            renderOperations();
+          } catch (err) {
+            if (msg) { msg.textContent = err.message || '校准失败'; msg.className = 'inline-msg'; }
+          }
+        });
       }
     } else if (adminTab === 'users') {
       const { users } = await api('/api/admin/users');
@@ -1188,7 +1246,7 @@ async function renderOperations() {
     } else if (adminTab === 'codes') {
       const { codes } = await api('/api/admin/codes?limit=200');
       if (!stillCurrent()) return;
-      shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<div class="content-grid"><section class="card"><p class="eyebrow">GENERATE</p><h2>生成卡密</h2><form id="genCodesForm" class="stack-form"><label>数量<input name="count" type="number" min="1" max="200" value="5" required></label><label>金额 ¥<input name="amount" type="number" min="0" step="0.01" value="10" required></label><label>Token 配额<input name="quotaTokens" type="number" min="0" value="100000" required></label><label>前缀<input name="prefix" value="RELAY"></label><button class="primary-btn" type="submit">生成</button></form><div id="codesMsg" class="inline-msg"></div></section><section class="card"><p class="eyebrow">CODES</p><h2>卡密列表</h2><table class="admin-table"><thead><tr><th>卡密</th><th>金额</th><th>配额</th><th>状态</th><th>用户</th></tr></thead><tbody>${codes.slice().reverse().slice(0,100).map(c=>`<tr><td><code>${esc(c.code)}</code></td><td>¥${Number(c.amount).toFixed(2)}</td><td>${Number(c.quotaTokens).toLocaleString()}</td><td><span class="tag ${c.usedAt?'danger':'success'}">${c.usedAt?'已用':'未用'}</span></td><td>${esc(c.userId||'-')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无卡密</td></tr>'}</tbody></table></section></div>`);
+      shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<div class="content-grid"><section class="card"><p class="eyebrow">GENERATE</p><h2>生成卡密</h2><form id="genCodesForm" class="stack-form"><label>数量<input name="count" type="number" min="1" max="200" value="5" required></label><label>金额 ¥<input name="amount" type="number" min="0" step="0.01" value="10" required></label><label>Token 配额<input name="quotaTokens" type="number" min="0" value="100000" required></label><label>前缀<input name="prefix" value="RELAY"></label><button class="primary-btn" type="submit">生成</button></form><div id="codesMsg" class="inline-msg"></div></section><section class="card"><p class="eyebrow">CODES</p><h2>卡密列表</h2><table class="admin-table"><thead><tr><th>卡密</th><th>金额</th><th>配额</th><th>状态</th><th>用户</th></tr></thead><tbody>${codes.slice().reverse().slice(0,100).map(c=>`<tr><td><code>${esc(c.code)}</code></td><td>¥${Number(c.amount).toFixed(2)}${c.creditAmount && Number(c.creditAmount)!==Number(c.amount) ? ` → ¥${Number(c.creditAmount).toFixed(2)}` : ''}</td><td>${Number(c.quotaTokens).toLocaleString()}</td><td><span class="tag ${c.usedAt?'danger':'success'}">${c.usedAt?'已用':'未用'}</span></td><td>${esc(c.userId||'-')}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无卡密</td></tr>'}</tbody></table></section></div>`);
       $('#genCodesForm')?.addEventListener('submit', async e => {
         e.preventDefault();
         const fd = new FormData(e.target);
@@ -1379,6 +1437,7 @@ async function renderOperations() {
         <article><small>上游 API 开销${stats.upstreamCostIsEstimate===false?"（实扣）":"（估算）"}</small><strong>¥${Number(stats.upstreamCostToday||0).toFixed(4)}</strong><span>今日上游成本 · ${Number(stats.requestCountToday||0)} 次请求${stats.upstreamCostReportedCount?` · 实扣${stats.upstreamCostReportedCount}`:""}</span></article>
         <article><small>客户实扣</small><strong>¥${Number(stats.chargedToday||0).toFixed(4)}</strong><span>今日向用户扣费</span></article>
       </div>
+      <section class="card" style="margin-top:16px"><div class="card-head"><div><p class="eyebrow">UPSTREAM LEDGER</p><h2>上游账单同步</h2><p class="sub">以每把上游 Key 的 <code>actual_cost</code> 为准。活跃 Key 每 2 秒结算，空闲 Key 每分钟核对；首次同步会补齐历史漏账。</p></div><button class="primary-btn" id="syncUpstreamBilling">立即同步</button></div><p id="upstreamBillingMsg" class="inline-msg">${stats.upstreamUsageSync?.lastRunAt ? `上次同步：${new Date(stats.upstreamUsageSync.lastRunAt).toLocaleString('zh-CN')} · 本次账本 ${Number(stats.upstreamLedgerRows||0)} 条` : '等待首次账单同步'}</p></section>
       <section class="card" id="payMetaCard"><div class="card-head"><div><p class="eyebrow">PAYMENT QR</p><h2>付款码有效期</h2><p class="sub">微信/支付宝不会回调本站。可在此登记预计到期日；到期或临近时，用户付款页与此处都会提示。</p></div></div>
         <div id="payMetaBanner" class="pay-expiry-tip" hidden></div>
         <div class="pay-meta-grid">
@@ -1391,6 +1450,20 @@ async function renderOperations() {
       </section>
       <section class="card"><div class="card-head"><div><p class="eyebrow">TODAY ISSUE</p><h2>今日发卡统计</h2><p class="sub">仅管理员可见。日期：${esc(stats.day)} · 库存目标每档 ${stats.target} 张</p></div><div><b>今日发放 ${stats.issuedTodayCount} 张 / ¥${Number(stats.issuedTodaySum).toFixed(0)}</b><br><span class="sub">今日兑换 ${stats.redeemedTodayCount} 张 / ¥${Number(stats.redeemedTodaySum).toFixed(0)}</span></div></div><table class="admin-table"><thead><tr><th>金额</th><th>可用库存</th><th>今日发放</th><th>今日发放金额</th><th>今日兑换</th><th>今日兑换金额</th></tr></thead><tbody>${(stats.byAmount||[]).map(r=>`<tr><td>¥${r.amount}</td><td>${r.available}</td><td>${r.issuedToday}</td><td>¥${r.issuedTodaySum}</td><td>${r.redeemedToday}</td><td>¥${r.redeemedTodaySum}</td></tr>`).join('')}</tbody></table></section>
       <section class="card" style="margin-top:16px"><div class="card-head"><div><p class="eyebrow">UPSTREAM COST</p><h2>今日上游开销明细</h2><p class="sub">按渠道汇总当日 upstreamCost（优先上游返回实扣；否则为单价×token×渠道上游倍率，非 displayMultiplier）</p></div></div><table class="admin-table"><thead><tr><th>渠道</th><th>请求数</th><th>上游开销</th><th>客户实扣</th></tr></thead><tbody>${(stats.upstreamByProvider||[]).map(r=>`<tr><td>${esc(r.providerName||r.providerId)}</td><td>${r.requests}</td><td>¥${Number(r.upstreamCost).toFixed(4)}</td><td>¥${Number(r.chargedAmount).toFixed(4)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">今日暂无上游调用</td></tr>'}</tbody></table></section>`);
+
+      document.getElementById('syncUpstreamBilling')?.addEventListener('click', async () => {
+        const button = document.getElementById('syncUpstreamBilling');
+        const msg = document.getElementById('upstreamBillingMsg');
+        if (button) button.disabled = true;
+        if (msg) { msg.textContent = '正在读取上游实际账单…'; msg.className = 'inline-msg'; }
+        try {
+          const j = await api('/api/admin/upstream-billing/sync', { method:'POST', body: JSON.stringify({ fullBackfill:true }) });
+          if (msg) { msg.textContent = `同步完成：${Number(j.synced?.rows||0)} 条上游账单，补入 ${Number(j.synced?.imported||0)} 条本地消费记录`; msg.className = 'inline-msg ok'; }
+          setTimeout(() => renderOperations(), 500);
+        } catch (err) {
+          if (msg) { msg.textContent = err.message || '同步失败'; msg.className = 'inline-msg'; }
+        } finally { if (button) button.disabled = false; }
+      });
 
       // payment QR expiry settings
       (async () => {
@@ -1465,10 +1538,10 @@ async function renderOperations() {
       <section class="card"><div class="card-head"><div><p class="eyebrow">SITE URL</p><h2>站点网址 / API 基础地址</h2>
         <p class="sub">给用户和客户端看的 Base URL。你上线域名后填这里；留空则自动用当前访问域名。上游中转地址（如 vip1129）在「渠道」里单独配置，不会展示给普通用户。</p></div></div>
         <label>公网站点网址<input id="publicBaseUrlInput" placeholder="https://api.your-domain.com" value="${esc(data.publicBaseUrl||'')}"></label>
-        <label style="margin-top:12px">推荐模型<input id="recommendedModelInput" placeholder="gpt-5.6-sol" value="${esc(data.recommendedModel||'gpt-5.6-sol')}"></label>
+        <label style="margin-top:12px">推荐模型<input id="recommendedModelInput" placeholder="gpt-5.6-terra" value="${esc(data.recommendedModel||'gpt-5.6-terra')}"></label>
         <p class="sub" style="margin-top:10px">当前解析：<code>${esc(data.resolvedBaseUrl||'(未设置)')}</code></p>
         <p class="sub">用户 API Base URL：<code>${esc(data.apiBaseUrl||'')}</code></p>
-        <p class="sub">推荐模型会写入 API 接入示例和 CC Switch 导入链接。请填上游真实存在的模型名（不要用已下线的 gpt-5.6）。</p>
+        <p class="sub">推荐模型会写入 API 接入示例和 CC Switch 导入链接。默认用 gpt-5.6-terra，不要填 gpt-5.6 或 gpt-5.6-sol。</p>
         <button class="primary-btn" type="button" id="saveSiteUrlBtn" style="margin-top:12px">保存站点设置</button>
         <div id="siteUrlMsg" class="inline-msg"></div>
       </section>`);
@@ -1480,7 +1553,7 @@ async function renderOperations() {
           if (window.appConfig) {
             window.appConfig.publicBaseUrl = j.resolvedBaseUrl || j.publicBaseUrl || '';
             window.appConfig.apiBaseUrl = j.apiBaseUrl || '';
-            window.appConfig.recommendedModel = j.recommendedModel || 'gpt-5.6-sol';
+            window.appConfig.recommendedModel = j.recommendedModel || 'gpt-5.6-terra';
           }
           msg.textContent = j.message || '已保存'; msg.className = 'inline-msg ok';
         } catch (err) {
@@ -1582,6 +1655,78 @@ async function renderOperations() {
       </div>
       <section class="card"><div class="card-head"><div><p class="eyebrow">CHECK-IN LOG</p><h2>最近签到</h2><p class="sub">日期按 Asia/Shanghai 自然日计算，奖励计入用户余额（不计入邀请返利）。</p></div><span class="sub">${recent.length} 条</span></div>
       <table class="admin-table"><thead><tr><th>日期</th><th>用户名</th><th>邮箱</th><th>金额</th><th>时间</th></tr></thead><tbody>${rows}</tbody></table></section>`);
+    } else if (adminTab === 'welfare') {
+      const data = await api('/api/admin/welfare');
+      if (!stillCurrent()) return;
+      const promo = data.promo || {};
+      const preview = (data.preview || []).map(p => `<span>付 ¥${p.amount} → 到账 ¥${p.creditAmount}</span>`).join(' · ');
+      const thumbs = (promo.images || []).map((u, i) => `<span class="welfare-thumb"><img src="${esc(u)}" alt=""><button type="button" class="ghost-btn" data-rm-img="${i}">移除</button></span>`).join('');
+      const until = promo.expiresAt ? new Date(promo.expiresAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : '今晚 24:00';
+      shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}
+      <section class="card"><div class="card-head"><div><p class="eyebrow">WELFARE</p><h2>充值福利</h2>
+        <p class="sub">只在后台配置。开启后用户端只看到顶部滚动横幅，以及购卡时的到账金额。福利到今晚 24:00（北京时间）截止；购卡时把倍率写进卡密，过点兑换仍按发卡时的到账额。</p></div>
+        <span class="tag ${data.active?'success':'danger'}">${data.active?'进行中':'未开启'}</span></div>
+        <form id="welfareForm" class="stack-form">
+          <label class="check-label"><input id="welfareOn" type="checkbox" ${promo.enabled?'checked':''}> 开启今日福利</label>
+          <label>福利倍率<input id="welfareMul" type="number" min="1" max="10" step="0.01" value="${esc(promo.multiplier ?? 1.1)}"></label>
+          <p class="sub">1.1 倍：10 元卡密到账 11 元；2 倍：10 元到账 20 元。截止：${esc(until)}</p>
+          <p class="sub">${preview || ''}</p>
+          <label>横幅文案（可留空用默认）<textarea id="welfareText" placeholder="今日充值福利开启！卡密按 {mul} 倍到账，付 10 得 {ten}，今晚 24:00 截止。">${esc(promo.text||'')}</textarea></label>
+          <p class="sub">占位符：{mul} {ten} {thirty} {fifty} {hundred}</p>
+          <div class="welfare-thumbs">${thumbs || '<p class="sub">还没有横幅图片，可在下方上传。</p>'}</div>
+          <label>上传横幅图片<input id="welfareFile" type="file" accept="image/*"></label>
+          <button class="primary-btn" type="submit">保存福利设置</button>
+          <div id="welfareMsg" class="inline-msg"></div>
+        </form>
+      </section>`);
+      const images = [...(promo.images || [])];
+      const saveWelfare = async (extra = {}) => {
+        const msg = $('#welfareMsg');
+        try {
+          const j = await api('/api/admin/welfare', {
+            method: 'PUT',
+            body: JSON.stringify({
+              enabled: !!$('#welfareOn')?.checked,
+              multiplier: Number($('#welfareMul')?.value),
+              text: $('#welfareText')?.value || '',
+              images,
+              ...extra
+            })
+          });
+          if (window.appConfig) window.appConfig.welfareBanner = j.banner || null;
+          paintWelfareBanner(j.banner);
+          if (msg) { msg.textContent = j.active ? '已开启，横幅对用户可见' : '已保存（当前未在有效期内，用户看不到横幅）'; msg.className = 'inline-msg ok'; }
+          renderOperations();
+        } catch (err) {
+          if (msg) { msg.textContent = err.message || '保存失败'; msg.className = 'inline-msg'; }
+        }
+      };
+      $('#welfareForm')?.addEventListener('submit', e => { e.preventDefault(); saveWelfare(); });
+      page.querySelectorAll('[data-rm-img]').forEach(btn => {
+        btn.onclick = () => {
+          images.splice(Number(btn.dataset.rmImg), 1);
+          saveWelfare({ refreshExpiry: false });
+        };
+      });
+      $('#welfareFile')?.addEventListener('change', async e => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        const msg = $('#welfareMsg');
+        try {
+          const dataUrl = await new Promise((resolve, reject) => {
+            const r = new FileReader();
+            r.onload = () => resolve(String(r.result || ''));
+            r.onerror = () => reject(new Error('读取图片失败'));
+            r.readAsDataURL(file);
+          });
+          const j = await api('/api/admin/welfare/upload', { method: 'POST', body: JSON.stringify({ image: dataUrl }) });
+          images.splice(0, images.length, ...(j.promo?.images || images));
+          if (msg) { msg.textContent = '图片已上传'; msg.className = 'inline-msg ok'; }
+          renderOperations();
+        } catch (err) {
+          if (msg) { msg.textContent = err.message || '上传失败'; msg.className = 'inline-msg'; }
+        }
+      });
     } else if (adminTab === 'orders') {
       const { orders } = await api('/api/admin/orders');
       if (!stillCurrent()) return;

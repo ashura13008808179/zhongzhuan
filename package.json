@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "relay-station",
   "version": "1.0.0",
   "private": true,
@@ -7,6 +7,6 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node --test tests/checkin.test.js && node tests/checkin-api.mjs && node test/relay-fixes.test.mjs && node test/http-onboarding.test.mjs && node test/diagnostics-suite.test.mjs && node test/admin-mobile.test.mjs && node test/payment-events.test.mjs && node test/payment-flow-security.test.mjs && node test/remote-plus-pay-verify.mjs && node test/billing-cost.test.mjs && node test/live-billing.test.mjs && node test/anthropic-wire.test.mjs && node test/full-feature-sweep.mjs"
+    "test": "node --test tests/checkin.test.js && node tests/checkin-api.mjs && node test/relay-fixes.test.mjs && node test/http-onboarding.test.mjs && node test/diagnostics-suite.test.mjs && node test/admin-mobile.test.mjs && node test/payment-events.test.mjs && node test/payment-flow-security.test.mjs && node test/remote-plus-pay-verify.mjs && node test/billing-cost.test.mjs && node test/db-rebase.test.mjs && node test/live-billing.test.mjs && node test/welfare-promo.test.mjs && node test/upstream-billing-ledger.test.mjs && node test/upstream-billing-sync.test.mjs && node test/upstream-billing-boot.test.mjs && node test/anthropic-wire.test.mjs && node test/full-feature-sweep.mjs"
   }
 }

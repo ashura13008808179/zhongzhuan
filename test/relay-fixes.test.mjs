@@ -13,6 +13,9 @@ import {
   resolveProxyApiKey,
   flattenListedKeys,
   findListedSecret,
+  findListedSecretById,
+  upstreamSecretOf,
+  preserveUpstreamSecret,
   validateInviteCode,
   insufficientBalanceMessage,
   resolveRecommendedModel,
@@ -43,18 +46,20 @@ const groups = normalizeAvailableGroups({
     { id: 4, name: 'DeepSeek 官方', platform: 'deepseek' },
     { id: 8, name: 'Grok Fast', platform: 'xai' },
     { id: 15, name: 'CC-MAX', platform: 'claude' },
-    { id: 21, name: 'Claude-Cursor', platform: 'cursor' }
+    { id: 21, name: 'Claude-Cursor', platform: 'cursor' },
+    { id: 80, name: 'Grok Heavy', platform: 'xai' }
   ]
 });
-assert.equal(groups.length, 4);
+assert.equal(groups.length, 5);
 assert.equal(matchUpstreamGroupId('grp_deepseek', groups), 4);
-assert.equal(matchUpstreamGroupId('grp_grok', groups), 8);
+assert.equal(matchUpstreamGroupId('grp_grok_heavy', groups), 80);
+assert.equal(matchUpstreamGroupId('grp_grok', groups), null);
 assert.equal(matchUpstreamGroupId('grp_cc_max', groups), 15);
 assert.equal(matchUpstreamGroupId('grp_claude_cursor', groups), null);
 
-const suggested = suggestGroupMap({ grp_deepseek: null }, groups, ['grp_deepseek', 'grp_grok']);
+const suggested = suggestGroupMap({ grp_deepseek: null }, groups, ['grp_deepseek', 'grp_grok_heavy']);
 assert.equal(suggested.grp_deepseek, 4);
-assert.equal(suggested.grp_grok, 8);
+assert.equal(suggested.grp_grok_heavy, 80);
 
 // --- provider wiring ---
 assert.equal(intendedUpstreamSync({ id: 'grp_gpt_pro' }), 'vip1129');
@@ -67,14 +72,17 @@ assert.equal(intendedUpstreamSync({ id: 'grp_gemini' }), 'beibeihai');
 const wired = wireAllProviders([
   { id: 'grp_deepseek', name: 'DeepSeek', url: 'https://api.deepseek.com/v1/chat/completions', apiKey: '' },
   { id: 'grp_gpt_pro', name: 'GPT PRO', url: 'https://api.vip1129.cc/v1/chat/completions', apiKey: '' },
-  { id: 'grp_grok', name: 'Grok', url: 'https://api.x.ai/v1/chat/completions', apiKey: '' },
+  { id: 'grp_grok_heavy', name: 'Grok Heavy', url: BEIBEIHAI_CHAT_URL, apiKey: '' },
   { id: 'grp_cursor_pool', name: 'Cursor账号池', url: 'https://api2.cursor.sh/v1/chat/completions' }
 ]);
 assert.equal(wired[0].upstreamSync, 'beibeihai');
 assert.equal(wired[0].url, BEIBEIHAI_CHAT_URL);
 assert.equal(wired[1].upstreamSync, 'vip1129');
 assert.equal(wired[1].url, VIP1129_CHAT_URL);
-assert.equal(applyProviderWiring({ id: 'grp_gpt_pro', url: VIP1129_CHAT_URL, defaultModel: 'gpt-5.6' }).defaultModel, 'gpt-5.6-sol');
+assert.equal(applyProviderWiring({ id: 'grp_gpt_pro', url: VIP1129_CHAT_URL, defaultModel: 'gpt-5.6' }).defaultModel, 'gpt-5.6-terra');
+assert.equal(applyProviderWiring({ id: 'grp_gpt_pro', url: VIP1129_CHAT_URL, defaultModel: 'gpt-5.6-sol', models: ['gpt-5.6-sol', 'gpt-5.6-terra'], priority: 20 }).defaultModel, 'gpt-5.6-terra');
+assert.equal(applyProviderWiring({ id: 'grp_gpt_pro', url: VIP1129_CHAT_URL, defaultModel: 'gpt-5.6-sol', models: ['gpt-5.6-sol', 'gpt-5.6-terra'], priority: 20 }).models[0], 'gpt-5.6-terra');
+assert.equal(applyProviderWiring({ id: 'grp_gpt_pro', url: VIP1129_CHAT_URL, defaultModel: 'gpt-5.6-sol', models: ['gpt-5.6-sol', 'gpt-5.6-terra'], priority: 20 }).priority, 1);
 assert.equal(wired[2].upstreamSync, 'beibeihai');
 assert.equal(wired[3].maintenance, true);
 
@@ -105,6 +113,27 @@ const otherGroup = {
 
 assert.equal(isUsableUpstreamSecret(gpt, syncedKey, isVip1129, isBeibeihai), true);
 assert.equal(isUsableUpstreamSecret(gpt, localRk, isVip1129, isBeibeihai), false);
+
+const rotatedRk = {
+  id: 'key_4',
+  key: 'rk_after_rotate',
+  groupId: 'grp_gpt_pro',
+  enabled: true,
+  upstream: { provider: 'vip1129', id: 'u1', key: 'sk-upstream-gpt' }
+};
+assert.equal(isUsableUpstreamSecret(gpt, rotatedRk, isVip1129, isBeibeihai), true);
+assert.equal(upstreamSecretOf(rotatedRk), 'sk-upstream-gpt');
+assert.equal(
+  resolveProxyApiKey(gpt, rotatedRk, { users: [{ id: 'usr_rot', apiKeys: [rotatedRk] }] }, { id: 'usr_rot', apiKeys: [rotatedRk] }, detectors),
+  'sk-upstream-gpt',
+  'rotated rk_ must still inject the stored upstream sk-'
+);
+
+const legacySk = { key: 'sk-copied-through', upstream: { provider: 'vip1129' } };
+preserveUpstreamSecret(legacySk);
+assert.equal(legacySk.upstream.key, 'sk-copied-through');
+legacySk.key = 'rk_new';
+assert.equal(upstreamSecretOf(legacySk), 'sk-copied-through');
 
 const user = { id: 'usr_a', apiKeys: [localRk, syncedKey] };
 assert.equal(resolveProxyApiKey(gpt, localRk, { users: [user] }, user, detectors), 'sk-upstream-gpt');
@@ -142,6 +171,9 @@ assert.equal(flattenListedKeys(listedPayload).length, 3);
 assert.equal(findListedSecret(listedPayload, { name: 'relay-probe-grp_gpt_pro', groupId: 10 }).key, 'sk-probe-pro');
 assert.equal(findListedSecret(listedPayload, { nameIncludes: 'relay-probe', groupId: 34 }).key, 'sk-probe-plus');
 assert.equal(findListedSecret(listedPayload, { groupId: 99 }).key, null);
+assert.equal(findListedSecretById(listedPayload, 6086).key, 'sk-probe-pro');
+assert.equal(findListedSecretById(listedPayload, '34').key, 'sk-probe-plus');
+assert.equal(findListedSecretById(listedPayload, 999).key, null);
 
 // --- invite / 402 copy ---
 const users = [
@@ -158,11 +190,13 @@ assert.equal(validateInviteCode(users, 'OLDCODE').ok, false);
 assert.match(validateInviteCode(users, 'OLDCODE').error, /过期/);
 assert.match(insufficientBalanceMessage(), /卡密充值/);
 
-assert.equal(DEFAULT_RECOMMENDED_MODEL, 'gpt-5.6-sol');
-assert.equal(resolveRecommendedModel({}), 'gpt-5.6-sol');
-assert.equal(resolveRecommendedModel({ recommendedModel: 'gpt-5.6' }), 'gpt-5.6-sol');
+assert.equal(DEFAULT_RECOMMENDED_MODEL, 'gpt-5.6-terra');
+assert.equal(resolveRecommendedModel({}), 'gpt-5.6-terra');
+assert.equal(resolveRecommendedModel({ recommendedModel: 'gpt-5.6' }), 'gpt-5.6-terra');
+assert.equal(resolveRecommendedModel({ recommendedModel: 'gpt-5.6-sol' }), 'gpt-5.6-terra');
 assert.equal(resolveRecommendedModel({ recommendedModel: 'gpt-5.6-terra' }), 'gpt-5.6-terra');
 assert.equal(normalizeRecommendedModel('gpt-5.6-sol').ok, true);
+assert.equal(normalizeRecommendedModel('gpt-5.6-sol').model, 'gpt-5.6-terra');
 assert.equal(normalizeRecommendedModel('bad model!').ok, false);
 
 assert.equal(DEFAULT_AVATAR, 'letter');

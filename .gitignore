@@ -14,6 +14,9 @@ android-admin/app/build/
 android-admin/local.properties
 public/payment-qr/uploads/*
 !public/payment-qr/uploads/.gitkeep
+public/welfare/uploads/*
+!public/welfare/uploads/.gitkeep
 dist/
 *.apk
+.relay-browser-profile/
 

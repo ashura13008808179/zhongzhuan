@@ -142,8 +142,7 @@ export function defaultGroupMap() {
     grp_gpt_pro: 10,   // codex 混合池1
     grp_gpt_plus: 34,  // codex 混合池2
     grp_gpt_mix: 65,   // codex 混合池3
-    grp_aws_cc: 56,    // aws-cc 金额消耗
-    grp_grok_vip: 79   // Grok 分组
+    grp_aws_cc: 56    // aws-cc 金额消耗
   };
 }
 

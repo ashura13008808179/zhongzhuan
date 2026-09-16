@@ -7,7 +7,9 @@ import {
   resolveUpstreamCost,
   billedTokensFromLog,
   usageListFromPayload,
-  pickUpstreamUsageRow
+  pickUpstreamUsageRow,
+  pickExclusiveUpstreamUsageRow,
+  findDuplicateUsageCharges
 } from '../lib/billing-cost.js';
 import { pricesFromUsageRows } from '../scripts/probe-upstream-prices.mjs';
 
@@ -202,6 +204,39 @@ const unmatchedHeader = pickUpstreamUsageRow([
 assert.equal(unmatchedHeader.id, 51);
 assert.equal(unmatchedHeader.actual_cost, 0.000102);
 
+const byTotalOnly = pickUpstreamUsageRow([
+  {
+    id: 61, api_key_id: 6163, model: 'gpt-5.6-terra',
+    input_tokens: 140000, output_tokens: 11717, cache_read_tokens: 0,
+    actual_cost: 0.08, created_at: '2026-09-15T08:05:50.504Z'
+  },
+  {
+    id: 62, api_key_id: 6163, model: 'gpt-5.6-terra',
+    input_tokens: 20000, output_tokens: 100, cache_read_tokens: 0,
+    actual_cost: 0.01, created_at: '2026-09-15T08:05:51.000Z'
+  }
+], {
+  apiKeyId: '',
+  model: 'gpt-5.6-terra',
+  usage: { total_tokens: 151717 },
+  startedAt: started,
+  now: started + 300000
+});
+assert.equal(byTotalOnly.id, 61);
+
+const wrongKey = pickUpstreamUsageRow([{
+  id: 71, api_key_id: 6163, model: 'gpt-5.6-terra',
+  input_tokens: 140000, output_tokens: 11717, actual_cost: 0.08,
+  created_at: '2026-09-15T08:05:50.504Z'
+}], {
+  apiKeyId: 9999,
+  model: 'gpt-5.6-terra',
+  usage: { total_tokens: 151717 },
+  startedAt: started,
+  now: started + 300000
+});
+assert.equal(wrongKey, null);
+
 assert.equal(billedTokensFromLog({ tokens: 100, billedTokens: 250, multiplier: 2.5 }), 250);
 assert.equal(billedTokensFromLog({ tokens: 100, multiplier: 1.5 }), 150);
 assert.equal(billedTokensFromLog({ tokens: 100, billedTokens: 0, multiplier: 2.5 }), 250);
@@ -240,5 +275,53 @@ const derived = pricesFromUsageRows([{
 assert.equal(derived['gpt-5.6-terra'].inputPricePer1K, 0.002);
 assert.equal(derived['gpt-5.6-terra'].outputPricePer1K, 0.012);
 assert.equal(derived['gpt-5.6-terra'].cacheReadPricePer1K, 0.0002);
+
+const twin = [
+  { id: 101, api_key_id: 1, model: 'gpt-5.6-sol', input_tokens: 10, output_tokens: 2, actual_cost: 0.006762, created_at: '2026-09-16T05:10:00.000Z' },
+  { id: 102, api_key_id: 1, model: 'gpt-5.6-sol', input_tokens: 10, output_tokens: 2, actual_cost: 0.006762, created_at: '2026-09-16T05:10:01.000Z' }
+];
+const claimed = new Set();
+const firstPick = pickExclusiveUpstreamUsageRow(twin, {
+  apiKeyId: 1,
+  model: 'gpt-5.6-sol',
+  usage: {},
+  startedAt: Date.parse('2026-09-16T05:10:00.000Z'),
+  now: Date.parse('2026-09-16T05:10:02.000Z'),
+  preferNewest: true,
+  lookbackMs: 180000
+}, (id) => {
+  const key = String(id);
+  if (claimed.has(key)) return false;
+  claimed.add(key);
+  return true;
+});
+const secondPick = pickExclusiveUpstreamUsageRow(twin, {
+  apiKeyId: 1,
+  model: 'gpt-5.6-sol',
+  usage: {},
+  startedAt: Date.parse('2026-09-16T05:10:00.000Z'),
+  now: Date.parse('2026-09-16T05:10:02.000Z'),
+  preferNewest: true,
+  lookbackMs: 180000,
+  usedIds: [...claimed]
+}, (id) => {
+  const key = String(id);
+  if (claimed.has(key)) return false;
+  claimed.add(key);
+  return true;
+});
+assert.equal(firstPick.id, 102);
+assert.equal(secondPick.id, 101);
+assert.notEqual(firstPick.id, secondPick.id);
+
+const dups = findDuplicateUsageCharges([
+  { id: 'a', upstreamUsageId: '9', chargedAmount: 0.1, collectedAmount: 0.1, createdAt: '2026-09-16T05:10:00.000Z', status: 'success' },
+  { id: 'b', upstreamUsageId: '9', chargedAmount: 0.1, collectedAmount: 0.1, createdAt: '2026-09-16T05:10:01.000Z', status: 'success' },
+  { id: 'c', upstreamUsageId: '8', chargedAmount: 0.2, collectedAmount: 0.2, createdAt: '2026-09-16T05:10:00.000Z', status: 'success' }
+]);
+assert.equal(dups.length, 1);
+assert.equal(dups[0].keep.id, 'a');
+assert.equal(dups[0].extras.length, 1);
+assert.equal(dups[0].extras[0].id, 'b');
 
 console.log('billing-cost.test.mjs: all assertions passed');
