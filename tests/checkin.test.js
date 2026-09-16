@@ -10,6 +10,11 @@ import {
   theoreticalCheckInMean,
   checkInRewardWeights,
   shanghaiDate,
+  shanghaiHourMinute,
+  rechargeDeskOpen,
+  publicRechargeHours,
+  RECHARGE_DESK_START_MIN,
+  RECHARGE_DESK_END_MIN,
   addDaysYmd,
   checkInStreak,
   claimCheckIn,
@@ -63,6 +68,29 @@ test('shanghaiDate uses Asia/Shanghai YYYY-MM-DD', () => {
   assert.equal(shanghaiDate(utcStill12th), '2026-09-12');
   assert.equal(CHECKIN_TIMEZONE, 'Asia/Shanghai');
   assert.match(shanghaiDate(), /^\d{4}-\d{2}-\d{2}$/);
+});
+
+test('recharge desk is open 08:30–23:30 Asia/Shanghai inclusive', () => {
+  const openStart = new Date('2026-09-16T00:30:00.000Z'); // 08:30 CST
+  const before = new Date('2026-09-16T00:29:00.000Z'); // 08:29 CST
+  const openEnd = new Date('2026-09-16T15:30:00.000Z'); // 23:30 CST
+  const after = new Date('2026-09-16T15:31:00.000Z'); // 23:31 CST
+  const midnight = new Date('2026-09-16T16:00:00.000Z'); // 00:00 CST next day
+  assert.equal(RECHARGE_DESK_START_MIN, 510);
+  assert.equal(RECHARGE_DESK_END_MIN, 1410);
+  assert.deepEqual(shanghaiHourMinute(openStart), { hour: 8, minute: 30, minutes: 510 });
+  assert.equal(rechargeDeskOpen(openStart), true);
+  assert.equal(rechargeDeskOpen(before), false);
+  assert.equal(rechargeDeskOpen(openEnd), true);
+  assert.equal(rechargeDeskOpen(after), false);
+  assert.equal(rechargeDeskOpen(midnight), false);
+  const closed = publicRechargeHours(before);
+  assert.equal(closed.timezone, 'Asia/Shanghai');
+  assert.equal(closed.start, '08:30');
+  assert.equal(closed.end, '23:30');
+  assert.equal(closed.open, false);
+  assert.match(closed.closedMessage, /8:30/);
+  assert.equal(publicRechargeHours(openStart).open, true);
 });
 
 test('addDaysYmd walks calendar dates', () => {

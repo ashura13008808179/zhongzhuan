@@ -79,6 +79,7 @@ try {
 
   const cfg = await req('/api/config');
   check('GET /api/config', cfg.status === 200 && Array.isArray(cfg.body.paymentPlans), JSON.stringify(cfg.body).slice(0, 120));
+  check('config rechargeHours', cfg.body.rechargeHours?.start === '08:30' && cfg.body.rechargeHours?.end === '23:30' && typeof cfg.body.rechargeHours?.open === 'boolean', JSON.stringify(cfg.body.rechargeHours));
 
   const guestDash = await req('/api/dashboard');
   check('dashboard guest 401', guestDash.status === 401, guestDash.status);

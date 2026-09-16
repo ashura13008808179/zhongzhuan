@@ -107,19 +107,40 @@ async function login() {
   $('#loginMsg').textContent = '登录中…';
   $('#loginMsg').className = 'msg';
   try {
+    const phoneBox = $('#phoneBox');
+    const phoneInput = $('#loginPhone');
+    if (phoneBox && !phoneBox.hidden && phoneInput) {
+      const phone = String(phoneInput.value || '').replace(/\D/g, '');
+      if (!/^1[3-9]\d{9}$/.test(phone)) throw Error('请输入正确的11位手机号');
+      const done = await api('/api/auth/login/phone', { method: 'POST', body: JSON.stringify({ ticket: window.__adminPhoneTicket, phone }) });
+      return finishAdminLogin(done);
+    }
     const j = await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ login: loginId, password }) });
-    if (!j.user?.isAdmin && j.user?.role !== 'admin') throw Error('需要管理员账号');
-    token = j.token;
-    localStorage.setItem(TOKEN_KEY, token);
-    tellNative('onLogin', token);
-    showApp();
-    $('#hello').textContent = j.user.username || j.user.name || '管理员';
-    startPoll();
-    render();
+    if (j.needPhone) {
+      window.__adminPhoneTicket = j.ticket;
+      if (phoneBox) phoneBox.hidden = false;
+      const hint = $('#phoneHint');
+      if (hint) hint.textContent = j.enroll ? '首次登录请绑定管理员手机号。' : '请输入已绑定的管理员手机号。';
+      $('#loginMsg').textContent = j.message || '请填写手机号后再次点登录';
+      $('#loginMsg').className = 'msg';
+      phoneInput?.focus();
+      return;
+    }
+    finishAdminLogin(j);
   } catch (err) {
     $('#loginMsg').textContent = err.message || '登录失败';
     $('#loginMsg').className = 'msg err';
   }
+}
+function finishAdminLogin(j) {
+  if (!j.user?.isAdmin && j.user?.role !== 'admin') throw Error('需要管理员账号');
+  token = j.token;
+  localStorage.setItem(TOKEN_KEY, token);
+  tellNative('onLogin', token);
+  showApp();
+  $('#hello').textContent = j.user.username || j.user.name || '管理员';
+  startPoll();
+  render();
 }
 
 function logout() {
@@ -150,25 +171,38 @@ function startPoll() {
         after = Number.isFinite(Number(j.seq)) ? Number(j.seq) : after;
         localStorage.setItem('relay_admin_event_seq', String(after));
         const events = j.events || [];
-        const alertable = events.filter(ev => ev.kind === 'placed' || ev.kind === 'paid');
+        const alertable = events.filter(ev => ev.kind === 'placed' || ev.kind === 'paid' || ev.kind === 'signup_burst');
         if (alertable.length) {
-          const first = alertable.find(e => e.kind === 'paid') || alertable[0];
-          const title = alertable.some(e => e.kind === 'paid')
-            ? `待核对充值 ${alertable.length} 笔`
-            : `有人发起充值 ${alertable.length} 笔`;
-          const body = first
-            ? `${first.username || '用户'} ¥${Number(first.amount || 0).toFixed(0)} · ${methodLabel(first.method)} · 备注 ${first.payNote || '-'}`
-            : '请打开值班台确认到账';
+          const burst = alertable.filter(e => e.kind === 'signup_burst');
+          const pays = alertable.filter(e => e.kind === 'placed' || e.kind === 'paid');
+          let title = '';
+          let body = '';
+          if (burst.length) {
+            const first = burst[0];
+            title = first.title || `注册暴增 ${first.count || ''}`.trim();
+            body = first.body || `短时间内新注册 ${first.count || ''} 个账号`;
+            const badge = document.querySelector('[data-tab="alerts"]');
+            if (badge && tab !== 'alerts') badge.textContent = `告警(${burst.length})`;
+          } else if (pays.length) {
+            const first = pays.find(e => e.kind === 'paid') || pays[0];
+            title = pays.some(e => e.kind === 'paid')
+              ? `待核对充值 ${pays.length} 笔`
+              : `有人发起充值 ${pays.length} 笔`;
+            body = first
+              ? `${first.username || '用户'} ¥${Number(first.amount || 0).toFixed(0)} · ${methodLabel(first.method)} · 备注 ${first.payNote || '-'}`
+              : '请打开值班台确认到账';
+            const badge = document.querySelector('[data-tab="orders"]');
+            const inbox = j.inbox || {};
+            if (badge && tab !== 'orders') badge.textContent = `充值(${inbox.pendingCount ?? pays.length})`;
+          }
           try {
             const b = bridge();
             const vibeOn = !(b && typeof b.getVibrateEnabled === 'function') || String(b.getVibrateEnabled()) === '1';
             if (vibeOn && navigator.vibrate) navigator.vibrate([180, 80, 180, 80, 320]);
+            tellNative('onNewOrders', JSON.stringify({ title, body }));
           } catch { /* ignore */ }
-          const badge = document.querySelector('[data-tab="orders"]');
-          const inbox = j.inbox || {};
-          if (badge && tab !== 'orders') badge.textContent = `充值(${inbox.pendingCount ?? alertable.length})`;
         }
-        if ((tab === 'home' || tab === 'orders') && j.inbox) render(j.inbox);
+        if ((tab === 'home' || tab === 'orders' || tab === 'alerts') && j.inbox) render(j.inbox);
       } catch (err) {
         if (ctl.signal.aborted) return;
         if (String(err.message || '').includes('未登录') || String(err.message || '').includes('需要管理员')) {
@@ -201,15 +235,46 @@ async function render(preloaded) {
           <div class="card"><small>待核对充值</small><b class="${inbox.pendingCount ? 'bad' : 'ok'}">${inbox.pendingCount}</b></div>
           <div class="card"><small>待支付订单</small><b>${inbox.awaitingCount}</b></div>
           <div class="card"><small>今日发卡</small><b>${money(f.incomeToday)}</b></div>
-          <div class="card"><small>渠道异常</small><b class="${down.length ? 'bad' : 'ok'}">${down.length}</b></div>
+          <div class="card"><small>注册告警</small><b class="${(inbox.securityAlerts || []).length ? 'bad' : 'ok'}">${(inbox.securityAlerts || []).length}</b></div>
         </div>
         <p class="sub">诊断上次：${inbox.diagnostics?.at ? when(inbox.diagnostics.at) : '尚未运行'} · 失败 ${inbox.diagnostics?.summary?.failed ?? '-'}</p>
-        <div class="row"><button class="primary" id="goOrders">去确认充值</button></div>
+        <div class="row"><button class="primary" id="goOrders">去确认充值</button><button class="ghost" id="goAlerts">看注册告警</button></div>
         ${inbox.paymentQr?.wechat?.expired || inbox.paymentQr?.alipay?.expired
           ? `<article class="item" style="margin-top:12px"><h3 class="bad">收款码已过期</h3><p class="sub">${esc([inbox.paymentQr?.wechat?.expired ? '微信' : '', inbox.paymentQr?.alipay?.expired ? '支付宝' : ''].filter(Boolean).join(' / '))} 需要按金额分别换图。</p><button class="primary" id="goQr">去替换收款码</button></article>`
           : ''}`;
       $('#goOrders').onclick = () => { tab = 'orders'; syncTabs(); render(); };
+      $('#goAlerts')?.addEventListener('click', () => { tab = 'alerts'; syncTabs(); render(); });
       $('#goQr')?.addEventListener('click', () => { tab = 'qr'; syncTabs(); render(); });
+    } else if (tab === 'alerts') {
+      const data = await api('/api/admin/security-alerts');
+      const list = data.alerts || [];
+      pane.innerHTML = `
+        <p class="sub">待处理 ${data.openCount || 0} 条。可一键封掉这批账号，或对单个账号点「封号」。</p>
+        <div class="list">${list.length ? list.map(a => `
+          <article class="item">
+            <h3>${a.status === 'open' ? '<span class="tag warn">待处理</span>' : (a.status === 'banned' ? '<span class="tag">已封</span>' : '<span class="tag">已忽略</span>')} 注册 ${Number(a.count || 0)} 个</h3>
+            <p class="sub">${esc(when(a.createdAt))} · IP ${esc(a.ip || '-')}</p>
+            ${(a.users || []).map(u => `
+              <div class="row" style="align-items:center">
+                <p class="sub" style="flex:1;margin:0">@${esc(u.username || u.email || u.userId)}${u.banned ? '（已封）' : ''}</p>
+                ${a.status === 'open' && !u.banned ? `<button class="ghost" data-ban-one="${esc(a.id)}" data-user="${esc(u.userId)}">封号</button>` : ''}
+              </div>`).join('')}
+            ${a.status === 'open' ? `<div class="row"><button class="primary" data-ban-all="${esc(a.id)}">一键封号</button><button class="ghost" data-dismiss="${esc(a.id)}">忽略</button></div>` : `<p class="sub">已处理 ${a.bannedCount || 0} 人</p>`}
+          </article>`).join('') : '<p class="sub">暂无告警</p>'}</div>`;
+      pane.querySelectorAll('[data-ban-all]').forEach(btn => btn.onclick = async () => {
+        if (!confirm('确认封禁该批次全部新注册账号？')) return;
+        await api(`/api/admin/security-alerts/${btn.dataset.banAll}/ban-all`, { method: 'POST', body: '{}' });
+        render();
+      });
+      pane.querySelectorAll('[data-ban-one]').forEach(btn => btn.onclick = async () => {
+        if (!confirm('确认封禁该账号？')) return;
+        await api(`/api/admin/security-alerts/${btn.dataset.banOne}/ban-one`, { method: 'POST', body: JSON.stringify({ userId: btn.dataset.user }) });
+        render();
+      });
+      pane.querySelectorAll('[data-dismiss]').forEach(btn => btn.onclick = async () => {
+        await api(`/api/admin/security-alerts/${btn.dataset.dismiss}/dismiss`, { method: 'POST', body: '{}' });
+        render();
+      });
     } else if (tab === 'orders') {
       const inbox = preloaded || await api('/api/admin/mobile/inbox');
       const list = [...(inbox.pending || []), ...(inbox.awaiting || [])];

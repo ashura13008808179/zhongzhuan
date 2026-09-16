@@ -10,9 +10,13 @@ export function epaySign(params, key) {
 }
 
 export function epayVerify(params, key) {
-  const sign = String(params.sign || '').toLowerCase();
+  const sign = String(params.sign || '');
   if (!sign) return false;
-  return epaySign(params, key).toLowerCase() === sign;
+  const expected = epaySign(params, key);
+  const left = Buffer.from(sign.toLowerCase(), 'utf8');
+  const right = Buffer.from(expected.toLowerCase(), 'utf8');
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
 }
 
 export function normalizeGateway(raw = {}) {

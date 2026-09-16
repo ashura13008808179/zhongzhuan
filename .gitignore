@@ -1,5 +1,11 @@
 data/db.json
 data/*.json
+data/.master.key
+data/*.key
+data/*.tmp
+data/*.bak*
+*.bak
+*.bak-*
 node_modules/
 .env
 .env.*

@@ -37,3 +37,4 @@ pre{white-space:pre-wrap;font-size:11px;color:#9ca5b5;background:#10131a;padding
 .qr-slot h3{margin:0}
 .hidden-file{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden}
 .file-btn{position:relative;display:flex;align-items:center;justify-content:center;height:40px;margin-top:8px;border-radius:8px;background:var(--lime);color:#10150e;font-weight:600;cursor:pointer}
+#phoneBox[hidden]{display:none!important}

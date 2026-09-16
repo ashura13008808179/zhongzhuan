@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { openDbDir } from '../lib/db-crypto.js';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-ledger-boot-'));
@@ -96,16 +97,17 @@ try {
     stdio: ['ignore', 'ignore', 'ignore']
   });
 
-  const dbPath = path.join(tmp, 'db.json');
+  const store = openDbDir(tmp);
+  const dbPath = store.file;
   await waitFor(() => {
     try {
-      const db = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+      const db = store.read();
       return db.settings?.upstreamUsageSync?.initialBackfillCompleted === true;
     } catch {
       return false;
     }
   });
-  const after = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+  const after = store.read();
   const user = after.users.find((item) => item.id === 'usr_boot_customer');
   assert.equal(after.settings.upstreamUsageSync.initialBackfillCompleted, true);
   assert.equal(after.upstreamBills.length, 1);

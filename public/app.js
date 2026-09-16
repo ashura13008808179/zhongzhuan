@@ -205,7 +205,57 @@ function setAuthMode(mode){
 document.querySelectorAll('[data-auth]').forEach(b=>b.onclick=()=>setAuthMode(b.dataset.auth));
 setAuthMode('login');
 rememberPrefill();
-$('#loginForm').onsubmit=async e=>{e.preventDefault();try{const identifier=$('#loginIdentifier').value.trim();const remember=!!$('#rememberMe')?.checked;const j=await api('/api/auth/login',{method:'POST',body:JSON.stringify({login:identifier,password:$('#loginPassword').value})});token=j.token;localStorage.setItem(REMEMBER_KEY,remember?'1':'0');if(remember) localStorage.setItem(LOGIN_KEY,identifier);else localStorage.removeItem(LOGIN_KEY);persistToken(token,remember);await boot()}catch(err){msg(err.message)}};
+$('#loginForm').onsubmit=async e=>{
+  e.preventDefault();
+  try{
+    const identifier=$('#loginIdentifier').value.trim();
+    const remember=!!$('#rememberMe')?.checked;
+    const j=await api('/api/auth/login',{method:'POST',body:JSON.stringify({login:identifier,password:$('#loginPassword').value})});
+    if(j.needPhone){
+      const phone=await askAdminPhone(j);
+      const done=await api('/api/auth/login/phone',{method:'POST',body:JSON.stringify({ticket:j.ticket,phone})});
+      token=done.token;
+    }else{
+      token=j.token;
+    }
+    localStorage.setItem(REMEMBER_KEY,remember?'1':'0');
+    if(remember) localStorage.setItem(LOGIN_KEY,identifier);else localStorage.removeItem(LOGIN_KEY);
+    persistToken(token,remember);
+    await boot();
+  }catch(err){msg(err.message)}
+};
+function askAdminPhone(challenge){
+  return new Promise((resolve,reject)=>{
+    const modal=$('#adminPhoneModal');
+    const input=$('#adminPhoneInput');
+    const sub=$('#adminPhoneSub');
+    const title=$('#adminPhoneTitle');
+    const errEl=$('#adminPhoneMsg');
+    if(!modal||!input){ reject(Error('无法打开手机号验证')); return; }
+    if(title) title.textContent=challenge.enroll?'绑定管理员手机号':'管理员手机号';
+    if(sub) sub.textContent=challenge.enroll?'首次登录请绑定你的手机号，之后每次管理员登录都要填写。':'请输入已绑定的管理员手机号。';
+    if(errEl) errEl.textContent='';
+    input.value='';
+    modal.hidden=false;
+    input.focus();
+    const finish=ok=>{
+      modal.hidden=true;
+      $('#adminPhoneSubmit')?.removeEventListener('click', onOk);
+      $('#adminPhoneCancel')?.removeEventListener('click', onCancel);
+      input.onkeydown=null;
+      ok?resolve(String(input.value||'').trim()):reject(Error('已取消'));
+    };
+    const onOk=()=>{
+      const v=String(input.value||'').replace(/\D/g,'');
+      if(!/^1[3-9]\d{9}$/.test(v)){ if(errEl) errEl.textContent='请输入正确的11位手机号'; return; }
+      finish(true);
+    };
+    const onCancel=()=>finish(false);
+    $('#adminPhoneSubmit')?.addEventListener('click', onOk);
+    $('#adminPhoneCancel')?.addEventListener('click', onCancel);
+    input.onkeydown=e=>{ if(e.key==='Enter'){ e.preventDefault(); onOk(); } };
+  });
+}
 $('#registerForm').onsubmit=async e=>{e.preventDefault();try{const j=await api('/api/auth/register',{method:'POST',body:JSON.stringify({email:$('#regEmail').value.trim(),username:$('#regUsername').value.trim(),name:$('#regName').value.trim(),password:$('#regPassword').value,inviteCode:$('#regInvite').value.trim()})});token=j.token;persistToken(token,true);localStorage.setItem(REMEMBER_KEY,'1');const ident=$('#regUsername').value.trim()||$('#regEmail').value.trim();if(ident) localStorage.setItem(LOGIN_KEY,ident);await boot()}catch(err){msg(err.message)}};
 $('#logoutBtn').onclick=async()=>{try{if(token)await api('/api/auth/logout',{method:'POST'});}catch{}stopPayLive();persistToken(null);location.reload()};
 $('#payLiveCopy')?.addEventListener('click',async()=>{
@@ -222,8 +272,50 @@ $('#payLiveGo')?.addEventListener('click',()=>{
   const code=$('#payLiveCode')?.textContent||'';
   const m=$('#payLiveModal'); if(m) m.hidden=true;
   window.__pendingRedeemCode=code;
-  render('billing');
+  render('billing', { skipHoursModal: true });
 });
+let rechargeHoursWaiter=null;
+function localRechargeDeskOpen(){
+  try{
+    const parts=new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Shanghai',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date());
+    const hour=Number(parts.find(p=>p.type==='hour')?.value||0);
+    const minute=Number(parts.find(p=>p.type==='minute')?.value||0);
+    const minutes=hour*60+minute;
+    return minutes>=8*60+30 && minutes<=23*60+30;
+  }catch(_e){
+    return true;
+  }
+}
+function closeRechargeHoursModal(proceed){
+  const modal=$('#rechargeHoursModal');
+  if(modal) modal.hidden=true;
+  const fn=rechargeHoursWaiter;
+  rechargeHoursWaiter=null;
+  if(fn) fn(!!proceed);
+}
+function showRechargeHoursModal(hours){
+  const modal=$('#rechargeHoursModal');
+  if(!modal) return Promise.resolve(true);
+  const sub=$('#rechargeHoursSub');
+  if(sub) sub.textContent=hours?.closedMessage||hours?.message||'每天早上 8:30 到晚上 11:30（北京时间）才会处理卡密充值。当前不在服务时间，提交的付款将在下一服务时段内核对发卡。';
+  modal.hidden=false;
+  return new Promise((resolve)=>{
+    if(rechargeHoursWaiter){
+      const prev=rechargeHoursWaiter;
+      rechargeHoursWaiter=(v)=>{ prev(v); resolve(v); };
+      return;
+    }
+    rechargeHoursWaiter=resolve;
+  });
+}
+async function gateBillingHours(){
+  try{ await ensureAppConfig(); }catch(_e){}
+  if(localRechargeDeskOpen()) return true;
+  return showRechargeHoursModal(window.appConfig?.rechargeHours);
+}
+$('#rechargeHoursOk')?.addEventListener('click',()=>closeRechargeHoursModal(true));
+$('#rechargeHoursBack')?.addEventListener('click',()=>closeRechargeHoursModal(false));
+$('#rechargeHoursModal')?.addEventListener('click',e=>{ if(e.target===$('#rechargeHoursModal')) closeRechargeHoursModal(false); });
 async function boot(){try{data=await api('/api/dashboard');me=data.user;try{checkin=await api('/api/checkin/status')}catch{checkin=null}authView.hidden=true;dash.hidden=false;$('#sideName').textContent=me.name;$('#sideEmail').textContent=me.username?`@${me.username}`:me.email;paintUserAvatars();render('overview')}catch{persistToken(null);token=null}}
 $('#helpTip')?.addEventListener('click',()=>{ closeMobileNav(); render('contact'); });
 ['#topAvatar','#sideAvatar'].forEach(sel=>{
@@ -242,6 +334,17 @@ document.addEventListener('click', e=>{
 });
   document.addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeAvatarMenu(); const m=$('#payLiveModal'); if(m && !m.hidden) m.hidden=true; } });
 function shell(title,kicker,html){$('#pageTitle').textContent=title;page.innerHTML=`<div class="page-head"><div><p class="eyebrow">${kicker}</p><h1>${title}</h1><p class="sub">管理你的 Relay Station 账户与 API 服务</p></div></div>${html}`}
+let navPage='overview';
+let navGen=0;
+function navBegin(name){
+  navPage=name;
+  navGen+=1;
+  return navGen;
+}
+function navAlive(name, gen){
+  if(gen==null) return navPage===name;
+  return navPage===name && navGen===gen;
+}
 let myPayOrdersPollTimer=null;
 let myPayOrdersPrevSnap={};
 let payLiveAbort=null;
@@ -314,23 +417,26 @@ function startPayLive(){
     }
   })();
 }
-function render(name){
+function render(name, gen){
   stopMyPayOrdersPoll();
+  if(gen==null) gen=navBegin(name);
   document.querySelectorAll('[data-page]').forEach(a=>a.classList.toggle('active',a.dataset.page===name));
   if(name==='overview')shell('数据概览','ACCOUNT OVERVIEW',`<div class="metric-grid"><article><small>账户余额</small><strong>${me.unlimited||me.isAdmin?'无限':('¥'+Number(me.balance||0).toFixed(2))}</strong><span class="green">${me.unlimited||me.isAdmin?'管理员不扣本地余额':'可用于 API 调用'}</span></article><article><small>累计请求</small><strong>${data.stats.requests.toLocaleString()}</strong><span>成功率 ${data.stats.requests?Math.round(data.stats.success/data.stats.requests*100):100}%</span></article><article><small>累计用量</small><strong>${Number(data.stats.usedTokens||data.stats.billedTokens||0).toLocaleString()}</strong><span>账户已计费用量</span></article><article><small>累计花销</small><strong>¥${Number(data.stats.totalSpent||0).toFixed(2)}</strong><span>API 调用累计扣费</span></article></div><div class="content-grid"><section class="card"><div class="card-head"><div><p class="eyebrow">RECENT REQUESTS</p><h2>最近请求</h2></div><button class="link-btn" data-page="logs">查看全部 →</button></div><table><thead><tr><th>模型</th><th>Token</th><th>花销</th><th>延迟</th><th>状态</th><th>时间</th></tr></thead><tbody>${data.logs.slice(0,8).map(l=>`<tr><td>${esc(l.model)}</td><td>${spentTokens(l)}</td><td>${logChargeText(l)}</td><td>${l.latency}ms</td><td>${logStatusTag(l)}</td><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">暂无请求记录</td></tr>'}</tbody></table></section><section class="card balance-card"><p class="eyebrow">QUICK ACTIONS</p><h2>快捷操作</h2><button class="action" data-page="checkin"><span>✦</span><div><b>每日签到</b><small>${checkin?.checkedInToday?`今日已领 ¥${Number(checkin.todayAmount||0).toFixed(2)}`:'随机领取 ¥0.05–¥0.50'}</small></div><i>→</i></button><button class="action" data-page="api"><span>◈</span><div><b>查看 API 接入</b><small>复制你的专属调用密钥</small></div><i>→</i></button><button class="action" data-page="billing"><span>◇</span><div><b>卡密充值</b><small>充值后立即到账</small></div><i>→</i></button><button class="action" data-page="referral"><span>♧</span><div><b>邀请好友</b><small>好友付费后返利 5%</small></div><i>→</i></button></section></div>`);
-  if(name==='checkin'){renderCheckIn();return;}
-  if(name==='operations'){renderOperations();return;}
-  if(name==='api'){renderApiKeys();return;}
+  if(name==='checkin'){renderCheckIn(gen);return;}
+  if(name==='operations'){renderOperations(gen);return;}
+  if(name==='api'){renderApiKeys(gen);return;}
   if(name==='logs')shell('使用日志','REQUEST LOGS',`<section class="card"><div class="card-head"><div><p class="eyebrow">AUDIT TRAIL</p><h2>全部请求记录</h2></div></div><table><thead><tr><th>时间</th><th>模型</th><th>Token</th><th>花销</th><th>延迟</th><th>状态</th></tr></thead><tbody>${data.logs.map(l=>`<tr><td>${new Date(l.createdAt).toLocaleString('zh-CN')}</td><td>${esc(l.model)}</td><td>${spentTokens(l)}</td><td>${logChargeText(l)}</td><td>${l.latency}ms</td><td>${logStatusTag(l)}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">暂无日志</td></tr>'}</tbody></table></section>`);
   if(name==='billing'){
   shell('卡密充值','BILLING & RECHARGE','<section class="card"><p class="sub">正在加载充值方案…</p></section>');
   (async () => {
     await ensureAppConfig();
+    if(!navAlive('billing', gen)) return;
     renderBillingContent();
   })();
   return;
 }
 function renderBillingContent(){
+  if(!navAlive('billing')) return;
 
   const plans=(window.appConfig?.paymentPlans||[{amount:10,qr:''},{amount:30,qr:''},{amount:50,qr:''},{amount:100,qr:''}]);
   shell('卡密充值','BILLING & RECHARGE',`<div class="billing-grid">
@@ -617,19 +723,22 @@ function renderBillingContent(){
 
 }
   if(name==='referral'){shell('邀请返利','REFERRAL PROGRAM',`<section class="card referral-card"><div class="referral-hero"><div><p class="eyebrow">YOUR INVITE CODE</p><h2>邀请好友，一起获得奖励</h2><p class="sub">好友使用你的邀请码注册后，每当好友充值付费，你获得其充值金额的 5% 返利。</p></div><div class="reward">5%<span>/ 充值</span></div></div><div class="invite-box"><code>${data.inviteCode}</code><button id="copyInvite">复制邀请码</button></div><div class="ref-stats"><div><b>${data.inviteCount}</b><span>已邀请好友</span></div><div><b>¥${me.bonusBalance.toFixed(2)}</b><span>累计奖励</span></div></div></section>`);$('#copyInvite')?.addEventListener('click',()=>{navigator.clipboard.writeText(data.inviteCode);$('#copyInvite').textContent='已复制 ✓'});}
-  if(name==='contact')shell('联系支持','SUPPORT CENTER',`<div class="contact-grid"><section class="card"><p class="eyebrow">WE ARE HERE TO HELP</p><h2>需要帮助？</h2><p class="sub">遇到接入、充值或账单问题，工作日我们会尽快回复。</p><div class="contact-item"><span>◎</span><div><small>客服 QQ</small><b>${esc(window.appConfig?.contactQq||'3845440106')}</b></div></div><div class="contact-item"><span>♧</span><div><small>QQ 群</small><b>${esc(window.appConfig?.contactQqGroup||'1061247399')}</b></div></div><div class="contact-item"><span>✉</span><div><small>支持邮箱</small><b>${esc(window.appConfig?.contactEmail||'3845440106@qq.com')}</b></div></div></section><section class="card"><p class="eyebrow">ACCOUNT</p><h2>账号信息</h2><div class="account-row"><span>用户名</span><b>@${esc(me.username||'-')}</b></div><div class="account-row"><span>显示名称</span><b>${esc(me.name)}</b></div><div class="account-row"><span>登录邮箱</span><b>${esc(me.email)}</b></div><div class="account-row"><span>注册时间</span><b>${new Date(me.createdAt).toLocaleDateString('zh-CN')}</b></div></section></div>`);
+  if(name==='contact')shell('联系支持','SUPPORT CENTER',`<div class="contact-grid"><section class="card"><p class="eyebrow">WE ARE HERE TO HELP</p><h2>需要帮助？</h2><p class="sub">遇到接入、充值或账单问题，工作日我们会尽快回复。</p><div class="contact-item"><span>◎</span><div><small>客服 QQ</small><b>${esc(window.appConfig?.contactQq||'1064289998')}</b></div></div><div class="contact-item"><span>♧</span><div><small>QQ 群</small><b>${esc(window.appConfig?.contactQqGroup||'1061247399')}</b></div></div><div class="contact-item"><span>✉</span><div><small>支持邮箱</small><b>${esc(window.appConfig?.contactEmail||'1064289998@qq.com')}</b></div></div></section><section class="card"><p class="eyebrow">ACCOUNT</p><h2>账号信息</h2><div class="account-row"><span>用户名</span><b>@${esc(me.username||'-')}</b></div><div class="account-row"><span>显示名称</span><b>${esc(me.name)}</b></div><div class="account-row"><span>登录邮箱</span><b>${esc(me.email)}</b></div><div class="account-row"><span>注册时间</span><b>${new Date(me.createdAt).toLocaleDateString('zh-CN')}</b></div></section></div>`);
   page.querySelectorAll('[data-page]').forEach(a=>a.onclick=()=>render(a.dataset.page));
   document.querySelectorAll('[data-page]').forEach(a=>a.onclick=()=>render(a.dataset.page));
 }
 
-async function renderCheckIn(){
+async function renderCheckIn(gen){
+  if(gen==null) gen=navAlive('checkin')?navGen:navBegin('checkin');
   shell('每日签到','DAILY CHECK-IN','<section class="card"><p class="sub">正在加载签到状态…</p></section>');
   try{
     checkin=await api('/api/checkin/status');
   }catch(err){
+    if(!navAlive('checkin', gen)) return;
     shell('每日签到','DAILY CHECK-IN',`<section class="card"><h2>无法加载签到</h2><p class="sub">${esc(err.message||'请求失败')}</p></section>`);
     return;
   }
+  if(!navAlive('checkin', gen)) return;
   const done=!!checkin.checkedInToday;
   const todayAmt=done?Number(checkin.todayAmount||0).toFixed(2):null;
   const streak=Number(checkin.streak||0);
@@ -720,10 +829,12 @@ function wireKeyForm(prefix, options){
   // 模型组选择即可，无需勾选模型
 }
 
-async function renderApiKeys(){
+async function renderApiKeys(gen){
+  if(gen==null) gen=navAlive('api')?navGen:navBegin('api');
   shell('API 接入','DEVELOPER ACCESS','<section class="card"><p class="sub">正在加载密钥…</p></section>');
   try{
     const [{keys},options]=await Promise.all([api('/api/keys'),api('/api/key-options')]);
+    if(!navAlive('api', gen)) return;
     const models=options.models||[];
     const first=keys[0];
     const sample=first?.key||'rk_your_key';
@@ -756,7 +867,7 @@ async function renderApiKeys(){
         <div class="code-box"><b>基础 URL（Base URL）</b><pre id="baseUrlText">${esc(baseUrl)}</pre><button type="button" class="link-btn" id="copyBaseUrl">复制</button></div>
         <div class="code-box"><b>完整对话地址</b><pre id="chatUrlText">${esc(chatUrl)}</pre><button type="button" class="link-btn" id="copyChatUrl">复制</button></div>
       </div>
-      <p class="sub" style="margin-bottom:14px">客户端请填写<strong>本站</strong>地址（上线后为你的域名）和 <code>rk_</code> 开头的密钥。不要填上游网站，也不要把密钥填到 OpenAI / Claude 官方。</p>
+      <p class="sub" style="margin-bottom:14px">客户端请填写<strong>本站</strong>地址和 <code>rk_</code> 开头的密钥。Base URL 填到 <code>/v1</code> 即可。</p>
       <div class="key-list">${keys.map(k=>`<article class="key-card" data-key-id="${esc(k.id)}">
         <div class="card-head">
           <div><h2>${esc(k.name)}</h2><p class="sub">${esc(keyLimitLabel(k))}${k.groupId?` · 组 ${esc(groupName(k.groupId))}`:''}</p></div>
@@ -895,7 +1006,7 @@ claude</pre></div>
     page.querySelectorAll('[data-copy-key]').forEach(btn=>btn.onclick=()=>copyText(btn.dataset.copyKey,btn));
     page.querySelectorAll('[data-copy-text]').forEach(btn=>btn.onclick=()=>copyText(btn.dataset.copyText,btn));
     page.querySelectorAll('[data-rotate-key]').forEach(btn=>btn.onclick=async()=>{
-      try{await api(`/api/keys/${btn.dataset.rotateKey}/rotate`,{method:'POST'});flash('密钥已轮换。请用 rk_ 新密钥，并把客户端地址填成本站 /v1，不要填上游。',true);renderApiKeys();}
+        try{await api(`/api/keys/${btn.dataset.rotateKey}/rotate`,{method:'POST'});flash('密钥已轮换，请把客户端里的旧密钥换成新的 rk_ 密钥。',true);renderApiKeys();}
       catch(err){flash(err.message);}
     });
     page.querySelectorAll('[data-delete-key]').forEach(btn=>btn.onclick=async()=>{
@@ -907,6 +1018,7 @@ claude</pre></div>
       page.querySelectorAll('[data-pane]').forEach(p=>{p.hidden=p.dataset.pane!==btn.dataset.docs;});
     });
   }catch(err){
+    if(!navAlive('api', gen)) return;
     shell('API 接入','DEVELOPER ACCESS',`<section class="card"><h2>无法加载密钥</h2><p class="sub">${esc(err.message)}</p></section>`);
   }
 }
@@ -945,9 +1057,17 @@ async function ensureAppConfig(){
 }
 
 const baseRender = render;
-render = function(name) {
+render = function(name, opts) {
   closeMobileNav();
-  return name === 'operations' ? renderOperations() : baseRender(name);
+  if (name === 'billing' && !(opts && opts.skipHoursModal)) {
+    return Promise.resolve(gateBillingHours()).then((ok) => {
+      if (!ok) return;
+      const gen = navBegin('billing');
+      return baseRender('billing', gen);
+    });
+  }
+  const gen = navBegin(name);
+  return name === 'operations' ? renderOperations(gen) : baseRender(name, gen);
 };
 
 let adminTab = 'rates';
@@ -960,6 +1080,7 @@ function adminTabsHtml() {
     ['rates', '倍率'],
     ['channels', '渠道'],
     ['users', '用户'],
+    ['alerts', '安全告警'],
     ['codes', '卡密'],
     ['audit', '审计'],
     ['orders', '订单'],
@@ -1109,14 +1230,16 @@ function collectProvidersFromDom() {
   return { providers, defaultProviderId };
 }
 
-async function renderOperations() {
+async function renderOperations(gen) {
+  if(gen==null) gen=navBegin('operations');
   document.querySelectorAll('[data-page]').forEach(a => a.classList.toggle('active', a.dataset.page === 'operations'));
   if (!me?.isAdmin) {
+    if(!navAlive('operations', gen)) return;
     shell('运营配置', 'ADMIN CONSOLE', `<section class="card"><h2>无权访问</h2><p class="sub">仅管理员账户可查看运营数据。</p></section>`);
     return;
   }
   const renderId = ++opsRenderSeq;
-  const stillCurrent = () => renderId === opsRenderSeq;
+  const stillCurrent = () => renderId === opsRenderSeq && navAlive('operations', gen);
   try {
     if (adminTab === 'rates' || adminTab === 'channels') {
       const settings = await api('/api/admin/pricing');
@@ -1189,6 +1312,56 @@ async function renderOperations() {
           }
         });
       }
+    } else if (adminTab === 'alerts') {
+      const { alerts, openCount } = await api('/api/admin/security-alerts');
+      if (!stillCurrent()) return;
+      const rows = (alerts || []).map(a => {
+        const names = (a.users || []).map(u => {
+          const label = `@${u.username || u.email || u.userId}`;
+          if (a.status !== 'open' || u.banned) return `${esc(label)}${u.banned ? '（已封）' : ''}`;
+          return `${esc(label)} <button class="ghost-btn" data-ban-one="${esc(a.id)}" data-user="${esc(u.userId)}">封号</button>`;
+        }).slice(0, 16).join('<br>') || '-';
+        const st = a.status === 'open' ? '待处理' : (a.status === 'banned' ? '已封号' : '已忽略');
+        const actions = a.status === 'open'
+          ? `<button class="primary-btn" data-ban-all="${esc(a.id)}">一键封号</button> <button class="ghost-btn" data-dismiss-alert="${esc(a.id)}">忽略</button>`
+          : `<span class="sub">已处理 ${a.bannedCount || 0} 人</span>`;
+        return `<tr>
+          <td>${esc(String(a.createdAt || '').replace('T', ' ').slice(0, 19))}</td>
+          <td>短时间注册 ${Number(a.count || 0)} 个</td>
+          <td>${esc(a.ip || '-')}</td>
+          <td>${names}</td>
+          <td><span class="tag ${a.status === 'open' ? 'danger' : 'success'}">${st}</span></td>
+          <td class="ops-cell">${actions}</td>
+        </tr>`;
+      }).join('') || '<tr><td colspan="6" class="empty">暂无注册暴增告警</td></tr>';
+      shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><div class="card-head"><div><p class="eyebrow">SECURITY</p><h2>安全告警</h2><p class="sub">短时间内大批量注册会推送到值班手机和本页。你可以一键封掉这批账号，或对单个账号点「封号」。</p></div><span class="sub">待处理 ${openCount || 0}</span></div>
+        <div id="alertsMsg" class="inline-msg"></div>
+        <table class="admin-table"><thead><tr><th>时间</th><th>事件</th><th>IP</th><th>账号</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></section>`);
+      const showAlertErr = (err) => { const el = $('#alertsMsg'); if (el) { el.textContent = err.message || String(err); el.className = 'inline-msg'; } };
+      page.querySelectorAll('[data-ban-all]').forEach(btn => btn.onclick = async () => {
+        if (!confirm('确认封禁该批次全部新注册账号？管理员账号不会被封。')) return;
+        try {
+          const j = await api(`/api/admin/security-alerts/${btn.dataset.banAll}/ban-all`, { method: 'POST', body: '{}' });
+          $('#alertsMsg').textContent = j.message || '已封禁';
+          $('#alertsMsg').className = 'inline-msg ok';
+          renderOperations();
+        } catch (err) { showAlertErr(err); }
+      });
+      page.querySelectorAll('[data-ban-one]').forEach(btn => btn.onclick = async () => {
+        if (!confirm('确认封禁该账号？')) return;
+        try {
+          const j = await api(`/api/admin/security-alerts/${btn.dataset.banOne}/ban-one`, { method: 'POST', body: JSON.stringify({ userId: btn.dataset.user }) });
+          $('#alertsMsg').textContent = j.message || '已封禁';
+          $('#alertsMsg').className = 'inline-msg ok';
+          renderOperations();
+        } catch (err) { showAlertErr(err); }
+      });
+      page.querySelectorAll('[data-dismiss-alert]').forEach(btn => btn.onclick = async () => {
+        try {
+          await api(`/api/admin/security-alerts/${btn.dataset.dismissAlert}/dismiss`, { method: 'POST', body: '{}' });
+          renderOperations();
+        } catch (err) { showAlertErr(err); }
+      });
     } else if (adminTab === 'users') {
       const { users } = await api('/api/admin/users');
       if (!stillCurrent()) return;
@@ -1734,6 +1907,7 @@ async function renderOperations() {
     }
     page.querySelectorAll('[data-admin-tab]').forEach(btn => btn.onclick = () => { adminTab = btn.dataset.adminTab; renderOperations(); });
   } catch (error) {
+    if (!stillCurrent()) return;
     shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><h2>无法加载配置</h2><p class="sub">${esc(error.message)}</p></section>`);
     page.querySelectorAll('[data-admin-tab]').forEach(btn => btn.onclick = () => { adminTab = btn.dataset.adminTab; renderOperations(); });
   }

@@ -15,6 +15,10 @@
     <p class="lead">充值确认、用户余额、封号、收款码换图、渠道探测。仅管理员登录。</p>
     <label>用户名 / 邮箱<input id="loginId" autocomplete="username"></label>
     <label>密码<input id="loginPw" type="password" autocomplete="current-password"></label>
+    <div id="phoneBox" hidden>
+      <label>管理员手机号<input id="loginPhone" type="tel" inputmode="numeric" maxlength="13" autocomplete="tel"></label>
+      <p class="sub" id="phoneHint">密码正确后需填写手机号。</p>
+    </div>
     <button class="primary" id="loginBtn" type="button">登录</button>
     <p id="loginMsg" class="msg"></p>
   </div>
@@ -29,6 +33,7 @@
     </header>
     <nav class="tabs">
       <button type="button" data-tab="home" class="active">首页</button>
+      <button type="button" data-tab="alerts">告警</button>
       <button type="button" data-tab="orders">充值</button>
       <button type="button" data-tab="users">用户</button>
       <button type="button" data-tab="qr">收款码</button>

@@ -34,7 +34,7 @@ import {
 } from './upstream/beibeihai.js';
 import { ensureSiteErrors, recordSiteError, clearSiteErrors, tipsForCode, failPayload, SITE_ERROR_CAP } from './diagnostics/site-errors.js';
 import { runDiagnosticSuite } from './diagnostics/run-suite.js';
-import { claimCheckIn, checkInStatus, checkInAdminStats, CHECKIN_LOG_STATUS, money2 } from './lib/checkin.js';
+import { claimCheckIn, checkInStatus, checkInAdminStats, CHECKIN_LOG_STATUS, money2, publicRechargeHours } from './lib/checkin.js';
 import {
   normalizeWelfarePromo,
   isWelfareActive,
@@ -107,6 +107,43 @@ import {
   usagePageHasMore
 } from './lib/upstream-billing-ledger.js';
 import { rebaseDbSnapshot, snapshotDbForRebase, cloneDbValue } from './lib/db-rebase.js';
+import { loadOrCreateDataKey, readDbFile, writeDbFileAtomic, emptyDb } from './lib/db-crypto.js';
+import { sanitizeChatCompletion, sanitizeSseDataLine } from './lib/response-mask.js';
+import {
+  adminPhoneRequired,
+  getAdminPhoneHash,
+  normalizeCnMobile,
+  createPhoneTicket,
+  takePhoneTicket,
+  noteSignupAndMaybeAlert,
+  publicSecurityAlert,
+  openSecurityAlerts,
+  stripAdminSecrets
+} from './lib/admin-guard.js';
+import {
+  attachSecurityHeaders,
+  clientIp as requestClientIp,
+  readLimitedBody,
+  parseJsonSafe,
+  MAX_JSON_BODY,
+  MAX_UPLOAD_BODY,
+  LOGIN_RATE_LIMIT,
+  REGISTER_RATE_LIMIT,
+  CONFIG_RATE_LIMIT,
+  API_RATE_LIMIT,
+  resolvePublicFile,
+  robotsTxt,
+  sessionRecord,
+  sessionExpired,
+  noteLoginFailure,
+  clearLoginFailures,
+  loginBlocked,
+  noteRegisterSuccess,
+  registerDailyBlocked,
+  withKeyedLock,
+  privilegeFieldsPresent,
+  trustProxyEnabled
+} from './lib/http-security.js';
 import {
   messagesEndpointFromChatUrl,
   normalizeAnthropicUsage,
@@ -145,9 +182,9 @@ const ADMIN_USERNAME = (() => {
   const raw = ADMIN_USERNAME_ENV || 'admin';
   return /^[a-z0-9][a-z0-9_-]{2,31}$/.test(raw) ? raw : 'admin';
 })();
-const CONTACT_EMAIL = process.env.CONTACT_EMAIL || '3845440106@qq.com';
+const CONTACT_EMAIL = process.env.CONTACT_EMAIL || '1064289998@qq.com';
 const CONTACT_WECHAT = process.env.CONTACT_WECHAT || '';
-const CONTACT_QQ = process.env.CONTACT_QQ || '3845440106';
+const CONTACT_QQ = process.env.CONTACT_QQ || '1064289998';
 const CONTACT_QQ_GROUP = process.env.CONTACT_QQ_GROUP || '1061247399';
 const PAYMENT_QR = process.env.PAYMENT_QR || '/payment-qr/10.png';
 const PAYMENT_AMOUNTS = [10, 30, 50, 100];
@@ -207,8 +244,12 @@ function resolvePublicBaseUrl(db, req) {
   if (fromSettings) return fromSettings;
   if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
   if (req) {
-    const proto = String(req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
-    const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+    const proto = trustProxyEnabled()
+      ? String(req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim()
+      : 'http';
+    const host = (trustProxyEnabled()
+      ? String(req.headers['x-forwarded-host'] || req.headers.host || '')
+      : String(req.headers.host || '')).split(',')[0].trim();
     if (host) return `${proto}://${host}`;
   }
   return '';
@@ -263,6 +304,54 @@ function emitPayment(order, kind) {
   });
 }
 
+function ensureAdminPhoneHash(db) {
+  db.settings ??= {};
+  if (getAdminPhoneHash(db)) return false;
+  const envPhone = normalizeCnMobile(process.env.ADMIN_PHONE || '');
+  if (!envPhone) return false;
+  db.settings.adminPhoneHash = hash(envPhone);
+  db.settings.adminPhoneBoundAt = new Date().toISOString();
+  return true;
+}
+
+function emitSignupBurst(alert) {
+  if (!alert) return;
+  pushPaymentEvent({
+    kind: 'signup_burst',
+    alertId: alert.id,
+    count: alert.count,
+    username: '系统',
+    title: '注册暴增告警',
+    body: `短时间内新注册 ${alert.count} 个账号，请到后台决定是否封号`,
+    status: alert.status
+  });
+}
+
+function banUserFromAlert(db, alert, userId) {
+  const target = db.users.find(u => u.id === userId);
+  if (!target) return { ok: false, error: '用户不存在' };
+  if (isAdmin(target)) return { ok: false, error: '不能封禁管理员' };
+  if (!target.banned) {
+    target.banned = true;
+    target.accountActive = false;
+  }
+  for (const row of alert.users || []) {
+    if (row.userId === userId) row.banned = true;
+  }
+  const bannedCount = (alert.users || []).filter((row) => {
+    const u = db.users.find(x => x.id === row.userId);
+    return u && u.banned && !isAdmin(u);
+  }).length;
+  const remaining = (alert.users || []).filter((row) => {
+    const u = db.users.find(x => x.id === row.userId);
+    return u && !isAdmin(u) && !u.banned;
+  }).length;
+  alert.bannedCount = bannedCount;
+  if (!remaining) alert.status = 'banned';
+  alert.updatedAt = new Date().toISOString();
+  return { ok: true, bannedCount, remaining };
+}
+
 function mobileInboxPayload(db, user) {
   const inbox = buildMobileInbox(db);
   const meta = paymentQrMeta(db);
@@ -274,7 +363,8 @@ function mobileInboxPayload(db, user) {
       wechat: paymentQrStatus(meta.wechatExpiresAt),
       alipay: paymentQrStatus(meta.alipayExpiresAt),
       note: meta.note || ''
-    }
+    },
+    securityAlerts: openSecurityAlerts(db)
   };
 }
 
@@ -545,16 +635,16 @@ const BALANCE_SAFETY_BUFFER = Number(process.env.BALANCE_SAFETY_BUFFER || 0);
 const LEGACY_UPSTREAM = { url: process.env.UPSTREAM_URL || '', apiKey: process.env.UPSTREAM_API_KEY || '', model: process.env.UPSTREAM_MODEL || 'gpt-4o-mini', price: Number(process.env.UPSTREAM_PRICE_PER_1K || 0.01) };
 const sessions = new Map();
 const rateBuckets = new Map();
-const AUTH_RATE_LIMIT = 60;
 const CHAT_RATE_LIMIT = 120;
 const RATE_WINDOW_MS = 60_000;
 const AUDIT_CAP = 5000;
 
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-if (!fs.existsSync(dbFile)) fs.writeFileSync(dbFile, JSON.stringify({ users: [], rechargeCodes: [], logs: [], upstreamBills: [], auditLogs: [], sessions: {}, settings: {}, checkIns: [] }, null, 2));
+const dataKey = loadOrCreateDataKey(dataDir);
+if (!fs.existsSync(dbFile)) writeDbFileAtomic(dbFile, emptyDb(), dataKey);
 
 const dbWriteBases = new WeakMap();
-function readDbRaw() { return JSON.parse(fs.readFileSync(dbFile, 'utf8')); }
+function readDbRaw() { return readDbFile(dbFile, dataKey); }
 function rememberDbBase(db) {
   dbWriteBases.set(db, { snapshot: snapshotDbForRebase(db), rechargeCodes: null });
   return db;
@@ -577,12 +667,7 @@ function writeDb(db) {
     if (state.rechargeCodes != null) base.rechargeCodes = state.rechargeCodes;
     committed = rebaseDbSnapshot(base, db, latest, { logCap: 3000 });
   }
-  // A request, health probe, and ledger poll can overlap. Replacing a complete
-  // same-directory temporary file prevents readers from ever seeing a
-  // partially-written JSON document.
-  const tempFile = `${dbFile}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  fs.writeFileSync(tempFile, JSON.stringify(committed, null, 2));
-  fs.renameSync(tempFile, dbFile);
+  writeDbFileAtomic(dbFile, committed, dataKey);
   if (state) {
     // Do not replace the caller's object graph here. A handler may retain an
     // order/card/log reference across an intermediate write; swapping the
@@ -597,7 +682,12 @@ function replaceDbContents(target, source) {
 }
 function id(prefix) { return `${prefix}_${crypto.randomBytes(7).toString('hex')}`; }
 function hash(password, salt = crypto.randomBytes(16).toString('hex')) { return `${salt}:${crypto.scryptSync(password, salt, 64).toString('hex')}`; }
+function looksLikePasswordHash(stored) {
+  const s = String(stored || '');
+  return /^[0-9a-f]{32}:[0-9a-f]{128}$/i.test(s);
+}
 function verify(password, stored) {
+  if (!looksLikePasswordHash(stored)) return false;
   const [salt, secret] = stored.split(':');
   try {
     return crypto.timingSafeEqual(Buffer.from(secret, 'hex'), crypto.scryptSync(password, salt, 64));
@@ -1136,10 +1226,7 @@ function publicApiKey(key) {
     spendUsed: Number(key.spendUsed || 0),
     tokenUsed: Number(key.tokenUsed || 0),
     enabled: key.enabled !== false,
-    createdAt: key.createdAt,
-    upstreamSynced: !!(key.upstream && key.upstream.id),
-    upstreamProvider: key.upstream?.provider || null,
-    upstreamGroupId: key.upstream?.groupId || null
+    createdAt: key.createdAt
   };
 }
 
@@ -1229,7 +1316,12 @@ function keyRateOk(res, key, tokensEstimate) {
   bucket.tokens += tokensEstimate;
   return true;
 }
-function json(res, status, body) { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); }
+function json(res, status, body) {
+  const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
+  if (status === 429) headers['Retry-After'] = '60';
+  res.writeHead(status, headers);
+  res.end(JSON.stringify(stripAdminSecrets(body)));
+}
 function fail(res, status, error, opts = null) {
   if (opts && typeof opts === 'object') {
     const { status: _s, body } = failPayload(status, error, opts);
@@ -1237,15 +1329,21 @@ function fail(res, status, error, opts = null) {
   }
   return json(res, status, { error });
 }
-async function body(req) { let raw = ''; for await (const chunk of req) raw += chunk; try { return raw ? JSON.parse(raw) : {}; } catch { return null; } }
+async function body(req, maxBytes = MAX_JSON_BODY) {
+  const raw = await readLimitedBody(req, maxBytes);
+  try { return raw ? parseJsonSafe(raw) : {}; } catch { return null; }
+}
 function clientIp(req) {
-  const fwd = req.headers['x-forwarded-for'];
-  if (typeof fwd === 'string' && fwd.trim()) return fwd.split(',')[0].trim();
-  return req.socket?.remoteAddress || 'unknown';
+  return requestClientIp(req);
 }
 function rateLimit(req, res, limit, bucketName, extra = '') {
   const key = `${clientIp(req)}:${bucketName || 'default'}:${extra}`;
   const now = Date.now();
+  if (rateBuckets.size > 20000) {
+    for (const [k, v] of rateBuckets) {
+      if (now - v.windowStart >= RATE_WINDOW_MS) rateBuckets.delete(k);
+    }
+  }
   let bucket = rateBuckets.get(key);
   if (!bucket || now - bucket.windowStart >= RATE_WINDOW_MS) {
     bucket = { windowStart: now, count: 0 };
@@ -1260,7 +1358,7 @@ function rateLimit(req, res, limit, bucketName, extra = '') {
 }
 function persistSession(db, token, userId) {
   db.sessions ??= {};
-  db.sessions[token] = { userId, createdAt: new Date().toISOString() };
+  db.sessions[token] = sessionRecord(userId);
 }
 function clearSession(db, token) {
   db.sessions ??= {};
@@ -1269,9 +1367,15 @@ function clearSession(db, token) {
 function userFrom(req, db) {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   if (!token) return null;
+  const rec = db.sessions?.[token];
+  if (rec && sessionExpired(rec)) {
+    sessions.delete(token);
+    clearSession(db, token);
+    return null;
+  }
   let userId = sessions.get(token);
-  if (!userId && db.sessions?.[token]) {
-    userId = db.sessions[token].userId;
+  if (!userId && rec?.userId) {
+    userId = rec.userId;
     sessions.set(token, userId);
   }
   return userId ? db.users.find(u => u.id === userId) : null;
@@ -1564,8 +1668,11 @@ function ensureAdminUser(db) {
   if ((admin.balance || 0) < 1000000) admin.balance = 999999999;
   if ((admin.quotaTokens || 0) < 1000000) admin.quotaTokens = 999999999;
   if (email) admin.email = email;
-  // Only overwrite the stored password when ADMIN_PASSWORD is actually set.
-  if (ADMIN_PASSWORD_ENV) admin.password = hash(ADMIN_PASSWORD_ENV);
+  if (!looksLikePasswordHash(admin.password)) {
+    admin.password = hash(ADMIN_PASSWORD_ENV || ADMIN_PASSWORD);
+  } else if (String(process.env.ADMIN_PASSWORD_RESET || '') === '1' && ADMIN_PASSWORD_ENV) {
+    admin.password = hash(ADMIN_PASSWORD_ENV);
+  }
 }
 
 function findUserByIdentifier(db, identifier) {
@@ -3642,21 +3749,22 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
       const usage = result.usage || {};
       const billedModel = result.model || settledModel;
       await live.finalize(usage, 'success');
-      if (req._responsesApi) return json(res, 200, chatCompletionToResponse(result));
-      if (req._anthropicApi) return json(res, 200, chatCompletionToAnthropic(result));
+      const masked = sanitizeChatCompletion(result, billedModel);
+      if (req._responsesApi) return json(res, 200, chatCompletionToResponse(masked));
+      if (req._anthropicApi) return json(res, 200, chatCompletionToAnthropic(masked));
       if (req._geminiApi) {
-        const choice = result && result.choices && result.choices[0];
+        const choice = masked && masked.choices && masked.choices[0];
         const text = responsesContentToText(choice && choice.message ? choice.message.content : '');
         return json(res, 200, {
           candidates: [{ content: { role: 'model', parts: [{ text }] }, finishReason: 'STOP' }],
           usageMetadata: {
-            promptTokenCount: Number(result && result.usage && result.usage.prompt_tokens) || 0,
-            candidatesTokenCount: Number(result && result.usage && result.usage.completion_tokens) || 0,
-            totalTokenCount: Number(result && result.usage && result.usage.total_tokens) || 0
+            promptTokenCount: Number(masked && masked.usage && masked.usage.prompt_tokens) || 0,
+            candidatesTokenCount: Number(masked && masked.usage && masked.usage.completion_tokens) || 0,
+            totalTokenCount: Number(masked && masked.usage && masked.usage.total_tokens) || 0
           }
         });
       }
-      return json(res, 200, result);
+      return json(res, 200, masked);
     } catch (err) {
       updateProviderHealth(db, provider.id, false, err?.message || 'fetch_failed');
       writeDb(db);
@@ -3752,13 +3860,26 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
   function processSseBuffer() {
     const parts = buffer.split('\n');
     buffer = parts.pop() || '';
+    const writeOpenAi = !responsesApi && !anthropicApi;
     for (const line of parts) {
       const trimmed = line.trim();
       if (!trimmed.startsWith('data:')) continue;
       const data = trimmed.slice(5).trim();
-      if (!data || data === '[DONE]') continue;
+      if (!data) continue;
+      if (data === '[DONE]') {
+        if (writeOpenAi) {
+          try { res.write('data: [DONE]\n\n'); } catch { /* ignore */ }
+        }
+        continue;
+      }
       try {
         const parsed = JSON.parse(data);
+        if (writeOpenAi) {
+          const masked = sanitizeSseDataLine(`data: ${data}`, model);
+          if (masked) {
+            try { res.write(masked); } catch { /* ignore */ }
+          }
+        }
         if (parsed.usage) {
           usage = parsed.usage;
           billing.noteUsage?.(usage);
@@ -3823,7 +3944,6 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
         if (aborted) break;
         const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
         buffer += text;
-        if (!responsesApi && !anthropicApi) res.write(text);
         processSseBuffer();
       }
     } else {
@@ -3834,7 +3954,6 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
         if (aborted) break;
         const text = decoder.decode(value, { stream: true });
         buffer += text;
-        if (!responsesApi && !anthropicApi) res.write(text);
         processSseBuffer();
       }
     }
@@ -3848,9 +3967,19 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
     const trimmed = buffer.trim();
     if (trimmed.startsWith('data:')) {
       const data = trimmed.slice(5).trim();
-      if (data && data !== '[DONE]') {
+      if (data === '[DONE]') {
+        if (!responsesApi && !anthropicApi) {
+          try { res.write('data: [DONE]\n\n'); } catch { /* ignore */ }
+        }
+      } else if (data) {
         try {
           const parsed = JSON.parse(data);
+          if (!responsesApi && !anthropicApi) {
+            const masked = sanitizeSseDataLine(`data: ${data}`, model);
+            if (masked) {
+              try { res.write(masked); } catch { /* ignore */ }
+            }
+          }
           if (parsed.usage) usage = parsed.usage;
           const delta = parsed.choices?.[0]?.delta?.content;
           if (typeof delta === 'string') {
@@ -3975,21 +4104,31 @@ const mime = {
 };
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  attachSecurityHeaders(res);
+  try {
+  const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
   const db = readDb();
   db.auditLogs ??= [];
   db.sessions ??= {};
   db.settings ??= {};
   db.upstreamBills ??= [];
 
+  if (req.method === 'GET' && url.pathname === '/robots.txt') {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
+    return res.end(robotsTxt());
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/config') {
+    if (!rateLimit(req, res, CONFIG_RATE_LIMIT, 'config')) return;
     return json(res, 200, { contactEmail: CONTACT_EMAIL, contactWechat: CONTACT_WECHAT, contactQq: CONTACT_QQ, contactQqGroup: CONTACT_QQ_GROUP, paymentQr: PAYMENT_QR, paymentPlans: paymentPlans(db), paymentMethods: PAYMENT_METHODS, paymentGateway: publicGatewayView(getPaymentGateway(db)), publicBaseUrl: resolvePublicBaseUrl(db, req), recommendedModel: resolveRecommendedModel(db.settings),
-      apiBaseUrl: `${resolvePublicBaseUrl(db, req)}/v1`, paymentQrMeta: (() => { const meta = paymentQrMeta(db); return { ...meta, wechat: paymentQrStatus(meta.wechatExpiresAt), alipay: paymentQrStatus(meta.alipayExpiresAt) }; })(), welfareBanner: publicWelfareBanner(db.settings?.welfarePromo), appName: 'Relay Station' });
+      apiBaseUrl: `${resolvePublicBaseUrl(db, req)}/v1`, paymentQrMeta: (() => { const meta = paymentQrMeta(db); return { ...meta, wechat: paymentQrStatus(meta.wechatExpiresAt), alipay: paymentQrStatus(meta.alipayExpiresAt) }; })(), welfareBanner: publicWelfareBanner(db.settings?.welfarePromo), rechargeHours: publicRechargeHours(), appName: 'Relay Station' });
   }
 
   if (req.method === 'POST' && url.pathname === '/api/auth/register') {
-    if (!rateLimit(req, res, AUTH_RATE_LIMIT, 'auth')) return;
+    if (!rateLimit(req, res, REGISTER_RATE_LIMIT, 'auth-register')) return;
+    if (registerDailyBlocked(clientIp(req))) return fail(res, 429, '该网络今日注册过多，请稍后再试');
     const p = await body(req);
+    if (p && privilegeFieldsPresent(p)) return fail(res, 400, '无效的注册字段');
     const email = String(p?.email || '').trim().toLowerCase();
     if (!email || !email.includes('@') || !p?.password || p.password.length < 8) return fail(res, 400, '请输入邮箱和至少 8 位密码');
     if (db.users.some(x => x.email === email)) return fail(res, 409, '该邮箱已注册');
@@ -4043,17 +4182,83 @@ const server = http.createServer(async (req, res) => {
     const token = crypto.randomBytes(32).toString('hex');
     sessions.set(token, user.id);
     persistSession(db, token, user.id);
+    noteRegisterSuccess(clientIp(req));
+    const burst = noteSignupAndMaybeAlert(db, user, clientIp(req));
     writeDb(db);
+    if (burst) {
+      emitSignupBurst(burst);
+      recordSiteError(db, {
+        source: 'security',
+        code: 'signup_burst',
+        message: `短时间内新注册 ${burst.count} 个账号`,
+        detail: (burst.users || []).map(u => u.username || u.email).slice(0, 20).join(', '),
+        context: { alertId: burst.id, count: burst.count }
+      });
+      writeDb(db);
+    }
     return json(res, 201, { token, user: safeUser(user) });
   }
 
   if (req.method === 'POST' && url.pathname === '/api/auth/login') {
-    if (!rateLimit(req, res, AUTH_RATE_LIMIT, 'auth')) return;
+    if (!rateLimit(req, res, LOGIN_RATE_LIMIT, 'auth-login')) return;
+    if (loginBlocked(clientIp(req))) return fail(res, 429, '登录失败次数过多，请稍后再试');
     const p = await body(req);
     const identifier = String(p?.login ?? p?.username ?? p?.email ?? '').trim();
     const user = findUserByIdentifier(db, identifier);
-    if (!user || !p?.password || !verify(p.password, user.password)) return fail(res, 401, '用户名/邮箱或密码错误');
+    if (!user || !p?.password || !verify(p.password, user.password)) {
+      noteLoginFailure(clientIp(req));
+      return fail(res, 401, '用户名/邮箱或密码错误');
+    }
     if (isBanned(user)) return fail(res, 403, '账号已被封禁');
+    clearLoginFailures(clientIp(req));
+    if (isAdmin(user) && adminPhoneRequired(db)) {
+      const stored = getAdminPhoneHash(db);
+      const envPhone = normalizeCnMobile(process.env.ADMIN_PHONE || '');
+      const enroll = !stored && !envPhone;
+      const ticket = createPhoneTicket(user.id, { enroll });
+      return json(res, 200, {
+        needPhone: true,
+        enroll,
+        ticket,
+        message: enroll ? '请绑定管理员手机号' : '请输入管理员手机号'
+      });
+    }
+    const token = crypto.randomBytes(32).toString('hex');
+    sessions.set(token, user.id);
+    persistSession(db, token, user.id);
+    writeDb(db);
+    return json(res, 200, { token, user: safeUser(user) });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/auth/login/phone') {
+    if (!rateLimit(req, res, LOGIN_RATE_LIMIT, 'auth-login-phone')) return;
+    const p = await body(req);
+    const ticket = takePhoneTicket(p?.ticket);
+    if (!ticket) return fail(res, 401, '验证已过期，请重新登录');
+    const user = db.users.find(u => u.id === ticket.userId);
+    if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
+    if (isBanned(user)) return fail(res, 403, '账号已被封禁');
+    const phone = normalizeCnMobile(p?.phone);
+    if (!phone) return fail(res, 400, '请输入正确的11位手机号');
+    const envPhone = normalizeCnMobile(process.env.ADMIN_PHONE || '');
+    if (envPhone && phone !== envPhone) {
+      noteLoginFailure(clientIp(req));
+      return fail(res, 401, '手机号不正确');
+    }
+    db.settings ??= {};
+    let stored = getAdminPhoneHash(db);
+    if (!stored && envPhone) {
+      db.settings.adminPhoneHash = hash(envPhone);
+      stored = db.settings.adminPhoneHash;
+    }
+    if (ticket.enroll || !stored) {
+      db.settings.adminPhoneHash = hash(phone);
+      db.settings.adminPhoneBoundAt = new Date().toISOString();
+    } else if (!verify(phone, stored)) {
+      noteLoginFailure(clientIp(req));
+      return fail(res, 401, '手机号不正确');
+    }
+    clearLoginFailures(clientIp(req));
     const token = crypto.randomBytes(32).toString('hex');
     sessions.set(token, user.id);
     persistSession(db, token, user.id);
@@ -4073,6 +4278,10 @@ const server = http.createServer(async (req, res) => {
 
   const user = userFrom(req, db);
 
+  if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/v1/')) {
+    if (!rateLimit(req, res, API_RATE_LIMIT, 'api')) return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/me') {
     return user ? json(res, 200, { user: safeUser(user) }) : fail(res, 401, '未登录');
   }
@@ -4081,6 +4290,7 @@ const server = http.createServer(async (req, res) => {
     if (!user) return fail(res, 401, '未登录');
     const p = await body(req);
     if (!p || typeof p !== 'object') return fail(res, 400, '无效请求体');
+    if (privilegeFieldsPresent(p)) return fail(res, 400, '不允许修改该字段');
     if (!('avatar' in p)) return fail(res, 400, '没有可更新的字段');
     const parsed = normalizeAvatar(p.avatar);
     if (!parsed.ok || !AVATAR_IDS.includes(String(p.avatar || ''))) return fail(res, 400, parsed.error || '无效的头像');
@@ -4133,7 +4343,7 @@ const server = http.createServer(async (req, res) => {
         const fix = tipsForCode(synced.error || 'create_failed');
         recordSiteError(db, { source: 'key_sync', code: synced.error || 'create_failed', message: `vip1129 同步建钥失败: ${synced.error}`, detail: JSON.stringify(synced.detail || {}).slice(0, 500), fix, context: { groupId: created.groupId, userId: user.id } });
         writeDb(db);
-        return fail(res, 502, `上游同步建钥失败: ${synced.error}`, { code: synced.error || 'create_failed', fix });
+        return fail(res, 502, '创建密钥失败，请稍后重试');
       }
     } else if (providerNeedsBeibeihaiSync(db, created.groupId)) {
       const synced = await syncCreateBeibeihaiKey(db, user, created);
@@ -4141,7 +4351,7 @@ const server = http.createServer(async (req, res) => {
         const fix = tipsForCode(synced.error || 'create_failed');
         recordSiteError(db, { source: 'key_sync', code: synced.error || 'create_failed', message: `Beibeihai 同步建钥失败: ${synced.error}`, detail: JSON.stringify(synced.detail || {}).slice(0, 500), fix, context: { groupId: created.groupId, userId: user.id } });
         writeDb(db);
-        return fail(res, 502, `上游同步建钥失败: ${synced.error}`, { code: synced.error || 'create_failed', fix });
+        return fail(res, 502, '创建密钥失败，请稍后重试');
       }
     }
     user.apiKeys.push(created);
@@ -4244,24 +4454,31 @@ const server = http.createServer(async (req, res) => {
     if (!user) return fail(res, 401, '未登录');
     if (isBanned(user)) return fail(res, 403, '账号已被封禁');
     if (!rateLimit(req, res, 30, 'checkin')) return;
-    db.checkIns ??= [];
-    const result = claimCheckIn(db, user);
-    if (!result.ok) {
-      return json(res, result.status || 409, {
-        error: result.error,
-        alreadyCheckedIn: result.alreadyCheckedIn === true,
-        date: result.date,
-        amount: result.amount,
-        balance: result.balance
+    const claimed = await withKeyedLock(`checkin:${user.id}`, () => {
+      const fresh = readDb();
+      const liveUser = fresh.users.find(u => u.id === user.id);
+      if (!liveUser) return { ok: false, status: 401, error: '未登录' };
+      fresh.checkIns ??= [];
+      const result = claimCheckIn(fresh, liveUser);
+      if (!result.ok) return result;
+      audit(fresh, { actorId: liveUser.id, action: 'checkin.claim', target: liveUser.id, detail: { date: result.date, amount: result.amount } });
+      writeDb(fresh);
+      return result;
+    });
+    if (!claimed.ok) {
+      return json(res, claimed.status || 409, {
+        error: claimed.error,
+        alreadyCheckedIn: claimed.alreadyCheckedIn === true,
+        date: claimed.date,
+        amount: claimed.amount,
+        balance: claimed.balance
       });
     }
-    audit(db, { actorId: user.id, action: 'checkin.claim', target: user.id, detail: { date: result.date, amount: result.amount } });
-    writeDb(db);
     return json(res, 200, {
-      amount: result.amount,
-      balance: result.balance,
+      amount: claimed.amount,
+      balance: claimed.balance,
       alreadyCheckedIn: false,
-      date: result.date
+      date: claimed.date
     });
   }
 
@@ -4322,7 +4539,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && url.pathname === '/api/admin/welfare/upload') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
-    const p = await body(req);
+    const p = await body(req, MAX_UPLOAD_BODY);
     const decoded = decodePaymentQrImage(p?.image);
     if (!decoded.ok) return fail(res, 400, String(decoded.error || '图片无效').replace('收款码', '福利'));
     const publicPath = saveWelfareImage(decoded.buf, decoded.ext);
@@ -4562,6 +4779,63 @@ const server = http.createServer(async (req, res) => {
   
   
   
+  if (req.method === 'GET' && url.pathname === '/api/admin/security-alerts') {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    db.securityAlerts ??= [];
+    return json(res, 200, {
+      alerts: db.securityAlerts.slice(0, 50).map(publicSecurityAlert),
+      openCount: db.securityAlerts.filter(a => a.status === 'open').length
+    });
+  }
+
+  if (req.method === 'POST' && url.pathname.startsWith('/api/admin/security-alerts/') && url.pathname.endsWith('/ban-all')) {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const alertId = decodeURIComponent(url.pathname.slice('/api/admin/security-alerts/'.length, -'/ban-all'.length));
+    db.securityAlerts ??= [];
+    const alert = db.securityAlerts.find(a => a.id === alertId);
+    if (!alert) return fail(res, 404, '告警不存在');
+    let bannedCount = 0;
+    for (const row of alert.users || []) {
+      const done = banUserFromAlert(db, alert, row.userId);
+      if (done.ok) bannedCount = done.bannedCount;
+    }
+    alert.status = 'banned';
+    alert.bannedCount = bannedCount;
+    alert.updatedAt = new Date().toISOString();
+    audit(db, { actorId: user.id, action: 'security.ban_all', target: alert.id, detail: { bannedCount, count: alert.count } });
+    writeDb(db);
+    return json(res, 200, { alert: publicSecurityAlert(alert), bannedCount, message: `已封禁 ${bannedCount} 个账号` });
+  }
+
+  if (req.method === 'POST' && url.pathname.startsWith('/api/admin/security-alerts/') && url.pathname.endsWith('/ban-one')) {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const alertId = decodeURIComponent(url.pathname.slice('/api/admin/security-alerts/'.length, -'/ban-one'.length));
+    db.securityAlerts ??= [];
+    const alert = db.securityAlerts.find(a => a.id === alertId);
+    if (!alert) return fail(res, 404, '告警不存在');
+    const p = await body(req);
+    const userId = String(p?.userId || '').trim();
+    if (!userId) return fail(res, 400, '缺少用户 ID');
+    const done = banUserFromAlert(db, alert, userId);
+    if (!done.ok) return fail(res, 400, done.error);
+    audit(db, { actorId: user.id, action: 'security.ban_one', target: userId, detail: { alertId: alert.id } });
+    writeDb(db);
+    return json(res, 200, { alert: publicSecurityAlert(alert), bannedCount: done.bannedCount, message: '已封禁该账号' });
+  }
+
+  if (req.method === 'POST' && url.pathname.startsWith('/api/admin/security-alerts/') && url.pathname.endsWith('/dismiss')) {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const alertId = decodeURIComponent(url.pathname.slice('/api/admin/security-alerts/'.length, -'/dismiss'.length));
+    db.securityAlerts ??= [];
+    const alert = db.securityAlerts.find(a => a.id === alertId);
+    if (!alert) return fail(res, 404, '告警不存在');
+    alert.status = 'dismissed';
+    alert.updatedAt = new Date().toISOString();
+    audit(db, { actorId: user.id, action: 'security.dismiss', target: alert.id, detail: { count: alert.count } });
+    writeDb(db);
+    return json(res, 200, { alert: publicSecurityAlert(alert) });
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/admin/site-errors') {
     if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
     const list = ensureSiteErrors(db);
@@ -4643,7 +4917,9 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && (url.pathname === '/api/admin/mobile/inbox' || url.pathname === '/api/admin/inbox')) {
     if (!user || !isAdmin(user)) return fail(res, 403, '需要管理员');
-    return json(res, 200, mobileInboxPayload(db, user));
+    const inbox = mobileInboxPayload(db, user);
+    inbox.securityAlerts = openSecurityAlerts(db);
+    return json(res, 200, inbox);
   }
 
   if (req.method === 'GET' && url.pathname === '/api/admin/upstream-accounts') {
@@ -4921,55 +5197,66 @@ const server = http.createServer(async (req, res) => {
     if (isBanned(user)) return fail(res, 403, '账号已被封禁');
     if (!rateLimit(req, res, REDEEM_RATE_LIMIT, 'redeem', user.id)) return;
     const p = await body(req);
-    const rec = findCodeRecord(db, p?.code);
-    const access = redeemAccess(rec, user.id);
-    if (!access.ok) return fail(res, 400, REDEEM_FAIL);
-    if (rec.usedAt) return fail(res, 400, REDEEM_FAIL);
-    markDbRootDirty(db, 'rechargeCodes');
-    rec.usedAt = new Date().toISOString();
-    rec.userId = user.id;
-    rec.issuedTo = rec.issuedTo || user.id;
-    rec.issuedAt = rec.issuedAt || rec.usedAt;
-    const quotaTokens = Number(rec.quotaTokens || 100000);
-    const payAmount = money2(rec.amount);
-    const credit = redeemCreditAmount(rec);
-    rec.creditAmount = credit;
-    user.balance = money2((user.balance || 0) + credit);
-    user.quotaTokens = (user.quotaTokens || 0) + quotaTokens;
-    if (!user.banned) user.accountActive = true;
-    // Referral: only when invited user pays — inviter gets 5% of face amount
-    let rebate = 0;
-    if (user.invitedBy && payAmount > 0) {
-      const inviter = db.users.find(x => x.id === user.invitedBy);
-      if (inviter) {
-        rebate = Math.round(payAmount * REFERRAL_REBATE_RATE * 100) / 100;
-        inviter.bonusBalance = (inviter.bonusBalance || 0) + rebate;
-        inviter.balance = (inviter.balance || 0) + rebate;
-        db.logs = db.logs || [];
-        db.logs.unshift({
-          id: id('log'),
-          userId: inviter.id,
-          model: 'referral',
-          tokens: 0,
-          billedTokens: 0,
-          upstreamCost: 0,
-          chargedAmount: -rebate,
-          multiplier: 1,
-          latency: 0,
-          status: 'referral_rebate',
-          detail: { fromUserId: user.id, payAmount, rebate, rate: REFERRAL_REBATE_RATE },
-          createdAt: new Date().toISOString()
-        });
-        db.logs = db.logs.slice(0, 3000);
+    const codeKey = normalizeRedeemCode(p?.code);
+    const redeemed = await withKeyedLock(`redeem:${codeKey || 'empty'}`, () => {
+      const fresh = readDb();
+      const liveUser = fresh.users.find(u => u.id === user.id);
+      if (!liveUser) return { ok: false, error: REDEEM_FAIL };
+      const rec = findCodeRecord(fresh, p?.code);
+      const access = redeemAccess(rec, liveUser.id);
+      if (!access.ok || rec.usedAt) return { ok: false, error: REDEEM_FAIL };
+      markDbRootDirty(fresh, 'rechargeCodes');
+      rec.usedAt = new Date().toISOString();
+      rec.userId = liveUser.id;
+      rec.issuedTo = rec.issuedTo || liveUser.id;
+      rec.issuedAt = rec.issuedAt || rec.usedAt;
+      const quotaTokens = Number(rec.quotaTokens || 100000);
+      const payAmount = money2(rec.amount);
+      const credit = redeemCreditAmount(rec);
+      rec.creditAmount = credit;
+      liveUser.balance = money2((liveUser.balance || 0) + credit);
+      liveUser.quotaTokens = (liveUser.quotaTokens || 0) + quotaTokens;
+      if (!liveUser.banned) liveUser.accountActive = true;
+      if (liveUser.invitedBy && payAmount > 0) {
+        const inviter = fresh.users.find(x => x.id === liveUser.invitedBy);
+        if (inviter) {
+          const rebate = Math.round(payAmount * REFERRAL_REBATE_RATE * 100) / 100;
+          inviter.bonusBalance = (inviter.bonusBalance || 0) + rebate;
+          inviter.balance = (inviter.balance || 0) + rebate;
+          fresh.logs = fresh.logs || [];
+          fresh.logs.unshift({
+            id: id('log'),
+            userId: inviter.id,
+            model: 'referral',
+            tokens: 0,
+            billedTokens: 0,
+            upstreamCost: 0,
+            chargedAmount: -rebate,
+            multiplier: 1,
+            latency: 0,
+            status: 'referral_rebate',
+            detail: { fromUserId: liveUser.id, payAmount, rebate, rate: REFERRAL_REBATE_RATE },
+            createdAt: new Date().toISOString()
+          });
+          fresh.logs = fresh.logs.slice(0, 3000);
+        }
       }
-    }
-    writeDb(db);
-    const bonus = credit > payAmount + 0.001;
+      writeDb(fresh);
+      const bonus = credit > payAmount + 0.001;
+      return {
+        ok: true,
+        user: liveUser,
+        creditAmount: credit,
+        paidAmount: payAmount,
+        message: bonus ? `充值成功，实付 ¥${payAmount}，福利到账 ¥${credit}` : `充值成功，到账 ¥${credit}`
+      };
+    });
+    if (!redeemed.ok) return fail(res, 400, redeemed.error || REDEEM_FAIL);
     return json(res, 200, {
-      user: safeUser(user),
-      creditAmount: credit,
-      paidAmount: payAmount,
-      message: bonus ? `充值成功，实付 ¥${payAmount}，福利到账 ¥${credit}` : `充值成功，到账 ¥${credit}`
+      user: safeUser(redeemed.user),
+      creditAmount: redeemed.creditAmount,
+      paidAmount: redeemed.paidAmount,
+      message: redeemed.message
     });
   }
 
@@ -4977,7 +5264,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && url.pathname === '/api/admin/payment-qrs/upload') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
-    const p = await body(req);
+    const p = await body(req, MAX_UPLOAD_BODY);
     const method = String(p?.method || '').toLowerCase();
     if (!['wechat', 'alipay'].includes(method)) return fail(res, 400, '付款方式无效');
     const decoded = decodePaymentQrImage(p?.image);
@@ -5281,6 +5568,7 @@ const server = http.createServer(async (req, res) => {
     if (!target) return fail(res, 404, '用户不存在');
     const p = await body(req);
     if (!p || typeof p !== 'object') return fail(res, 400, '无效请求体');
+    if ('unlimited' in p || 'isAdmin' in p) return fail(res, 400, '不允许通过接口设置无限额度');
     const changes = {};
     if ('balance' in p && 'balanceDelta' in p) return fail(res, 400, '不能同时设置余额和增减额');
     if ('banned' in p) {
@@ -5410,12 +5698,12 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/v1/models') {
     const apiKey = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     const found = findByApiSecret(db, apiKey);
-    if (!found) return fail(res, 401, '无效的 Relay API Key');
+    if (!found) return fail(res, 401, '无效的 API Key');
     const allowed = allowedModelsForKey(db, found.key);
     const listed = allowed.length ? allowed : catalogModels(db);
     return json(res, 200, {
       object: 'list',
-      data: listed.map(id => ({ id, object: 'model', owned_by: 'relay-station' }))
+      data: listed.map(id => ({ id, object: 'model', owned_by: 'system' }))
     });
   }
 
@@ -5423,7 +5711,7 @@ const server = http.createServer(async (req, res) => {
     if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
     const apiKey = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     const found = findByApiSecret(db, apiKey);
-    if (!found) return fail(res, 401, '无效的 Relay API Key');
+    if (!found) return fail(res, 401, '无效的 API Key');
     return chat(req, res, db, found.user, found.key);
   }
 
@@ -5432,7 +5720,7 @@ const server = http.createServer(async (req, res) => {
     if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
     const apiKey = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     const found = findByApiSecret(db, apiKey);
-    if (!found) return fail(res, 401, '无效的 Relay API Key');
+    if (!found) return fail(res, 401, '无效的 API Key');
     const raw = await body(req);
     if (raw == null) return fail(res, 400, 'invalid json');
     const pseudoPayload = { model: raw.model, messages: [{ role: 'user', content: 'x' }] };
@@ -5470,7 +5758,7 @@ const server = http.createServer(async (req, res) => {
     if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
     const apiKey = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     const found = findByApiSecret(db, apiKey);
-    if (!found) return fail(res, 401, '无效的 Relay API Key');
+    if (!found) return fail(res, 401, '无效的 API Key');
     const raw = await body(req);
     if (raw == null) return fail(res, 400, 'invalid json');
     const user = found.user;
@@ -5695,7 +5983,7 @@ const server = http.createServer(async (req, res) => {
     if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
     const apiKey = req.headers['x-api-key'] || req.headers['x-goog-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     const found = findByApiSecret(db, apiKey);
-    if (!found) return fail(res, 401, '无效的 Relay API Key');
+    if (!found) return fail(res, 401, '无效的 API Key');
     const m = url.pathname.match(/^\/v1beta\/models\/([^/:]+):(generateContent|streamGenerateContent)$/);
     const model = decodeURIComponent(m[1]);
     const stream = m[2] === 'streamGenerateContent';
@@ -5718,7 +6006,7 @@ const server = http.createServer(async (req, res) => {
     if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
     const apiKey = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     const found = findByApiSecret(db, apiKey);
-    if (!found) return fail(res, 401, '无效的 Relay API Key');
+    if (!found) return fail(res, 401, '无效的 API Key');
     const raw = await body(req);
     if (raw == null) return fail(res, 400, 'invalid json');
     const user = found.user;
@@ -5977,15 +6265,23 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(302, { Location: '/payment-qr/10.png' });
     return res.end();
   }
-  let file = url.pathname === '/' ? path.join(publicDir, 'index.html') : path.join(publicDir, url.pathname);
-  file = path.normalize(file);
-  if (!file.startsWith(publicDir)) return fail(res, 403, 'Forbidden');
+  const file = url.pathname === '/' ? resolvePublicFile(publicDir, '/') : resolvePublicFile(publicDir, url.pathname);
+  if (!file) return fail(res, 403, 'Forbidden');
   fs.readFile(file, (err, data) => {
     if (err) return fail(res, 404, 'Not found');
-    res.writeHead(200, { 'Content-Type': mime[path.extname(file)] || 'application/octet-stream' });
+    const ext = path.extname(file);
+    const cache = ext === '.html' ? 'no-store' : 'public, max-age=300';
+    res.writeHead(200, { 'Content-Type': mime[ext] || 'application/octet-stream', 'Cache-Control': cache });
     if (req.method !== 'HEAD') res.end(data);
     else res.end();
   });
+  } catch (err) {
+    if (res.headersSent) return;
+    if (err?.code === 'PAYLOAD_TOO_LARGE') return fail(res, 413, '请求体过大');
+    if (err?.code === 'ERR_INVALID_URL') return fail(res, 400, '无效请求');
+    console.error('request_error', err?.stack || err);
+    return fail(res, 500, '服务器错误');
+  }
 });
 
 const initial = readDb();
@@ -6113,6 +6409,7 @@ if (!initial.settings.providers.length && LEGACY_UPSTREAM.url && LEGACY_UPSTREAM
 }
 initial.settings.defaultProviderId ??= initial.settings.providers[0]?.id ?? null;
 ensureAdminUser(initial);
+ensureAdminPhoneHash(initial);
 const envCodes = (process.env.RECHARGE_CODES || '').split(',').map(x => x.trim()).filter(Boolean);
 for (const item of envCodes) {
   const [code, amount, quotaTokens] = item.split(':');

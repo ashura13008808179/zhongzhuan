@@ -98,7 +98,14 @@ class InboxService : Service() {
         for (i in 0 until events.length()) {
             val ev = events.optJSONObject(i) ?: continue
             val kind = ev.optString("kind")
-            if (kind != "placed" && kind != "paid") continue
+            if (kind != "placed" && kind != "paid" && kind != "signup_burst") continue
+            if (kind == "signup_burst") {
+                val title = ev.optString("title").ifBlank { "注册暴增告警" }
+                val body = ev.optString("body").ifBlank { "短时间内有大批账号注册，请打开值班台处理" }
+                val tag = "signup:${ev.optString("alertId")}:${ev.opt("seq")}"
+                Notifier.notifyOrder(this, title, body, tag)
+                continue
+            }
             val who = ev.optString("username").ifBlank { "用户" }
             val amount = ev.optDouble("amount", 0.0).toInt()
             val note = ev.optString("payNote", "-").ifBlank { "-" }

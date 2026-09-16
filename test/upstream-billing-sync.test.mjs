@@ -10,6 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { openDbDir } from '../lib/db-crypto.js';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-ledger-'));
@@ -129,8 +130,9 @@ try {
   assert.equal(login.status, 200, JSON.stringify(login.body));
   const auth = { Authorization: `Bearer ${login.body.token}` };
 
-  const dbPath = path.join(tmp, 'db.json');
-  const db = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+  const store = openDbDir(tmp);
+  const dbPath = store.file;
+  const db = store.read();
   const provider = db.settings.providers.find((item) => item.id === 'grp_gpt_mix');
   provider.url = `${upstreamBase}/v1/chat/completions`;
   provider.upstreamSync = 'vip1129';
@@ -187,7 +189,7 @@ try {
     upstreamUsageId: 'usage-direct', upstreamApiKeyId: '6178', pendingActual: false,
     holdAmount: 0, status: 'success', createdAt: now, startedAt: now
   }];
-  fs.writeFileSync(dbPath, JSON.stringify(db, null, 2));
+  store.write(db);
 
   const first = await request('/api/admin/upstream-billing/sync', {
     method: 'POST', headers: auth, body: JSON.stringify({ fullBackfill: true })
@@ -196,7 +198,7 @@ try {
   assert.equal(first.body.synced.imported, 2);
   assert.equal(first.body.synced.linked, 1);
 
-  let after = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+  let after = store.read();
   let customer = after.users.find((item) => item.id === userId);
   const overdrawn = after.users.find((item) => item.id === 'usr_overdrawn_customer');
   let direct = after.logs.find((item) => item.id === 'log_direct');
@@ -214,7 +216,7 @@ try {
     method: 'POST', headers: auth, body: JSON.stringify({ fullBackfill: true })
   });
   assert.equal(duplicate.status, 200, JSON.stringify(duplicate.body));
-  after = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+  after = store.read();
   customer = after.users.find((item) => item.id === userId);
   assertAmount(customer.balance, 12.12917, 'a repeated sync must not charge again');
   assert.equal(after.upstreamBills.length, 3, 'a repeated sync must not duplicate bills');
@@ -225,7 +227,7 @@ try {
   assert.equal(repriced.status, 200, JSON.stringify(repriced.body));
   assert.equal(repriced.body.ledgerSync?.skipped, false);
   assert.equal(repriced.body.repricedLedgerRows, 3);
-  after = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+  after = store.read();
   customer = after.users.find((item) => item.id === userId);
   const repricedOverdrawn = after.users.find((item) => item.id === 'usr_overdrawn_customer');
   direct = after.logs.find((item) => item.id === 'log_direct');
