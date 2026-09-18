@@ -1106,9 +1106,11 @@ function modelPricesEditorHtml(provider, idx) {
       <input data-mp-field="input" type="number" step="0.0001" min="0" value="${esc(price.inputPricePer1K ?? 0)}" placeholder="输入/1K">
       <input data-mp-field="output" type="number" step="0.0001" min="0" value="${esc(price.outputPricePer1K ?? 0)}" placeholder="输出/1K">
       <input data-mp-field="cache" type="number" step="0.0001" min="0" value="${esc(price.cacheReadPricePer1K ?? '')}" placeholder="缓存读/1K">
+      <span class="sub">¥${esc(Number((Number(price.inputPricePer1K)||0)*1000).toFixed(2))}</span>
+      <span class="sub">¥${esc(Number((Number(price.outputPricePer1K)||0)*1000).toFixed(2))}</span>
       <button type="button" class="ghost-btn" data-remove-mp="${idx}:${pi}">删除</button>
     </div>`).join('');
-  return `<div class="model-prices" data-provider-mp="${idx}"><div class="model-price-head"><span>模型</span><span>输入价/1K</span><span>输出价/1K</span><span>缓存读/1K</span><span></span></div>${rows || '<p class="sub">暂无按模型价格，将使用渠道默认输入/输出/缓存价。</p>'}<button type="button" class="ghost-btn" data-add-mp="${idx}">+ 添加模型价格</button></div>`;
+  return `<div class="model-prices" data-provider-mp="${idx}"><div class="model-price-head"><span>模型</span><span>输入价/1K</span><span>输出价/1K</span><span>缓存读/1K</span><span>100万输入</span><span>100万输出</span><span></span></div>${rows || '<p class="sub">暂无按模型价格，将使用渠道默认输入/输出/缓存价。自动拉价未完成前仍用上一份表。</p>'}<button type="button" class="ghost-btn" data-add-mp="${idx}">+ 添加模型价格</button></div>`;
 }
 
 function providerHost(url) {
@@ -1120,6 +1122,24 @@ function chargeRateHint(provider, settings) {
   const vip = provider?.upstreamSync === 'vip1129' || /vip1129/i.test(String(provider?.url || ''));
   const rate = vip ? (settings?.multiplierVip1129 ?? 1.5) : (settings?.multiplier ?? 2.5);
   return `真实花销倍率 ${fmtRate(rate)}x（${vip ? 'vip1129 / Codex' : 'beibeihai / 北海'} 全局）`;
+}
+
+function fmtShanghai(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+}
+
+function tokenPriceSyncHtml(sync) {
+  const s = sync || {};
+  const line = s.running
+    ? '正在拉取最新 Token 价格，扣费仍用上一份价格表。'
+    : (s.message || '扣费使用当前已保存的价格表。');
+  const failed = Array.isArray(s.failed) && s.failed.length
+    ? `<p class="sub">有 ${s.failed.length} 个渠道未拉到新价，5 分钟后重试；期间继续用上一份表。</p>`
+    : '';
+  return `<div class="rate-block" style="margin:1rem 0;padding:1rem;border:1px solid rgba(255,255,255,.08);border-radius:12px"><h3 style="margin:0 0 .5rem">Token 价格表</h3><p class="sub">${esc(line)}</p><p class="sub">上次成功：${esc(fmtShanghai(s.lastOkAt))} · 上次尝试：${esc(fmtShanghai(s.lastRunAt))} · 下次自动（12:00 / 24:00）：${esc(fmtShanghai(s.nextAt))}</p>${failed}<button class="primary-btn" type="button" id="calibrateRates">立即更新 Token 价格表</button><div id="calibrateRatesMsg" class="inline-msg"></div></div>`;
 }
 
 function providerFormHtml(provider, idx, settings) {
@@ -1162,7 +1182,7 @@ function providerFormHtml(provider, idx, settings) {
       <label>输入价/1K<input data-f="inputPricePer1K" type="number" step="0.0001" min="0" value="${esc(provider.inputPricePer1K ?? 0)}"></label>
       <label>输出价/1K<input data-f="outputPricePer1K" type="number" step="0.0001" min="0" value="${esc(provider.outputPricePer1K ?? 0)}"></label>
       <label>缓存读价/1K<input data-f="cacheReadPricePer1K" type="number" step="0.0001" min="0" value="${esc(provider.cacheReadPricePer1K ?? '')}"><small class="hint">对齐上游 cache / cached_tokens，空则按输入价 10%。</small></label>
-      <label>上游分组倍率<input data-f="upstreamRateMultiplier" type="number" step="0.01" min="0" value="${esc(provider.upstreamRateMultiplier ?? 1)}"><small class="hint">vip1129/北海 group rate_multiplier。估算上游成本 = 基价 × 此倍率；有实扣字段时以实扣为准。</small></label>
+      <label>上游分组倍率<input data-f="upstreamRateMultiplier" type="number" step="0.01" min="0" value="${esc(provider.upstreamRateMultiplier ?? 1)}"><small class="hint">分组倍率。Token 成本 = 价格表基价 × 此倍率，再乘全局倍率才是客户扣费。拉价未完成时沿用上一份价格表。</small></label>
       <label>超时 ms<input data-f="timeoutMs" type="number" min="1000" value="${esc(provider.timeoutMs ?? 60000)}"></label>
       <label>重试次数<input data-f="maxRetries" type="number" min="0" max="5" value="${esc(provider.maxRetries ?? 0)}"></label>
       <label class="check-label"><input data-f="enabled" type="checkbox" ${provider.enabled !== false ? 'checked' : ''}> 启用</label>
@@ -1247,12 +1267,12 @@ async function renderOperations(gen) {
       adminProvidersCache = settings.providers || [];
       adminDefaultProviderId = settings.defaultProviderId;
       if (adminTab === 'rates') {
-        shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><p class="eyebrow">REAL-TIME PRICING</p><h2>客户计费倍率</h2><p class="sub">真实扣费按<strong>上游全局倍率</strong>分两档：beibeihai / 北海 与 vip1129 / Codex 直连中转。默认只按上游账单 <code>actual_cost</code> 实时扣款：客户花销 = 上游实扣 × 对应上游全局倍率。估价结算默认关闭，避免估低亏本。</p>
-<div class="rate-block" style="margin:1rem 0;padding:1rem;border:1px solid rgba(255,255,255,.08);border-radius:12px"><h3 style="margin:0 0 .5rem">扣费方式</h3><label style="display:flex;align-items:flex-start;gap:.6rem;margin:.5rem 0"><input id="allowEstimate" type="checkbox" ${settings.allowEstimatedBilling ? 'checked' : ''}><span>允许估价结算（仅当拿不到上游 <code>actual_cost</code> 时）。<br><small class="sub">关闭时：只认上游实时实扣；实扣未到会挂起继续对齐，不会用价表定稿。</small></span></label><button class="primary-btn" id="saveEstimateMode">保存扣费方式</button></div>
+        shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><p class="eyebrow">REAL-TIME PRICING</p><h2>客户计费倍率</h2><p class="sub">客户扣费 = Token 价格表成本 × 对应全局倍率。每天 12:00 和 24:00 自动拉最新单价；拉价未完成或失败时继续用上一份价格表。官方实扣只记财务账本，不改写客户已扣金额。</p>
+<div class="rate-block" style="margin:1rem 0;padding:1rem;border:1px solid rgba(255,255,255,.08);border-radius:12px"><h3 style="margin:0 0 .5rem">扣费方式</h3><label style="display:flex;align-items:flex-start;gap:.6rem;margin:.5rem 0"><input id="allowEstimate" type="checkbox" ${settings.allowEstimatedBilling ? 'checked' : ''}><span>允许估价结算（仅当拿不到价格表时才回退）。<br><small class="sub">关闭时：始终按 Token 价格表 × 全局倍率扣费；拉价未完成继续用上一份表。</small></span></label><button class="primary-btn" id="saveEstimateMode">保存扣费方式</button></div>
 <div class="rate-block" style="margin:1rem 0;padding:1rem;border:1px solid rgba(255,255,255,.08);border-radius:12px"><h3 style="margin:0 0 .5rem">beibeihai / 北海 全局倍率</h3><p class="sub">绑定 <code>settings.billingMultiplier</code>，默认 <b>2.5x</b>。当前 <b>${esc(fmtRate(settings.multiplier))}x</b></p><div class="inline-form"><input id="customRate" type="number" min="0.01" max="10" step="0.01" value="${esc(fmtRate(settings.multiplier))}"><button class="primary-btn" id="saveCustomRate">保存北海倍率</button></div><p class="sub">快捷选择：</p><div class="rate-buttons" id="beibeiRates">${[1,1.5,2,2.5,3,4].map(rate=>`<button class="rate-btn ${rateEquals(settings.multiplier,rate)?'selected':''}" data-rate="${rate}" data-which="beibei">${fmtRate(rate)}x <small>北海</small></button>`).join('')}</div></div>
 <div class="rate-block" style="margin:1rem 0;padding:1rem;border:1px solid rgba(255,255,255,.08);border-radius:12px"><h3 style="margin:0 0 .5rem">vip1129 / Codex 直连中转 全局倍率</h3><p class="sub">绑定 <code>settings.billingMultiplierVip1129</code> / <code>settings.multiplierVip1129</code>，默认 <b>1.5x</b>。当前 <b>${esc(fmtRate(settings.multiplierVip1129 ?? 1.5))}x</b></p><div class="inline-form"><input id="customRateVip" type="number" min="0.01" max="10" step="0.01" value="${esc(fmtRate(settings.multiplierVip1129 ?? 1.5))}"><button class="primary-btn" id="saveCustomRateVip">保存 vip1129 倍率</button></div><p class="sub">快捷选择：</p><div class="rate-buttons" id="vipRates">${[1,1.5,2,2.5,3,4].map(rate=>`<button class="rate-btn ${rateEquals(settings.multiplierVip1129 ?? 1.5,rate)?'selected':''}" data-rate="${rate}" data-which="vip">${fmtRate(rate)}x <small>vip1129</small></button>`).join('')}</div></div>
-<p id="rateResult" class="inline-msg"></p><p class="sub">渠道列表（仅展示摆设倍率；真实扣费看上方对应上游全局倍率）：</p><div class="health-summary">${(settings.providers||[]).map(p=>`<div class="account-row"><span>${esc(p.name)}</span><b>展示倍率 ${esc(fmtRate(p.displayMultiplier))}x（摆设）· 真实扣费看上游全局倍率</b></div>`).join('')||'<p class="sub">暂无渠道。</p>'}</div>
-<div class="rate-block" style="margin:1rem 0;padding:1rem;border:1px solid rgba(255,255,255,.08);border-radius:12px"><h3 style="margin:0 0 .5rem">对照账单校准估价</h3><p class="sub">用近期账单反推每个渠道组、每个模型的 Token 单价（元/1K），用于没拉到实扣时的 1.2 倍占位。不会改历史账单、也不会改全局扣费倍率。</p><button class="primary-btn" type="button" id="calibrateRates">立即校准</button><div id="calibrateRatesMsg" class="inline-msg"></div></div></section>`);
+<p id="rateResult" class="inline-msg"></p>        <p class="sub">渠道列表（仅展示摆设倍率；真实扣费 = Token 价格表 × 对应全局倍率）：</p><div class="health-summary">${(settings.providers||[]).map(p=>`<div class="account-row"><span>${esc(p.name)}</span><b>展示倍率 ${esc(fmtRate(p.displayMultiplier))}x（摆设）· 真实扣费看价格表 × 全局倍率</b></div>`).join('')||'<p class="sub">暂无渠道。</p>'}</div>
+${tokenPriceSyncHtml(settings.tokenPriceSync)}</section>`);
         page.querySelectorAll('[data-rate]').forEach(button => button.onclick = async () => {
           try {
             const which = button.dataset.which;
@@ -1280,7 +1300,7 @@ async function renderOperations(gen) {
         $('#saveEstimateMode')?.addEventListener('click', async () => {
           try {
             await api('/api/admin/pricing', { method: 'PUT', body: JSON.stringify({ allowEstimatedBilling: !!$('#allowEstimate')?.checked }) });
-            $('#rateResult').textContent = $('#allowEstimate')?.checked ? '已开启估价结算（仅实扣缺失时）' : '已关闭估价结算，只按上游实扣扣费';
+            $('#rateResult').textContent = $('#allowEstimate')?.checked ? '已开启估价结算（仅价格表缺失时）' : '已关闭估价结算，始终按价格表 × 倍率扣费';
             $('#rateResult').className = 'inline-msg ok';
             renderOperations();
           } catch (error) { $('#rateResult').textContent = error.message; $('#rateResult').className = 'inline-msg'; }
@@ -1289,7 +1309,7 @@ async function renderOperations(gen) {
         $('#customRateVip')?.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); $('#saveCustomRateVip')?.click(); } });
         $('#calibrateRates')?.addEventListener('click', async () => {
           const msg = $('#calibrateRatesMsg');
-          if (msg) { msg.textContent = '正在对照账单校准…'; msg.className = 'inline-msg'; }
+          if (msg) { msg.textContent = '正在拉取最新 Token 价格（未完成前扣费仍用上一份表）…'; msg.className = 'inline-msg'; }
           try {
             const j = await api('/api/admin/providers/calibrate-prices', { method: 'POST', body: '{}' });
             if (msg) { msg.textContent = j.message || '已校准'; msg.className = 'inline-msg ok'; }
@@ -1298,11 +1318,11 @@ async function renderOperations(gen) {
           }
         });
       } else {
-        shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<div class="admin-actions-bar"><div><p class="eyebrow">CHANNEL POOL</p><h2 style="margin:0">渠道管理</h2><p class="sub">填写上游地址和 API Key 后会自动同步模型；后台每小时自动探测渠道是否可用。</p></div><button class="primary-btn" id="addProvider">+ 添加渠道</button><button class="ghost-btn" id="probeHealth">立即探测渠道</button><button class="ghost-btn" id="syncAllModels">同步全部上游模型</button><button class="ghost-btn" id="calibratePrices">对照账单校准估价</button><button class="primary-btn" id="saveProviders">保存全部渠道</button><span id="providerResult" class="inline-msg"></span></div><div id="providersList">${adminProvidersCache.map((p, i) => providerFormHtml(p, i, settings)).join('') || '<section class="card"><p class="sub">尚未配置渠道，请点击添加。</p></section>'}</div>`);
+        shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<div class="admin-actions-bar"><div><p class="eyebrow">CHANNEL POOL</p><h2 style="margin:0">渠道管理</h2><p class="sub">填写地址和 API Key 后会自动同步模型。扣费 = Token 价格表 × 全局倍率。每天 12:00 和 24:00 自动拉最新价；拉价未完成或失败时继续用上一份价格表，失败渠道 5 分钟后再试。</p></div><button class="primary-btn" id="addProvider">+ 添加渠道</button><button class="ghost-btn" id="probeHealth">立即探测渠道</button><button class="ghost-btn" id="syncAllModels">同步全部模型</button><button class="ghost-btn" id="calibratePrices">立即更新 Token 价格表</button><button class="primary-btn" id="saveProviders">保存全部渠道</button><span id="providerResult" class="inline-msg"></span></div><div id="providersList">${adminProvidersCache.map((p, i) => providerFormHtml(p, i, settings)).join('') || '<section class="card"><p class="sub">尚未配置渠道，请点击添加。</p></section>'}</div>`);
         wireProviderEditor();
         $('#calibratePrices')?.addEventListener('click', async () => {
           const msg = $('#providerResult');
-          if (msg) { msg.textContent = '正在对照账单校准…'; msg.className = 'inline-msg'; }
+          if (msg) { msg.textContent = '正在拉取最新 Token 价格（未完成前扣费仍用上一份表）…'; msg.className = 'inline-msg'; }
           try {
             const j = await api('/api/admin/providers/calibrate-prices', { method: 'POST', body: '{}' });
             if (msg) { msg.textContent = j.message || '已校准'; msg.className = 'inline-msg ok'; }
@@ -1622,6 +1642,7 @@ async function renderOperations(gen) {
         <div id="payMetaMsg" class="inline-msg"></div>
       </section>
       <section class="card"><div class="card-head"><div><p class="eyebrow">TODAY ISSUE</p><h2>今日发卡统计</h2><p class="sub">仅管理员可见。日期：${esc(stats.day)} · 库存目标每档 ${stats.target} 张</p></div><div><b>今日发放 ${stats.issuedTodayCount} 张 / ¥${Number(stats.issuedTodaySum).toFixed(0)}</b><br><span class="sub">今日兑换 ${stats.redeemedTodayCount} 张 / ¥${Number(stats.redeemedTodaySum).toFixed(0)}</span></div></div><table class="admin-table"><thead><tr><th>金额</th><th>可用库存</th><th>今日发放</th><th>今日发放金额</th><th>今日兑换</th><th>今日兑换金额</th></tr></thead><tbody>${(stats.byAmount||[]).map(r=>`<tr><td>¥${r.amount}</td><td>${r.available}</td><td>${r.issuedToday}</td><td>¥${r.issuedTodaySum}</td><td>${r.redeemedToday}</td><td>¥${r.redeemedTodaySum}</td></tr>`).join('')}</tbody></table></section>
+      <section class="card" style="margin-top:16px"><div class="card-head"><div><p class="eyebrow">TODAY BY USER</p><h2>今日按用户实扣</h2><p class="sub">只统计今天官方账本里记到该用户头上的实扣，用来对余额。管理员自己测的也会出现在这里，但不扣管理员余额。</p></div></div><table class="admin-table"><thead><tr><th>用户</th><th>请求数</th><th>官方成本</th><th>客户实扣</th></tr></thead><tbody>${(stats.chargedTodayByUser||[]).map(r=>`<tr><td>${esc(r.username||r.userId)}</td><td>${r.requests}</td><td>¥${Number(r.upstreamCost).toFixed(4)}</td><td>¥${Number(r.chargedAmount).toFixed(4)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">今日暂无客户实扣</td></tr>'}</tbody></table></section>
       <section class="card" style="margin-top:16px"><div class="card-head"><div><p class="eyebrow">UPSTREAM COST</p><h2>今日上游开销明细</h2><p class="sub">按渠道汇总当日 upstreamCost（优先上游返回实扣；否则为单价×token×渠道上游倍率，非 displayMultiplier）</p></div></div><table class="admin-table"><thead><tr><th>渠道</th><th>请求数</th><th>上游开销</th><th>客户实扣</th></tr></thead><tbody>${(stats.upstreamByProvider||[]).map(r=>`<tr><td>${esc(r.providerName||r.providerId)}</td><td>${r.requests}</td><td>¥${Number(r.upstreamCost).toFixed(4)}</td><td>¥${Number(r.chargedAmount).toFixed(4)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">今日暂无上游调用</td></tr>'}</tbody></table></section>`);
 
       document.getElementById('syncUpstreamBilling')?.addEventListener('click', async () => {

@@ -95,7 +95,7 @@ import {
   isPendingBillStatus
 } from './lib/billing-cost.js';
 import { applyLiveMoneyCharge, applyLiveMoneyRefund, settleRemainder, parkPendingHold, releasePendingHold, liveBillTarget, exactUserCharge, LIVE_POLL_INTERVAL_MS } from './lib/live-billing.js';
-import { applyUsagePricesToProviders } from './lib/calibrate-prices.js';
+import { applyUsagePricesToProviders, nextTokenPriceSyncAt, msUntilNextTokenPriceSync, TOKEN_PRICE_RETRY_MS, channelTokenPriceView } from './lib/token-price-sync.js';
 import { catalogPrice, channelFallbackPrice } from './lib/upstream-prices.js';
 import {
   upstreamUsageId,
@@ -580,6 +580,7 @@ function poolStats(db) {
     ? ledgerRows.map((bill) => ({
         createdAt: bill.createdAt,
         providerId: bill.providerId,
+        userId: bill.userId,
         providerName: (db.settings?.providers || []).find((p) => p.id === bill.providerId)?.name || bill.providerId,
         upstreamCost: bill.actualCost,
         chargedAmount: bill.chargedAmount,
@@ -587,12 +588,24 @@ function poolStats(db) {
         status: bill.status
       }))
     : (db.logs || []);
+  const chargedTodayByUser = {};
+  const userLabel = (uid) => {
+    const u = (db.users || []).find((x) => x.id === uid);
+    return u?.username || u?.name || uid || 'unknown';
+  };
   for (const log of costRows) {
     if (!log?.createdAt || localDay(new Date(log.createdAt)) !== day) continue;
     if (log.status === 'referral_rebate' || log.status === CHECKIN_LOG_STATUS) continue;
     requestCountToday += 1;
     const up = Number(log.upstreamCost || 0);
     const charged = Number(log.chargedAmount || 0);
+    const uid = log.userId || 'unknown';
+    if (!chargedTodayByUser[uid]) {
+      chargedTodayByUser[uid] = { userId: uid, username: userLabel(uid), upstreamCost: 0, chargedAmount: 0, requests: 0 };
+    }
+    chargedTodayByUser[uid].requests += 1;
+    if (Number.isFinite(up)) chargedTodayByUser[uid].upstreamCost += up;
+    if (Number.isFinite(charged) && charged > 0) chargedTodayByUser[uid].chargedAmount += charged;
     if (Number.isFinite(up)) {
       upstreamCostToday += up;
       const pid = log.providerId || 'unknown';
@@ -625,7 +638,14 @@ function poolStats(db) {
     upstreamCostIsEstimate: upstreamCostReportedCount === 0,
     upstreamLedgerRows: ledgerRows.length,
     upstreamUsageSync: db.settings?.upstreamUsageSync || null,
-    upstreamByProvider: Object.values(upstreamByProvider).sort((a, b) => b.upstreamCost - a.upstreamCost)
+    upstreamByProvider: Object.values(upstreamByProvider).sort((a, b) => b.upstreamCost - a.upstreamCost),
+    chargedTodayByUser: Object.values(chargedTodayByUser)
+      .map((row) => ({
+        ...row,
+        upstreamCost: Math.round(row.upstreamCost * 10000) / 10000,
+        chargedAmount: Math.round(row.chargedAmount * 10000) / 10000
+      }))
+      .sort((a, b) => b.chargedAmount - a.chargedAmount)
   };
 }
 
@@ -946,6 +966,32 @@ function ensureMeasuredPrices(db) {
     }
   }
   return changed;
+}
+
+/** Snap the old DeepSeek 0.003/0.009 table to live official 0.00015/0.0006. */
+function migrateDeepSeekLivePrices(db) {
+  const provider = (db.settings?.providers || []).find((p) => p.id === 'grp_deepseek');
+  if (!provider) return false;
+  const flash = catalogPrice('deepseek-v4-flash');
+  const pro = catalogPrice('deepseek-v4-pro');
+  if (!flash) return false;
+  provider.modelPrices = provider.modelPrices && typeof provider.modelPrices === 'object' ? provider.modelPrices : {};
+  const oldIn = Number(provider.modelPrices['deepseek-v4-flash']?.inputPricePer1K ?? provider.inputPricePer1K);
+  if (!(oldIn >= 0.002 && oldIn <= 0.004)) return false;
+  const nowIso = new Date().toISOString();
+  provider.modelPrices['deepseek-v4-flash'] = { ...flash, source: 'official_actual', calibratedAt: nowIso };
+  provider.modelPrices['deepseek-chat'] = { ...flash, source: 'official_actual', calibratedAt: nowIso };
+  if (pro) {
+    const proIn = Number(provider.modelPrices['deepseek-v4-pro']?.inputPricePer1K);
+    if (!proIn || proIn >= 0.005) {
+      provider.modelPrices['deepseek-v4-pro'] = { ...pro, source: 'official_actual', calibratedAt: nowIso };
+    }
+  }
+  provider.inputPricePer1K = flash.inputPricePer1K;
+  provider.outputPricePer1K = flash.outputPricePer1K;
+  provider.cacheReadPricePer1K = flash.cacheReadPricePer1K;
+  if (flash.cacheWritePricePer1K) provider.cacheWritePricePer1K = flash.cacheWritePricePer1K;
+  return true;
 }
 
 async function autofillVip1129GroupMap(db, token = null) {
@@ -1746,7 +1792,8 @@ function providerMultiplier(provider, db) {
   //   * settings.billingMultiplierVip1129 = vip1129 / Codex 直连中转 全局倍率（默认 1.5）
   // - 若 provider 为 vip1129（isVip1129Provider / upstreamSync==='vip1129' / url 含 vip1129）→ multiplierVip1129(db)
   // - 否则（beibeihai 及其他）→ multiplier(db)
-  // - 客户花销 = 上游成本(upstreamCost) × 对应上游全局倍率；绝不读 provider.billingMultiplier / displayMultiplier。
+  // - 客户花销 = 价格表 Token 成本 × 对应全局倍率；拉价失败时继续用上一份价格表。
+  // - 官方 actual_cost 只记入账本，不改写客户已扣金额。
   const url = String(provider?.url || '');
   if (typeof isVip1129Provider === 'function' && isVip1129Provider(provider)) return multiplierVip1129(db);
   if (provider?.upstreamSync === 'vip1129') return multiplierVip1129(db);
@@ -2010,6 +2057,9 @@ function publicProvider(provider) {
     inputPricePer1K: Number(provider.inputPricePer1K ?? provider.pricePer1K ?? 0),
     outputPricePer1K: Number(provider.outputPricePer1K ?? provider.pricePer1K ?? 0),
     cacheReadPricePer1K: Number(provider.cacheReadPricePer1K ?? ((Number(provider.inputPricePer1K ?? provider.pricePer1K ?? 0) || 0) * 0.1)),
+    inputPricePer1M: Number(provider.inputPricePer1K ?? provider.pricePer1K ?? 0) * 1000,
+    outputPricePer1M: Number(provider.outputPricePer1K ?? provider.pricePer1K ?? 0) * 1000,
+    tokenPriceTable: channelTokenPriceView(provider),
     upstreamRateMultiplier: providerUpstreamRate(provider),
     priority: Number(provider.priority ?? 100),
     billingMultiplier: (() => {
@@ -2237,6 +2287,135 @@ async function fetchUsageListForLookup(db, kind, query, { timeoutMs = 20000, cac
   return pending;
 }
 
+async function fetchUsageKindForPrices(db, kind) {
+  const auth = kind === 'vip1129' ? await ensureVip1129Token(db) : await ensureBeibeihaiToken(db);
+  if (!auth.ok) return { ok: false, rows: [], error: auth.error || 'login_failed' };
+  const fetchUsage = kind === 'vip1129' ? vip1129FetchUsage : beibeihaiFetchUsage;
+  const rows = [];
+  try {
+    for (let page = 1; page <= 4; page++) {
+      const parsed = await fetchUsage(auth.cfg.baseUrl, auth.token, `page=${page}&page_size=80`, { timeoutMs: 20000 });
+      if (!parsed?.ok) return { ok: false, rows, error: `usage_http_${parsed?.status || 'failed'}` };
+      const list = usageListFromPayload(parsed.data);
+      rows.push(...list);
+      if (!list.length || list.length < 80) break;
+    }
+    return { ok: true, rows };
+  } catch (err) {
+    return { ok: false, rows, error: err?.message || 'usage_fetch_failed' };
+  }
+}
+
+let tokenPriceSyncRunning = false;
+let tokenPriceRetryTimer = null;
+let tokenPriceSlotTimer = null;
+
+function tokenPriceSyncPublic(db) {
+  const rec = db.settings?.tokenPriceSync || {};
+  return {
+    running: tokenPriceSyncRunning,
+    lastRunAt: rec.lastRunAt || null,
+    lastOkAt: rec.lastOkAt || null,
+    nextAt: rec.nextAt || nextTokenPriceSyncAt().toISOString(),
+    failed: rec.failed || [],
+    retryAt: rec.retryAt || null,
+    message: tokenPriceSyncRunning
+      ? '正在拉取最新 Token 价格，扣费仍用上一份价格表'
+      : (rec.failed?.length ? '部分渠道未拉到新价，已沿用上一份价格表' : null)
+  };
+}
+
+async function runTokenPriceSync(db, { onlyIds = null, reason = 'manual' } = {}) {
+  if (tokenPriceSyncRunning) {
+    return { skipped: true, running: true, stats: tokenPriceSyncPublic(db) };
+  }
+  tokenPriceSyncRunning = true;
+  try {
+    const [vip, bei] = await Promise.all([
+      fetchUsageKindForPrices(db, 'vip1129'),
+      fetchUsageKindForPrices(db, 'beibeihai')
+    ]);
+    const fresh = readDb();
+    const applied = applyUsagePricesToProviders({
+      providers: fresh.settings?.providers || [],
+      users: fresh.users || [],
+      vipUsage: vip.rows,
+      beiUsage: bei.rows,
+      vipOk: vip.ok,
+      beiOk: bei.ok,
+      onlyIds
+    });
+    const failed = [
+      ...(vip.ok ? [] : [{ kind: 'vip1129', error: vip.error }]),
+      ...(bei.ok ? [] : [{ kind: 'beibeihai', error: bei.error }]),
+      ...applied.failedIds.map((id) => ({ id, error: 'kind_fetch_failed' }))
+    ];
+    const nowIso = new Date().toISOString();
+    const anyUpdated = applied.results.some((r) => r.ok && r.models?.length);
+    fresh.settings ??= {};
+    fresh.settings.tokenPriceSync = {
+      lastRunAt: nowIso,
+      lastOkAt: anyUpdated ? nowIso : (fresh.settings.tokenPriceSync?.lastOkAt || null),
+      nextAt: nextTokenPriceSyncAt().toISOString(),
+      failed,
+      retryAt: failed.length ? new Date(Date.now() + TOKEN_PRICE_RETRY_MS).toISOString() : null,
+      reason
+    };
+    writeDb(fresh);
+    replaceDbContents(db, fresh);
+    return {
+      skipped: false,
+      vipOk: vip.ok,
+      beiOk: bei.ok,
+      vipRows: vip.rows.length,
+      beiRows: bei.rows.length,
+      failedIds: applied.failedIds,
+      results: applied.results,
+      stats: tokenPriceSyncPublic(fresh)
+    };
+  } finally {
+    tokenPriceSyncRunning = false;
+  }
+}
+
+function armTokenPriceRetry(failedIds) {
+  if (tokenPriceRetryTimer) clearTimeout(tokenPriceRetryTimer);
+  const retryAll = failedIds == null;
+  if (!retryAll && !failedIds.length) return;
+  tokenPriceRetryTimer = setTimeout(() => {
+    tokenPriceRetryTimer = null;
+    const dbx = readDb();
+    runTokenPriceSync(dbx, retryAll ? { reason: 'retry-5m' } : { onlyIds: failedIds, reason: 'retry-5m' })
+      .then((out) => {
+        if (out.failedIds) console.log(`[prices] retry done, still failed ${out.failedIds.length}`);
+      })
+      .catch((err) => console.warn('[prices] retry failed, keeping last table:', err?.message || err));
+  }, TOKEN_PRICE_RETRY_MS);
+  if (typeof tokenPriceRetryTimer.unref === 'function') tokenPriceRetryTimer.unref();
+}
+
+function scheduleTokenPriceSyncJobs() {
+  const armSlot = () => {
+    if (tokenPriceSlotTimer) clearTimeout(tokenPriceSlotTimer);
+    const wait = msUntilNextTokenPriceSync();
+    tokenPriceSlotTimer = setTimeout(async () => {
+      try {
+        const dbx = readDb();
+        const out = await runTokenPriceSync(dbx, { reason: 'slot-12-24' });
+        if (out.failedIds?.length) armTokenPriceRetry(out.failedIds);
+        console.log(`[prices] scheduled sync: vip ${out.vipOk} (${out.vipRows}) bei ${out.beiOk} (${out.beiRows}) failed ${out.failedIds?.length || 0}`);
+      } catch (err) {
+        console.warn('[prices] scheduled sync failed, keeping last table:', err?.message || err);
+        armTokenPriceRetry(null);
+      } finally {
+        armSlot();
+      }
+    }, wait);
+    if (typeof tokenPriceSlotTimer.unref === 'function') tokenPriceSlotTimer.unref();
+  };
+  armSlot();
+}
+
 function occupiedUsageIds(db, exceptId = null) {
   const except = exceptId == null || exceptId === '' ? null : String(exceptId);
   const fromLogs = (db.logs || [])
@@ -2373,26 +2552,16 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
   const upstreamTokens = Math.max(0, Number(usage.total_tokens || ((usage.prompt_tokens || 0) + (usage.completion_tokens || 0))));
   const extraTokens = upstreamTokens * rate;
   const billedTokens = tokenReservation > 0 ? Math.min(extraTokens, tokenReservation) : extraTokens;
-  const allowEstimate = extras.allowEstimate != null ? extras.allowEstimate : allowEstimatedBilling(db);
-  const resolvedUp = resolveUpstreamCost(provider, usage, model, { allowEstimate });
-  const pending = resolvedUp.source === 'pending' && isPendingBillStatus(status);
-  const upstreamCost = pending ? 0 : resolvedUp.cost;
-  const upstreamCostSource = pending ? 'pending' : resolvedUp.source;
-  const floor = tokenFloorCost(provider, usage, model);
+  const tokenCost = tokenFloorCost(provider, usage, model);
+  const reported = extractReportedUpstreamCost(usage);
   const unlimited = isUnlimited(user);
-  let chargedAmount;
+  let chargedAmount = exactUserCharge(tokenCost, rate);
   let extraCharge;
-  if (pending) {
-    chargedAmount = liveBillTarget(0, floor, rate);
-    extraCharge = settleRemainder(chargedAmount, alreadyCharged);
-  } else {
-    chargedAmount = exactUserCharge(upstreamCost, rate);
-    if (!unlimited && alreadyCharged > chargedAmount + 1e-12) {
-      const refunded = applyLiveMoneyRefund(user, apiKeyRec, alreadyCharged - chargedAmount, unlimited);
-      alreadyCharged = Math.max(0, alreadyCharged - refunded);
-    }
-    extraCharge = settleRemainder(chargedAmount, alreadyCharged);
+  if (!unlimited && alreadyCharged > chargedAmount + 1e-12) {
+    const refunded = applyLiveMoneyRefund(user, apiKeyRec, alreadyCharged - chargedAmount, unlimited);
+    alreadyCharged = Math.max(0, alreadyCharged - refunded);
   }
+  extraCharge = settleRemainder(chargedAmount, alreadyCharged);
   user.reservedTokens = Math.max(0, (user.reservedTokens || 0) - tokenReservation);
   user.reservedBalance = Math.max(0, (user.reservedBalance || 0) - amountReservation);
   let collected = extraCharge;
@@ -2422,9 +2591,6 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
   }
   const collectedAmount = alreadyCharged + collected;
   const unpaidAmount = Math.max(0, chargedAmount - collectedAmount);
-  if (pending) {
-    parkPendingHold(user, apiKeyRec, unpaidAmount);
-  }
   if (!unlimited && unpaidAmount > 1e-12) {
     user.upstreamOutstandingAmount = Math.max(0, Number(user.upstreamOutstandingAmount) || 0) + unpaidAmount;
     user.accountActive = false;
@@ -2437,25 +2603,27 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
     providerId: provider.id,
     tokens: upstreamTokens,
     billedTokens,
-    upstreamCost,
-    upstreamCostSource,
-    chargedAmount: pending ? collectedAmount : chargedAmount,
+    tokenCost,
+    upstreamCost: reported != null ? reported : tokenCost,
+    upstreamCostSource: reported != null ? 'reported' : 'token_table',
+    chargedAmount,
     alreadyCharged: collectedAmount,
     collectedAmount,
     unpaidAmount,
-    holdAmount: pending ? unpaidAmount : 0,
-    pendingActual: pending,
+    holdAmount: 0,
+    pendingActual: false,
     multiplier: rate,
+    billingSource: 'token_table',
     upstreamUsageId: usage?.upstreamUsageId ?? null,
     upstreamApiKeyId: extras.upstreamApiKeyId || apiKeyRec?._usedUpstreamId || apiKeyRec?.upstream?.id || null,
     clientRequestId: extras.clientRequestId || usage?.clientRequestId || null,
     latency: Date.now() - started,
     startedAt: new Date(started).toISOString(),
-    status: pending ? 'pending_actual_cost' : status,
+    status: status || 'success',
     createdAt: new Date().toISOString()
   });
   db.logs = db.logs.slice(0, 3000);
-  return { billedTokens, chargedAmount: pending ? collectedAmount : chargedAmount, upstreamTokens, upstreamCost, upstreamCostSource, pending };
+  return { billedTokens, chargedAmount, upstreamTokens, upstreamCost: reported != null ? reported : tokenCost, upstreamCostSource: reported != null ? 'reported' : 'token_table', pending: false };
 }
 function releaseReserve(user, tokenReservation, amountReservation, apiKeyRec = null) {
   user.reservedTokens = Math.max(0, (user.reservedTokens || 0) - tokenReservation);
@@ -2476,6 +2644,7 @@ function startLiveBillSession({ db, user, provider, apiKeyRec, model, started, r
     ticking: false,
     finalized: false,
     tokenFloor: seedUsage ? tokenFloorCost(provider, seedUsage, model) : 0,
+    seedFloor: seedUsage ? tokenFloorCost(provider, seedUsage, model) : 0,
     clientRequestId: String(clientRequestId || '')
   };
   let persistTimer = null;
@@ -2517,10 +2686,10 @@ function startLiveBillSession({ db, user, provider, apiKeyRec, model, started, r
     const floor = tokenFloorCost(provider, usage, model);
     if (floor > state.tokenFloor) {
       state.tokenFloor = floor;
-      if (!state.stopped && !state.finalized) syncToTarget(state.lastCost, state.lastCost > 0);
+      if (!state.stopped && !state.finalized) syncToTarget(state.tokenFloor, true);
     }
   };
-  if (state.tokenFloor > 0) syncToTarget(0, false);
+  if (state.tokenFloor > 0) syncToTarget(state.tokenFloor, false);
   const tick = async () => {
     if (state.stopped || state.ticking) return;
     state.ticking = true;
@@ -2545,7 +2714,7 @@ function startLiveBillSession({ db, user, provider, apiKeyRec, model, started, r
         const floor = tokenFloorCost(provider, rowUsage, model);
         if (floor > state.tokenFloor) state.tokenFloor = floor;
       }
-      syncToTarget(state.lastCost, state.lastCost > 0);
+      syncToTarget(state.tokenFloor, true);
     } catch {
       /* ignore poll errors */
     } finally {
@@ -2561,6 +2730,30 @@ function startLiveBillSession({ db, user, provider, apiKeyRec, model, started, r
     stop() {
       state.stopped = true;
       clearInterval(timer);
+    },
+    async abandon({ releaseHold = false } = {}) {
+      this.stop();
+      if (state.finalized) return 0;
+      state.finalized = true;
+      if (persistTimer) {
+        clearTimeout(persistTimer);
+        persistTimer = null;
+      }
+      const refunded = applyLiveMoneyRefund(user, apiKeyRec, state.liveCharged, unlimited);
+      if (reservation && refunded > 0) {
+        reservation.amountReservation = (Number(reservation.amountReservation) || 0) + refunded;
+        user.reservedBalance = (Number(user.reservedBalance) || 0) + refunded;
+        if (apiKeyRec) apiKeyRec.reservedSpend = (Number(apiKeyRec.reservedSpend) || 0) + refunded;
+      }
+      state.liveCharged = 0;
+      if (releaseHold && reservation) {
+        const leftover = Math.max(0, Number(reservation.amountReservation) || 0);
+        user.reservedBalance = Math.max(0, (Number(user.reservedBalance) || 0) - leftover);
+        if (apiKeyRec) apiKeyRec.reservedSpend = Math.max(0, (Number(apiKeyRec.reservedSpend) || 0) - leftover);
+        reservation.amountReservation = 0;
+      }
+      writeDb(db);
+      return refunded;
     },
     async finalize(usage, status = 'success') {
       this.stop();
@@ -2592,9 +2785,9 @@ function startLiveBillSession({ db, user, provider, apiKeyRec, model, started, r
       if (state.lastCost > 0 && extractReportedUpstreamCost(billUsage) == null) {
         billUsage.actual_cost = state.lastCost;
       }
-      const actual = extractReportedUpstreamCost(billUsage) || 0;
-      if (actual > 0) state.lastCost = actual;
-      syncToTarget(state.lastCost, actual > 0);
+      const tokenCost = tokenFloorCost(provider, billUsage, model);
+      if (tokenCost > state.tokenFloor) state.tokenFloor = tokenCost;
+      syncToTarget(state.tokenFloor, true);
       const settleRate = providerMultiplier(provider, db);
       settleUsage(
         db, user, provider, billUsage, settleRate,
@@ -2713,6 +2906,37 @@ async function reconcilePendingActualCosts(db) {
     log.status = 'success';
     log.reconciledAt = new Date().toISOString();
     log.holdAmount = 0;
+    settled += 1;
+  }
+  const staleMs = 10 * 60 * 1000;
+  const now = Date.now();
+  for (const log of db.logs || []) {
+    if (!(log?.pendingActual === true || log?.status === 'pending_actual_cost')) continue;
+    if (log.upstreamUsageId != null) continue;
+    const at = Date.parse(log.createdAt || log.startedAt || '');
+    if (!Number.isFinite(at) || now - at < staleMs) continue;
+    const owner = (db.users || []).find((u) => u.id === log.userId);
+    if (!owner || isUnlimited(owner)) continue;
+    const apiKeyRec = log.apiKeyId
+      ? (owner.apiKeys || []).find((k) => k.id === log.apiKeyId)
+      : null;
+    const hold = Math.max(0, Number(log.holdAmount) || 0);
+    const collected = Math.max(0, Number(log.collectedAmount ?? log.alreadyCharged ?? log.chargedAmount) || 0);
+    releasePendingHold(owner, apiKeyRec, hold);
+    if (collected > 0) applyLiveMoneyRefund(owner, apiKeyRec, collected, false);
+    const oldOutstanding = Math.max(0, Number(log.unpaidAmount) || 0);
+    owner.upstreamOutstandingAmount = Math.max(0, (Number(owner.upstreamOutstandingAmount) || 0) - oldOutstanding);
+    log.status = 'hold_released';
+    log.pendingActual = false;
+    log.chargedAmount = 0;
+    log.collectedAmount = 0;
+    log.alreadyCharged = 0;
+    log.unpaidAmount = 0;
+    log.holdAmount = 0;
+    log.detail = {
+      ...(log.detail && typeof log.detail === 'object' ? log.detail : {}),
+      releasedBecause: 'stale_pending_without_official_bill'
+    };
     settled += 1;
   }
   return settled;
@@ -2853,9 +3077,17 @@ function repriceStoredUpstreamBills(db) {
     const log = logsById.get(bill.localLogId)
       || logsByUsage.get(`${bill.upstreamApiKeyId}:${bill.upstreamUsageId}`);
     if (!user || !key || !provider || !log) continue;
+    const tokenCost = Number(log.tokenCost);
+    if (!(tokenCost > 0)) continue;
     const rate = providerMultiplier(provider, db);
     const before = Number(log.chargedAmount) || 0;
-    bill.chargedAmount = settleImportedUpstreamBill(user, key, log, bill.actualCost, rate);
+    const official = Number(bill.actualCost);
+    bill.chargedAmount = settleImportedUpstreamBill(user, key, log, tokenCost, rate);
+    log.tokenCost = tokenCost;
+    if (Number.isFinite(official) && official > 0) {
+      log.upstreamCost = official;
+      log.upstreamCostSource = 'reported';
+    }
     bill.multiplier = rate;
     bill.collectedAmount = Number(log.collectedAmount) || 0;
     bill.unpaidAmount = Number(log.unpaidAmount) || 0;
@@ -2876,6 +3108,7 @@ function createImportedUpstreamLog(db, owner, row, bill) {
     providerName: owner.provider.name || owner.provider.id,
     tokens: tokens.totalTokens,
     billedTokens: tokens.totalTokens * rate,
+    tokenCost: 0,
     upstreamCost: 0,
     upstreamCostSource: 'reported',
     chargedAmount: 0,
@@ -2893,7 +3126,16 @@ function createImportedUpstreamLog(db, owner, row, bill) {
     detail: { source: 'upstream_usage_sync', upstreamBillId: bill.id },
     createdAt: bill.createdAt || new Date().toISOString()
   };
-  settleImportedUpstreamBill(owner.user, owner.key, log, bill.actualCost, rate);
+  const tokenCost = tokenFloorCost(owner.provider, {
+    prompt_tokens: tokens.promptTokens,
+    completion_tokens: tokens.completionTokens,
+    cache_read_tokens: tokens.cacheReadTokens
+  }, log.model);
+  settleImportedUpstreamBill(owner.user, owner.key, log, tokenCost, rate);
+  log.tokenCost = tokenCost;
+  log.upstreamCost = Number(bill.actualCost) || tokenCost;
+  log.upstreamCostSource = 'reported';
+  log.billingSource = 'token_table';
   owner.user.usedTokens = (Number(owner.user.usedTokens) || 0) + log.billedTokens;
   owner.key.tokenUsed = (Number(owner.key.tokenUsed) || 0) + log.billedTokens;
   if (!isUnlimited(owner.user) && isNearlyEmptyBalance(owner.user, owner.provider, rate, log.model)) {
@@ -2947,7 +3189,21 @@ function settlePendingLogFromUpstreamBill(db, owner, log, row, bill) {
   log.tokens = tokenCounts.totalTokens;
   log.billedTokens = tokenCounts.totalTokens * rate;
   log.multiplier = rate;
-  settleImportedUpstreamBill(owner.user, owner.key, log, bill.actualCost, rate);
+  const tokenCost = Number(log.tokenCost) > 0
+    ? Number(log.tokenCost)
+    : tokenFloorCost(owner.provider, {
+      prompt_tokens: tokenCounts.promptTokens,
+      completion_tokens: tokenCounts.completionTokens,
+      cache_read_tokens: tokenCounts.cacheReadTokens
+    }, log.model);
+  if (!(Number(log.chargedAmount) > 0) && tokenCost > 0) {
+    settleImportedUpstreamBill(owner.user, owner.key, log, tokenCost, rate);
+    log.tokenCost = tokenCost;
+  }
+  log.upstreamCost = bill.actualCost;
+  log.upstreamCostSource = 'reported';
+  log.pendingActual = false;
+  log.holdAmount = 0;
   const tokenDelta = log.billedTokens - previousBilled;
   owner.user.usedTokens = Math.max(0, (Number(owner.user.usedTokens) || 0) + tokenDelta);
   owner.key.tokenUsed = Math.max(0, (Number(owner.key.tokenUsed) || 0) + tokenDelta);
@@ -3082,9 +3338,12 @@ async function reconcileUpstreamUsageLedger(db, { fullBackfill = false } = {}) {
           if (log.pendingActual === true || Number(log.holdAmount) > 0) {
             releasePendingHold(owner.user, owner.key, Math.max(0, Number(log.holdAmount) || 0));
           }
-          const rate = ledgerRateForLog(db, owner, log);
-          bill.chargedAmount = settleImportedUpstreamBill(owner.user, owner.key, log, actualCost, rate);
-          bill.multiplier = rate;
+          log.upstreamCost = actualCost;
+          log.upstreamCostSource = 'reported';
+          log.pendingActual = false;
+          log.holdAmount = 0;
+          bill.chargedAmount = Number(log.chargedAmount) || 0;
+          bill.multiplier = Number(log.multiplier) || ledgerRateForLog(db, owner, log);
           bill.collectedAmount = Number(log.collectedAmount) || 0;
           bill.unpaidAmount = Number(log.unpaidAmount) || 0;
           result.linked += 1;
@@ -3675,6 +3934,7 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
   let lastError = null;
 
   for (const provider of candidates) {
+    let live = null;
     try {
       const upstreamPayload = { ...payload, stream: wantStream };
       const proxyKey = await ensureProxyApiKey(db, user, provider, apiKeyRec);
@@ -3709,7 +3969,7 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
 
       const settledModel = model || provider.defaultModel;
       const reservation = { tokenReservation, amountReservation };
-      const live = startLiveBillSession({
+      live = startLiveBillSession({
         db, user, provider, apiKeyRec, model: settledModel, started, rate, reservation,
         clientRequestId,
         seedUsage: { prompt_tokens: inputReserve },
@@ -3742,8 +4002,8 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
         updateProviderHealth(db, provider.id, false, 'invalid_json');
         writeDb(db);
         lastError = new Error('invalid_json');
-        await live.finalize({}, 'invalid_json');
-        return fail(res, 502, '模型服务暂时不可用，请稍后重试');
+        await live.abandon();
+        continue;
       }
 
       const usage = result.usage || {};
@@ -3766,6 +4026,9 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
       }
       return json(res, 200, masked);
     } catch (err) {
+      if (live) {
+        try { await live.abandon(); } catch { /* ignore */ }
+      }
       updateProviderHealth(db, provider.id, false, err?.message || 'fetch_failed');
       writeDb(db);
       lastError = err;
@@ -3814,7 +4077,12 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
     settled = true;
     aborted = true;
     try { abortHolder?.abort?.(); } catch { /* ignore */ }
-    Promise.resolve(billing.finalize(usage || {}, reason)).catch(() => {});
+    const hasOfficial = Number(billing.state?.lastCost) > 0
+      || Number(billing.state?.tokenFloor) > Number(billing.state?.seedFloor || 0) + 1e-12;
+    Promise.resolve(hasOfficial
+      ? billing.finalize(usage || {}, reason)
+      : billing.abandon({ releaseHold: true })
+    ).catch(() => {});
     try { res.end(); } catch { /* ignore */ }
   };
 
@@ -5384,6 +5652,7 @@ const server = http.createServer(async (req, res) => {
       allowEstimatedBilling: allowEstimatedBilling(db),
       defaultProviderId: db.settings.defaultProviderId || null,
       providers: (db.settings.providers || []).map(publicProvider),
+      tokenPriceSync: tokenPriceSyncPublic(db),
       healthSummary: (db.settings.providers || []).map(p => ({
         id: p.id,
         name: p.name,
@@ -5395,29 +5664,25 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && url.pathname === '/api/admin/providers/calibrate-prices') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
-    const [vipUsage, beiUsage] = await Promise.all([
-      fetchUsageListForLookup(db, 'vip1129', 'page=1&page_size=80', { timeoutMs: 15000 }).catch(() => []),
-      fetchUsageListForLookup(db, 'beibeihai', 'page=1&page_size=80', { timeoutMs: 15000 }).catch(() => [])
-    ]);
-    const extraVip = await fetchUsageListForLookup(db, 'vip1129', 'page=2&page_size=80', { timeoutMs: 15000 }).catch(() => []);
-    const extraBei = await fetchUsageListForLookup(db, 'beibeihai', 'page=2&page_size=80', { timeoutMs: 15000 }).catch(() => []);
-    const results = applyUsagePricesToProviders({
-      providers: db.settings.providers || [],
-      users: db.users || [],
-      vipUsage: [...(vipUsage || []), ...(extraVip || [])],
-      beiUsage: [...(beiUsage || []), ...(extraBei || [])]
-    });
-    audit(db, {
+    const out = await runTokenPriceSync(db, { reason: 'manual' });
+    if (out.skipped) return json(res, 409, { error: '价格表正在更新，请稍候。扣费仍用上一份价格表', syncing: true, stats: out.stats });
+    if (out.failedIds?.length) armTokenPriceRetry(out.failedIds);
+    const latest = readDb();
+    audit(latest, {
       actorId: user.id,
       action: 'providers.calibrate-prices',
       target: 'modelPrices',
-      detail: { groups: results.length, vipRows: (vipUsage || []).length + (extraVip || []).length, beiRows: (beiUsage || []).length + (extraBei || []).length }
+      detail: { groups: out.results?.length || 0, vipRows: out.vipRows, beiRows: out.beiRows, failed: out.failedIds }
     });
-    writeDb(db);
+    writeDb(latest);
     return json(res, 200, {
-      results,
-      providers: (db.settings.providers || []).map(publicProvider),
-      message: '已按账单校准各渠道组模型单价（元/1K）'
+      results: out.results,
+      failedIds: out.failedIds,
+      tokenPriceSync: tokenPriceSyncPublic(latest),
+      providers: (latest.settings.providers || []).map(publicProvider),
+      message: out.failedIds?.length
+        ? '已更新能拉到的渠道；失败渠道仍沿用上一份价格表，5 分钟后重试'
+        : '已按最新账单回填 Token 价格表（100万 Token = 单价/1K × 1000）'
     });
   }
 
@@ -5558,6 +5823,52 @@ const server = http.createServer(async (req, res) => {
       users = users.filter(u => [u.username, u.name, u.email, u.id].some(x => String(x || '').toLowerCase().includes(q)));
     }
     return json(res, 200, { users, total: db.users.length });
+  }
+
+  if (req.method === 'GET' && url.pathname.startsWith('/api/admin/users/')) {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const targetId = decodeURIComponent(url.pathname.slice('/api/admin/users/'.length));
+    if (!targetId) return fail(res, 400, '缺少用户 ID');
+    const target = db.users.find(x => x.id === targetId);
+    if (!target) return fail(res, 404, '用户不存在');
+    const day = localDay();
+    const logs = (db.logs || []).filter((log) => log?.userId === target.id);
+    const todayLogs = logs.filter((log) => log?.createdAt && localDay(new Date(log.createdAt)) === day);
+    const bills = (db.upstreamBills || []).filter((bill) => bill?.userId === target.id);
+    const todayBills = bills.filter((bill) => bill?.createdAt && localDay(new Date(bill.createdAt)) === day);
+    const sum = (rows, key) => rows.reduce((s, row) => s + (Number(row?.[key]) || 0), 0);
+    const compactLog = (log) => ({
+      id: log.id,
+      at: log.createdAt,
+      model: log.model,
+      status: log.status,
+      pending: !!log.pendingActual,
+      tokens: Number(log.tokens) || 0,
+      upstreamCost: Number(log.upstreamCost) || 0,
+      chargedAmount: Number(log.chargedAmount) || 0,
+      collectedAmount: Number(log.collectedAmount ?? log.alreadyCharged ?? log.chargedAmount) || 0,
+      multiplier: Number(log.multiplier) || 0,
+      upstreamUsageId: log.upstreamUsageId || null
+    });
+    return json(res, 200, {
+      user: {
+        ...adminUserView(target),
+        reservedBalance: Number(target.reservedBalance) || 0,
+        pendingActualHold: Number(target.pendingActualHold) || 0,
+        upstreamOutstandingAmount: Number(target.upstreamOutstandingAmount) || 0
+      },
+      today: {
+        day,
+        logCount: todayLogs.length,
+        billCount: todayBills.length,
+        logCharged: Math.round(sum(todayLogs, 'chargedAmount') * 10000) / 10000,
+        logCollected: Math.round(sum(todayLogs, 'collectedAmount') * 10000) / 10000,
+        billUpstream: Math.round(sum(todayBills, 'actualCost') * 10000) / 10000,
+        billCharged: Math.round(sum(todayBills, 'chargedAmount') * 10000) / 10000
+      },
+      pendingLogs: logs.filter((log) => log.pendingActual || log.status === 'pending_actual_cost').slice(0, 50).map(compactLog),
+      recentLogs: logs.slice(0, 40).map(compactLog)
+    });
   }
 
   if (req.method === 'PUT' && url.pathname.startsWith('/api/admin/users/')) {
@@ -5848,6 +6159,7 @@ const server = http.createServer(async (req, res) => {
     let lastError = null;
 
     for (const provider of candidates) {
+      let live = null;
       try {
         const proxyKey = await ensureProxyApiKey(db, user, provider, apiKeyRec);
         if (!proxyKey) {
@@ -5869,7 +6181,7 @@ const server = http.createServer(async (req, res) => {
         writeDb(db);
 
         const reservation = { tokenReservation, amountReservation };
-        const live = startLiveBillSession({
+        live = startLiveBillSession({
           db, user, provider, apiKeyRec, model, started, rate, reservation,
           clientRequestId,
           seedUsage: { prompt_tokens: inputReserve },
@@ -5890,7 +6202,12 @@ const server = http.createServer(async (req, res) => {
             if (settled) return;
             settled = true;
             try { abortHolder.abort?.(); } catch { /* ignore */ }
-            Promise.resolve(live.finalize(normalizeAnthropicUsage(usageAcc), reason)).catch(() => {});
+            const hasOfficial = Number(live.state?.lastCost) > 0
+              || Number(live.state?.tokenFloor) > Number(live.state?.seedFloor || 0) + 1e-12;
+            Promise.resolve(hasOfficial
+              ? live.finalize(normalizeAnthropicUsage(usageAcc), reason)
+              : live.abandon({ releaseHold: true })
+            ).catch(() => {});
             try { res.end(); } catch { /* ignore */ }
           };
           req.on('close', () => { if (!settled) cleanup('client_abort'); });
@@ -5951,12 +6268,12 @@ const server = http.createServer(async (req, res) => {
         let result;
         try { result = JSON.parse(text); } catch {
           lastError = new Error('invalid_json');
-          live.stop();
+          await live.abandon();
           continue;
         }
         if (result && (result.type === 'error' || result.error)) {
           lastError = new Error(result.error?.message || result.message || 'anthropic_error');
-          live.stop();
+          await live.abandon();
           continue;
         }
         const usage = normalizeAnthropicUsage(result.usage || {});
@@ -5964,6 +6281,9 @@ const server = http.createServer(async (req, res) => {
         await live.finalize(usage, 'success');
         return json(res, 200, result);
       } catch (err) {
+        if (live) {
+          try { await live.abandon(); } catch { /* ignore */ }
+        }
         lastError = err;
         continue;
       }
@@ -6102,6 +6422,7 @@ const server = http.createServer(async (req, res) => {
     let lastError = null;
 
     for (const provider of candidates) {
+      let live = null;
       try {
         const proxyKey = await ensureProxyApiKey(db, user, provider, apiKeyRec);
         if (!proxyKey) {
@@ -6124,7 +6445,7 @@ const server = http.createServer(async (req, res) => {
         writeDb(db);
 
         const reservation = { tokenReservation, amountReservation };
-        const live = startLiveBillSession({
+        live = startLiveBillSession({
           db, user, provider, apiKeyRec, model, started, rate, reservation,
           clientRequestId,
           seedUsage: { prompt_tokens: inputReserve },
@@ -6145,7 +6466,12 @@ const server = http.createServer(async (req, res) => {
             if (settled) return;
             settled = true;
             try { abortHolder.abort?.(); } catch { /* ignore */ }
-            Promise.resolve(live.finalize(usage || {}, reason)).catch(() => {});
+            const hasOfficial = Number(live.state?.lastCost) > 0
+              || Number(live.state?.tokenFloor) > Number(live.state?.seedFloor || 0) + 1e-12;
+            Promise.resolve(hasOfficial
+              ? live.finalize(usage || {}, reason)
+              : live.abandon({ releaseHold: true })
+            ).catch(() => {});
             try { res.end(); } catch { /* ignore */ }
           };
           req.on('close', () => { if (!settled) cleanup('client_abort'); });
@@ -6222,7 +6548,7 @@ const server = http.createServer(async (req, res) => {
         let result;
         try { result = JSON.parse(text); } catch {
           lastError = new Error('invalid_json');
-          live.stop();
+          await live.abandon();
           continue;
         }
         const usage = normalizeResponsesUsage(result.usage || {});
@@ -6230,6 +6556,9 @@ const server = http.createServer(async (req, res) => {
         await live.finalize(usage, 'success');
         return json(res, 200, result);
       } catch (err) {
+        if (live) {
+          try { await live.abandon(); } catch { /* ignore */ }
+        }
         lastError = err;
         continue;
       }
@@ -6389,6 +6718,7 @@ for (const provider of initial.settings.providers) {
   }
 }
 ensureMeasuredPrices(initial);
+if (migrateDeepSeekLivePrices(initial)) writeDb(initial);
 if (!initial.settings.providers.length && LEGACY_UPSTREAM.url && LEGACY_UPSTREAM.apiKey) {
   initial.settings.providers.push({
     id: 'primary',
@@ -6480,10 +6810,21 @@ if (process.env.RELAY_TEST_NO_LISTEN !== '1') {
         const bad = healthResults.filter(r => !r.ok);
         console.log(`Channel health probe: ${ok} ok, ${bad.length} down (of ${healthResults.length})`);
         for (const r of bad) console.warn(`  channel down ${r.name}: ${r.error}`);
+        try {
+          const priceDb = readDb();
+          const priceOut = await runTokenPriceSync(priceDb, { reason: 'boot' });
+          if (priceOut.failedIds?.length) armTokenPriceRetry(priceOut.failedIds);
+          console.log(`[prices] boot sync: vip ${priceOut.vipOk} (${priceOut.vipRows}) bei ${priceOut.beiOk} (${priceOut.beiRows}) failed ${priceOut.failedIds?.length || 0}`);
+        } catch (err) {
+          console.warn('[prices] boot sync failed, keeping last table:', err?.message || err);
+          armTokenPriceRetry(null);
+        }
       } catch (err) {
         console.error('Boot pool/model sync failed:', err);
       }
     });
+
+    scheduleTokenPriceSyncJobs();
 
     setInterval(async () => {
       if (periodicBillingSweepRunning || upstreamUsageSyncRunning) return;

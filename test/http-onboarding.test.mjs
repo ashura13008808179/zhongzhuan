@@ -147,6 +147,8 @@ try {
   assert.equal(pricing.status, 200);
   assert.equal(pricing.body.providers.length, alias.body.providers.length);
   assert.equal(pricing.body.multiplier, 2.5);
+  assert.equal(typeof pricing.body.tokenPriceSync, 'object');
+  assert.equal(pricing.body.tokenPriceSync.running, false);
 
   const upstreamLedgerSync = await req('/api/admin/upstream-billing/sync', {
     method: 'POST', headers: auth, body: JSON.stringify({ fullBackfill: false })
@@ -317,6 +319,16 @@ try {
   assert.equal(usersList.status, 200);
   assert.equal(usersList.body.users.length, 1);
   assert.equal(usersList.body.users[0].username, 'newbie01');
+
+  const userBillingGuest = await req(`/api/admin/users/${encodeURIComponent(newbieId)}`);
+  assert.equal(userBillingGuest.status, 403);
+  const userBilling = await req(`/api/admin/users/${encodeURIComponent(newbieId)}`, { headers: auth });
+  assert.equal(userBilling.status, 200, JSON.stringify(userBilling.body));
+  assert.equal(userBilling.body.user.username, 'newbie01');
+  assert.equal(userBilling.body.today.logCount, 0);
+  assert.equal(userBilling.body.today.billCharged, 0);
+  assert.ok(Array.isArray(userBilling.body.recentLogs));
+  assert.ok(Array.isArray(userBilling.body.pendingLogs));
 
   const addBal = await req(`/api/admin/users/${encodeURIComponent(newbieId)}`, {
     method: 'PUT', headers: auth, body: JSON.stringify({ balanceDelta: 5 })

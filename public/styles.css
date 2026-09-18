@@ -24,7 +24,7 @@
 .ghost-btn.danger{border-color:#5a3434;color:#f0a0a0}
 .provider-head-actions{display:flex;gap:8px;align-items:center}
 .model-prices{margin-top:8px}
-.model-price-head,.model-price-row{display:grid;grid-template-columns:1.4fr 1fr 1fr auto;gap:8px;align-items:center;margin-bottom:8px}
+.model-price-head,.model-price-row{display:grid;grid-template-columns:1.4fr .85fr .85fr .85fr .7fr .7fr auto;gap:8px;align-items:center;margin-bottom:8px}
 .model-price-head{font:9px 'DM Mono';color:#636e81;letter-spacing:1px}
 .tag.danger{color:#f0a0a0;background:#3a2424}
 .admin-table{width:100%;border-collapse:collapse}
