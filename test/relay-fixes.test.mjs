@@ -30,7 +30,12 @@ import {
   formatBillingMultiplier,
   DEFAULT_BILLING_MULTIPLIER,
   defaultDisplayMultiplier,
-  resolveDisplayMultiplier
+  resolveDisplayMultiplier,
+  applySyncedModels,
+  chatCandidatesForRequest,
+  filterModelsForProviderFamily,
+  pickSeededDefaultModel,
+  SEEDED_DEFAULT_MODELS
 } from '../lib/relay-core.js';
 
 const isVip1129 = (p) => p?.upstreamSync === 'vip1129' || String(p?.url || '').includes('vip1129.cc');
@@ -222,5 +227,29 @@ assert.equal(defaultDisplayMultiplier('grp_gpt_mix'), 0.05);
 assert.equal(resolveDisplayMultiplier({ id: 'grp_gpt_pro' }), 0.2);
 assert.equal(resolveDisplayMultiplier({ id: 'grp_gpt_pro', displayMultiplier: 0.2, billingMultiplier: 2.5 }), 0.2);
 assert.equal(resolveDisplayMultiplier({ id: 'grp_gpt_pro', displayMultiplier: 0.8 }), 0.8);
+
+const mixedModels = ['kimi-k3', 'glm-5.2', 'deepseek-chat', 'deepseek-v4-flash'];
+assert.deepEqual(filterModelsForProviderFamily({ id: 'grp_deepseek' }, mixedModels), ['deepseek-chat', 'deepseek-v4-flash']);
+assert.equal(pickSeededDefaultModel({ id: 'grp_deepseek' }, mixedModels, SEEDED_DEFAULT_MODELS.grp_deepseek), 'deepseek-chat');
+const ds = { id: 'grp_deepseek', defaultModel: 'kimi-k3', models: mixedModels };
+applySyncedModels(ds, mixedModels, 'deepseek-chat');
+assert.equal(ds.defaultModel, 'deepseek-chat');
+assert.ok(ds.models.every((m) => String(m).startsWith('deepseek')));
+assert.equal(ds.models.includes('kimi-k3'), false);
+
+const claudePinned = { id: 'grp_claude_kiro', defaultModel: 'claude-sonnet-4-5-20250929' };
+const awsCc = { id: 'grp_aws_cc', models: ['claude-sonnet-4-5-20250929'], priority: 210 };
+const routed = chatCandidatesForRequest({
+  providers: [claudePinned, awsCc],
+  model: 'claude-sonnet-4-5-20250929',
+  pinnedProvider: claudePinned,
+  allowCrossGroupFailover: false
+});
+assert.deepEqual(routed.map((p) => p.id), ['grp_claude_kiro']);
+const unknownRoute = chatCandidatesForRequest({
+  providers: [awsCc],
+  model: 'zz-unknown-model-xyz'
+});
+assert.deepEqual(unknownRoute, []);
 
 console.log('relay-fixes.test.mjs: all assertions passed');

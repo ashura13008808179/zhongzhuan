@@ -9,7 +9,13 @@ import {
   usageListFromPayload,
   pickUpstreamUsageRow,
   pickExclusiveUpstreamUsageRow,
-  findDuplicateUsageCharges
+  findDuplicateUsageCharges,
+  VIP1129_UPSTREAM_COST_DIVISOR,
+  providerUsesVip1129CostDivisor,
+  trueUpstreamCost,
+  isInvertedCharge,
+  accountingUpstreamCost,
+  applyTrueUpstreamCost
 } from '../lib/billing-cost.js';
 import { pricesFromUsageRows } from '../scripts/probe-upstream-prices.mjs';
 
@@ -323,5 +329,23 @@ assert.equal(dups.length, 1);
 assert.equal(dups[0].keep.id, 'a');
 assert.equal(dups[0].extras.length, 1);
 assert.equal(dups[0].extras[0].id, 'b');
+
+assert.equal(VIP1129_UPSTREAM_COST_DIVISOR, 7);
+const vipProvider = { id: 'grp_gpt_pro', upstreamSync: 'vip1129', url: 'https://api.vip1129.cc/v1/chat/completions' };
+const beiProvider = { id: 'grp_kimi', upstreamSync: 'beibeihai', url: 'https://sub.beibeihai.xyz/v1/chat/completions' };
+assert.equal(providerUsesVip1129CostDivisor(vipProvider), true);
+assert.equal(providerUsesVip1129CostDivisor(beiProvider), false);
+assert.equal(trueUpstreamCost(0.000588, vipProvider), 0.000588 / 7);
+assert.equal(trueUpstreamCost(0.01698245, beiProvider), 0.01698245);
+// charged ≈ 0.4 × reported VIP bill is profitable vs true cost (0.4 × 7 = 2.8×)
+assert.equal(isInvertedCharge(0.0002352, 0.000588, vipProvider), false);
+assert.equal(isInvertedCharge(0.00004, 0.000588, vipProvider), true);
+assert.equal(isInvertedCharge(0.02717192, 0.01698245, beiProvider), false);
+assert.equal(isInvertedCharge(0.01, 0.01698245, beiProvider), true);
+const marked = applyTrueUpstreamCost({}, 0.007, vipProvider);
+assert.equal(marked, 0.001);
+assert.equal(accountingUpstreamCost({ upstreamCost: 0.001, upstreamCostTrue: true, upstreamReportedCost: 0.007 }, vipProvider), 0.001);
+assert.equal(accountingUpstreamCost({ upstreamCost: 0.007 }, vipProvider), 0.001);
+assert.equal(accountingUpstreamCost({ actualCost: 0.007 }, vipProvider), 0.001);
 
 console.log('billing-cost.test.mjs: all assertions passed');

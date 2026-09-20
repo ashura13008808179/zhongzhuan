@@ -68,6 +68,10 @@ import {
   GPT_RELAY_GROUP_IDS,
   GPT_RELAY_PRIORITY,
   preferGptTerra,
+  applySyncedModels,
+  chatCandidatesForRequest,
+  SEEDED_DEFAULT_MODELS,
+  modelFamilyToken,
   resolveRecommendedModel,
   normalizeRecommendedModel,
   AVATAR_IDS,
@@ -92,7 +96,9 @@ import {
   tokenFloorCost,
   applyUpstreamUsageRow,
   allowEstimatedBilling,
-  isPendingBillStatus
+  isPendingBillStatus,
+  accountingUpstreamCost,
+  applyTrueUpstreamCost
 } from './lib/billing-cost.js';
 import { applyLiveMoneyCharge, applyLiveMoneyRefund, settleRemainder, parkPendingHold, releasePendingHold, liveBillTarget, exactUserCharge, LIVE_POLL_INTERVAL_MS } from './lib/live-billing.js';
 import { applyUsagePricesToProviders, nextTokenPriceSyncAt, msUntilNextTokenPriceSync, TOKEN_PRICE_RETRY_MS, channelTokenPriceView } from './lib/token-price-sync.js';
@@ -593,11 +599,16 @@ function poolStats(db) {
     const u = (db.users || []).find((x) => x.id === uid);
     return u?.username || u?.name || uid || 'unknown';
   };
+  const providerById = new Map((db.settings?.providers || []).map((p) => [p.id, p]));
+  let invertedCount = 0;
+  let invertedLossToday = 0;
   for (const log of costRows) {
     if (!log?.createdAt || localDay(new Date(log.createdAt)) !== day) continue;
     if (log.status === 'referral_rebate' || log.status === CHECKIN_LOG_STATUS) continue;
     requestCountToday += 1;
-    const up = Number(log.upstreamCost || 0);
+    const pid = log.providerId || 'unknown';
+    const provider = providerById.get(pid) || null;
+    const up = accountingUpstreamCost(log, provider);
     const charged = Number(log.chargedAmount || 0);
     const uid = log.userId || 'unknown';
     if (!chargedTodayByUser[uid]) {
@@ -608,11 +619,14 @@ function poolStats(db) {
     if (Number.isFinite(charged) && charged > 0) chargedTodayByUser[uid].chargedAmount += charged;
     if (Number.isFinite(up)) {
       upstreamCostToday += up;
-      const pid = log.providerId || 'unknown';
-      if (!upstreamByProvider[pid]) upstreamByProvider[pid] = { providerId: pid, providerName: log.providerName || pid, upstreamCost: 0, chargedAmount: 0, requests: 0 };
+      if (!upstreamByProvider[pid]) upstreamByProvider[pid] = { providerId: pid, providerName: log.providerName || provider?.name || pid, upstreamCost: 0, chargedAmount: 0, requests: 0 };
       upstreamByProvider[pid].upstreamCost += up;
       upstreamByProvider[pid].chargedAmount += Number.isFinite(charged) ? charged : 0;
       upstreamByProvider[pid].requests += 1;
+    }
+    if (up > 0 && Number.isFinite(charged) && charged + 1e-12 < up) {
+      invertedCount += 1;
+      invertedLossToday += Math.max(0, up - charged);
     }
     if (log.upstreamCostSource === 'reported') upstreamCostReportedCount += 1;
     else if (Number.isFinite(up) && up > 0) upstreamCostEstimatedCount += 1;
@@ -645,7 +659,9 @@ function poolStats(db) {
         upstreamCost: Math.round(row.upstreamCost * 10000) / 10000,
         chargedAmount: Math.round(row.chargedAmount * 10000) / 10000
       }))
-      .sort((a, b) => b.chargedAmount - a.chargedAmount)
+      .sort((a, b) => b.chargedAmount - a.chargedAmount),
+    invertedCount,
+    invertedLossToday: Math.round(invertedLossToday * 10000) / 10000
   };
 }
 
@@ -745,15 +761,9 @@ function resolveGroupModels(db, groupId) {
 function snapProviderDefaultModel(provider) {
   if (!provider) return false;
   const before = `${provider.defaultModel}|${(provider.models || []).join(',')}|${provider.priority}`;
+  const seed = SEEDED_DEFAULT_MODELS[provider.id] || provider.defaultModel || '';
+  applySyncedModels(provider, provider.models, seed);
   preferGptTerra(provider);
-  const models = [...new Set((provider.models || []).map((m) => String(m).trim()).filter(Boolean))];
-  if (models.length) {
-    const cur = String(provider.defaultModel || '').trim();
-    if (!cur || !models.includes(cur)) {
-      provider.defaultModel = models[0];
-      preferGptTerra(provider);
-    }
-  }
   return `${provider.defaultModel}|${(provider.models || []).join(',')}|${provider.priority}` !== before;
 }
 
@@ -774,20 +784,29 @@ function keyAllowsModel(db, apiKeyRec, model) {
   return allowed.includes(want);
 }
 
+function catalogHasModel(db, model) {
+  const want = String(model || '').trim();
+  if (!want) return false;
+  if (catalogModels(db).includes(want)) return true;
+  return (db.settings?.providers || []).some((p) => {
+    if (p?.enabled === false) return false;
+    if (String(p.defaultModel || '').trim() === want) return true;
+    return Array.isArray(p.models) && p.models.includes(want);
+  });
+}
+
 function resolveAuthorizedModel(db, apiKeyRec, requested, provider) {
   const allowed = allowedModelsForKey(db, apiKeyRec);
   const req = String(requested || '').trim();
   const def = String(provider?.defaultModel || '').trim();
   if (req) {
+    if (!catalogHasModel(db, req)) return { ok: false, model: req, reason: 'unknown_model' };
     if (keyAllowsModel(db, apiKeyRec, req)) return { ok: true, model: req };
-    if (req === def && allowed[0]) return { ok: true, model: allowed[0] };
-    const listed = (db.settings?.providers || []).some((p) => Array.isArray(p.models) && p.models.includes(req));
-    if (!listed && allowed[0]) return { ok: true, model: allowed[0] };
-    return { ok: false, model: req };
+    return { ok: false, model: req, reason: 'unauthorized' };
   }
   if (def && keyAllowsModel(db, apiKeyRec, def)) return { ok: true, model: def };
   if (allowed[0]) return { ok: true, model: allowed[0] };
-  return { ok: false, model: def };
+  return { ok: false, model: def, reason: 'unknown_model' };
 }
 
 
@@ -1563,25 +1582,13 @@ function ensureDefaultModelGroups(db) {
   return added;
 }
 
-function modelFamilyToken(name) {
-  return String(name || '').toLowerCase().split(/[-_./]/)[0];
-}
-
 function repairSeededDefaultModels(db) {
   let changed = false;
   const providers = db.settings?.providers || [];
   for (const g of DEFAULT_MODEL_GROUPS) {
     const p = providers.find(x => x && x.id === g.id);
     if (!p || !g.defaultModel) continue;
-    const current = String(p.defaultModel || '').trim();
-    const seed = String(g.defaultModel).trim();
-    const models = (p.models || []).map((m) => String(m).trim()).filter(Boolean);
-    const curTok = modelFamilyToken(current);
-    const seedTok = modelFamilyToken(seed);
-    if (!current || (curTok && seedTok && curTok !== seedTok)) {
-      p.defaultModel = models.includes(seed) ? seed : (models[0] || seed);
-      changed = true;
-    }
+    if (applySyncedModels(p, p.models, g.defaultModel)) changed = true;
   }
   for (const p of providers) {
     if (snapProviderDefaultModel(p)) changed = true;
@@ -1859,6 +1866,62 @@ function modelsEndpointFromChatUrl(url) {
   return `${raw}/models`;
 }
 
+function filesEndpointFromChatUrl(url, extraPath = '') {
+  const raw = String(url || '').trim().replace(/\/+$/, '');
+  if (!raw) return '';
+  let base = '';
+  if (/\/chat\/completions$/i.test(raw)) base = raw.replace(/\/chat\/completions$/i, '/files');
+  else if (/\/messages$/i.test(raw)) base = raw.replace(/\/messages$/i, '/files');
+  else if (/\/v1$/i.test(raw)) base = `${raw}/files`;
+  else {
+    const v1 = raw.indexOf('/v1/');
+    base = v1 >= 0 ? `${raw.slice(0, v1 + 3)}/files` : `${raw}/files`;
+  }
+  const extra = String(extraPath || '').replace(/^\/+/, '');
+  return extra ? `${base}/${extra}` : base;
+}
+
+const MAX_FILE_UPLOAD_BODY = Math.max(MAX_UPLOAD_BODY, 32 * 1024 * 1024);
+
+async function readRawBody(req, maxBytes = MAX_FILE_UPLOAD_BODY) {
+  const len = Number(req.headers['content-length']);
+  if (Number.isFinite(len) && len > maxBytes) {
+    const err = new Error('payload_too_large');
+    err.code = 'PAYLOAD_TOO_LARGE';
+    throw err;
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > maxBytes) {
+      req.destroy();
+      const err = new Error('payload_too_large');
+      err.code = 'PAYLOAD_TOO_LARGE';
+      throw err;
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, size);
+}
+
+function guessUploadFilename(contentType, raw) {
+  const header = String(contentType || '');
+  const text = raw && raw.length < 64 * 1024 ? raw.toString('utf8') : raw ? raw.subarray(0, 4096).toString('utf8') : '';
+  const fromDisp = text.match(/filename\*?=(?:UTF-8''|")?([^\r\n";]+)/i);
+  if (fromDisp) {
+    try { return decodeURIComponent(fromDisp[1].replace(/"/g, '').trim()); } catch { return fromDisp[1].replace(/"/g, '').trim(); }
+  }
+  if (/json/i.test(header)) {
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed?.filename) return String(parsed.filename);
+      if (parsed?.file?.filename) return String(parsed.file.filename);
+    } catch { /* ignore */ }
+  }
+  return 'upload.bin';
+}
+
 async function fetchUpstreamModels(provider, overrideApiKey = null) {
   const apiKey = String(overrideApiKey || provider?.apiKey || '').trim();
   if (!provider?.url || !apiKey) {
@@ -1951,15 +2014,12 @@ async function syncAllUpstreamModels(db, { onlyStaleMs = 0, ids = null } = {}) {
     try {
       const bearer = await ensureUpstreamProbeKey(db, provider);
       const { endpoint, models } = await fetchUpstreamModelsRetry(db, provider, bearer);
-      provider.models = models;
+      const seed = SEEDED_DEFAULT_MODELS[provider.id] || DEFAULT_MODEL_GROUPS.find((g) => g.id === provider.id)?.defaultModel || provider.defaultModel;
+      applySyncedModels(provider, models, seed);
       snapProviderDefaultModel(provider);
-      if (!provider.defaultModel || !models.includes(provider.defaultModel)) {
-        provider.defaultModel = models[0];
-        preferGptTerra(provider);
-      }
       provider.modelsSyncedAt = new Date().toISOString();
       provider.modelsSource = endpoint;
-      results.push({ id: provider.id, name: provider.name, ok: true, count: models.length, endpoint });
+      results.push({ id: provider.id, name: provider.name, ok: true, count: (provider.models || []).length, endpoint });
     } catch (err) {
       results.push({ id: provider.id, name: provider.name, ok: false, error: err.message || String(err) });
     }
@@ -1974,18 +2034,21 @@ function providers(db) {
 }
 function providersForModel(payload, db) {
   const list = providers(db);
-  const model = String(payload.model || '');
-  // Exact model match only. Empty models[] must NOT match every request (e.g. Cursor pool).
-  const exact = list
-    .filter(p => Array.isArray(p.models) && p.models.length && p.models.includes(model))
-    .sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100));
-  if (exact.length) return exact;
-  if (!model) {
-    const any = list.slice().sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100));
-    if (any.length) return any;
+  const model = String(payload.model || '').trim();
+  return chatCandidatesForRequest({ providers: list, model, pinnedProvider: null, allowCrossGroupFailover: false });
+}
+function pinnedProviderForKey(db, apiKeyRec) {
+  if (!apiKeyRec?.groupId) return null;
+  return (db.settings?.providers || []).find((p) => p.id === apiKeyRec.groupId && p.enabled !== false && !isMaintenanceProvider(p)) || null;
+}
+function failIfModelUnauthorized(res, authorized) {
+  if (!authorized || authorized.ok) return false;
+  if (authorized.reason === 'unknown_model') {
+    fail(res, 404, `未知模型：${authorized.model || '（空）'}`, { code: 'model_not_found' });
+    return true;
   }
-  const fallback = list.find(p => p.id === db.settings.defaultProviderId) || list[0];
-  return fallback ? [fallback] : [];
+  fail(res, 400, '该密钥未授权使用此模型', { code: 'model_not_allowed' });
+  return true;
 }
 function providerFor(payload, db) {
   return providersForModel(payload, db)[0] || null;
@@ -2154,16 +2217,12 @@ async function probeProviderHealth(db, provider) {
     provider.health.probe = 'models';
     provider.health.endpoint = endpoint;
     provider.health.modelCount = models.length;
-    // 探测成功时顺带刷新模型列表，保持与上游一致
-    provider.models = models;
+    const seed = SEEDED_DEFAULT_MODELS[provider.id] || DEFAULT_MODEL_GROUPS.find((g) => g.id === provider.id)?.defaultModel || provider.defaultModel;
+    applySyncedModels(provider, models, seed);
     snapProviderDefaultModel(provider);
-    if (!provider.defaultModel) {
-      provider.defaultModel = models[0];
-      preferGptTerra(provider);
-    }
     provider.modelsSyncedAt = new Date().toISOString();
     provider.modelsSource = endpoint;
-    return { id: provider.id, name: provider.name, ok: true, count: models.length, endpoint };
+    return { id: provider.id, name: provider.name, ok: true, count: (provider.models || []).length, endpoint };
   } catch (err) {
     updateProviderHealth(db, provider.id, false, err.message || String(err));
     return { id: provider.id, name: provider.name, ok: false, error: err.message || String(err) };
@@ -2595,12 +2654,13 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
     user.upstreamOutstandingAmount = Math.max(0, Number(user.upstreamOutstandingAmount) || 0) + unpaidAmount;
     user.accountActive = false;
   }
-  db.logs.unshift({
+  const logRow = {
     id: id('log'),
     userId: user.id,
     apiKeyId: apiKeyRec?.id || null,
     model,
     providerId: provider.id,
+    providerName: provider.name || provider.id,
     tokens: upstreamTokens,
     billedTokens,
     tokenCost,
@@ -2621,9 +2681,12 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
     startedAt: new Date(started).toISOString(),
     status: status || 'success',
     createdAt: new Date().toISOString()
-  });
+  };
+  if (reported != null) applyTrueUpstreamCost(logRow, reported, provider);
+  else logRow.upstreamCost = tokenCost;
+  db.logs.unshift(logRow);
   db.logs = db.logs.slice(0, 3000);
-  return { billedTokens, chargedAmount, upstreamTokens, upstreamCost: reported != null ? reported : tokenCost, upstreamCostSource: reported != null ? 'reported' : 'token_table', pending: false };
+  return { billedTokens, chargedAmount, upstreamTokens, upstreamCost: logRow.upstreamCost, upstreamCostSource: logRow.upstreamCostSource, pending: false };
 }
 function releaseReserve(user, tokenReservation, amountReservation, apiKeyRec = null) {
   user.reservedTokens = Math.max(0, (user.reservedTokens || 0) - tokenReservation);
@@ -2895,7 +2958,7 @@ async function reconcilePendingActualCosts(db) {
     user.upstreamOutstandingAmount = Math.max(0,
       (Number(user.upstreamOutstandingAmount) || 0) - oldOutstanding + unpaidAmount);
     if (!isUnlimited(user) && unpaidAmount > 1e-12) user.accountActive = false;
-    log.upstreamCost = cost;
+    applyTrueUpstreamCost(log, cost, provider);
     log.upstreamCostSource = 'reported';
     log.chargedAmount = chargedAmount;
     log.alreadyCharged = collectedAmount;
@@ -3085,7 +3148,7 @@ function repriceStoredUpstreamBills(db) {
     bill.chargedAmount = settleImportedUpstreamBill(user, key, log, tokenCost, rate);
     log.tokenCost = tokenCost;
     if (Number.isFinite(official) && official > 0) {
-      log.upstreamCost = official;
+      applyTrueUpstreamCost(log, official, provider);
       log.upstreamCostSource = 'reported';
     }
     bill.multiplier = rate;
@@ -3133,7 +3196,8 @@ function createImportedUpstreamLog(db, owner, row, bill) {
   }, log.model);
   settleImportedUpstreamBill(owner.user, owner.key, log, tokenCost, rate);
   log.tokenCost = tokenCost;
-  log.upstreamCost = Number(bill.actualCost) || tokenCost;
+  applyTrueUpstreamCost(log, Number(bill.actualCost) || tokenCost, owner.provider);
+  if (!(Number(bill.actualCost) > 0)) log.upstreamCost = tokenCost;
   log.upstreamCostSource = 'reported';
   log.billingSource = 'token_table';
   owner.user.usedTokens = (Number(owner.user.usedTokens) || 0) + log.billedTokens;
@@ -3200,7 +3264,7 @@ function settlePendingLogFromUpstreamBill(db, owner, log, row, bill) {
     settleImportedUpstreamBill(owner.user, owner.key, log, tokenCost, rate);
     log.tokenCost = tokenCost;
   }
-  log.upstreamCost = bill.actualCost;
+  applyTrueUpstreamCost(log, bill.actualCost, owner.provider);
   log.upstreamCostSource = 'reported';
   log.pendingActual = false;
   log.holdAmount = 0;
@@ -3338,7 +3402,7 @@ async function reconcileUpstreamUsageLedger(db, { fullBackfill = false } = {}) {
           if (log.pendingActual === true || Number(log.holdAmount) > 0) {
             releasePendingHold(owner.user, owner.key, Math.max(0, Number(log.holdAmount) || 0));
           }
-          log.upstreamCost = actualCost;
+          applyTrueUpstreamCost(log, actualCost, owner.provider);
           log.upstreamCostSource = 'reported';
           log.pendingActual = false;
           log.holdAmount = 0;
@@ -3840,23 +3904,24 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
   if (!payload || !Array.isArray(payload.messages) || !payload.messages.length) return fail(res, 400, 'messages 不能为空');
   if (apiKeyRec && apiKeyRec.enabled === false) return fail(res, 403, '该 API 密钥已停用');
   if (isBanned(user)) return fail(res, 403, '账号已被封禁');
-  if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
   scrubStuckReserves(user, apiKeyRec);
 
   const requestedModel = String(payload.model || '');
-  const pinned = apiKeyRec?.groupId
-    ? (db.settings?.providers || []).find((p) => p.id === apiKeyRec.groupId && p.enabled !== false && !isMaintenanceProvider(p))
-    : null;
-  const primaryHint = pinned || providersForModel(payload, db)[0];
+  const pinned = pinnedProviderForKey(db, apiKeyRec);
+  const primaryHint = pinned || providersForModel(payload, db)[0] || providers(db)[0] || null;
   if (!primaryHint) return fail(res, 503, '模型服务暂不可用，请稍后重试');
   const authorized = resolveAuthorizedModel(db, apiKeyRec, requestedModel, primaryHint);
-  if (!authorized.ok) return fail(res, 400, '该密钥无权调用此模型');
+  if (failIfModelUnauthorized(res, authorized)) return;
   const model = authorized.model;
-  let candidates = providersForModel({ ...payload, model }, db);
-  if (pinned) {
-    candidates = [pinned, ...candidates.filter((p) => p.id !== pinned.id)];
-  }
-  if (!candidates.length) candidates = [primaryHint];
+  let candidates = chatCandidatesForRequest({
+    providers: providers(db),
+    model,
+    pinnedProvider: pinned,
+    allowCrossGroupFailover: false
+  });
+  if (!candidates.length) candidates = pinned ? [pinned] : [];
+  if (!candidates.length) return fail(res, 404, `未知模型：${model}`, { code: 'model_not_found' });
+  if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
   const primary = candidates[0];
   const rate = providerMultiplier(primary, db);
   const inputReserve = Math.ceil(JSON.stringify(payload.messages).length * 2) + 256;
@@ -6018,6 +6083,68 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  if (/^\/v1\/files(\/|$)/.test(url.pathname) && ['GET', 'POST', 'DELETE'].includes(req.method)) {
+    if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
+    const apiKey = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const found = findByApiSecret(db, apiKey);
+    if (!found) return fail(res, 401, '无效的 API Key');
+    const user = found.user;
+    const apiKeyRec = found.key;
+    if (apiKeyRec && apiKeyRec.enabled === false) return fail(res, 403, '该 API 密钥已停用');
+    if (isBanned(user)) return fail(res, 403, '账号已被封禁');
+    const rest = url.pathname.slice('/v1/files'.length).replace(/^\/+/, '');
+    const provider = pinnedProviderForKey(db, apiKeyRec)
+      || providers(db).find((p) => isVip1129Provider(p) || isBeibeihaiProvider(p))
+      || providers(db)[0]
+      || null;
+    const raw = req.method === 'GET' ? Buffer.alloc(0) : await readRawBody(req, MAX_FILE_UPLOAD_BODY);
+    if (provider) {
+      try {
+        const proxyKey = await ensureProxyApiKey(db, user, provider, apiKeyRec);
+        const endpoint = filesEndpointFromChatUrl(provider.url, rest);
+        if (proxyKey && endpoint && /^https:\/\//i.test(endpoint)) {
+          const headers = {
+            Authorization: `Bearer ${proxyKey}`
+          };
+          const ct = req.headers['content-type'];
+          if (ct && req.method !== 'GET') headers['Content-Type'] = ct;
+          const upstream = await fetch(endpoint, {
+            method: req.method,
+            headers,
+            body: req.method === 'GET' ? undefined : raw,
+            signal: AbortSignal.timeout(60000)
+          });
+          const text = await upstream.text();
+          const upType = upstream.headers.get('content-type') || '';
+          if (upstream.ok && /json/i.test(upType)) {
+            res.writeHead(upstream.status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+            return res.end(text);
+          }
+        }
+      } catch {
+        /* fall through to local stub */
+      }
+    }
+    if (req.method === 'POST' && url.pathname === '/v1/files') {
+      const filename = guessUploadFilename(req.headers['content-type'], raw);
+      return json(res, 200, {
+        id: `file_${crypto.randomBytes(12).toString('hex')}`,
+        object: 'file',
+        bytes: raw.length,
+        created_at: Math.floor(Date.now() / 1000),
+        filename,
+        purpose: 'assistants',
+        status: 'processed'
+      });
+    }
+    if (req.method === 'GET' && url.pathname === '/v1/files') {
+      return json(res, 200, { object: 'list', data: [] });
+    }
+    return json(res, 404, {
+      error: { message: '文件不存在', type: 'invalid_request_error', code: 'file_not_found' }
+    });
+  }
+
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
     if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
     const apiKey = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
@@ -6076,17 +6203,22 @@ const server = http.createServer(async (req, res) => {
     const apiKeyRec = found.key;
     if (apiKeyRec && apiKeyRec.enabled === false) return fail(res, 403, '该 API 密钥已停用');
     if (isBanned(user)) return fail(res, 403, '账号已被封禁');
-    if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
     scrubStuckReserves(user, apiKeyRec);
 
-    const pseudoPayload = { model: raw.model, messages: [{ role: 'user', content: 'x' }] };
-    const allCandidates = providersForModel(pseudoPayload, db);
+    const pinned = pinnedProviderForKey(db, apiKeyRec);
+    const allCandidates = chatCandidatesForRequest({
+      providers: providers(db),
+      model: String(raw.model || ''),
+      pinnedProvider: pinned,
+      allowCrossGroupFailover: false
+    });
     const passthroughCandidates = allCandidates.filter(providerSupportsResponsesPassthrough).slice(0, 2);
     const candidates = passthroughCandidates.length ? passthroughCandidates : allCandidates.slice(0, 1);
     if (!candidates.length) return fail(res, 503, '模型服务暂不可用，请稍后再试');
     const primary = candidates[0];
     const authorized = resolveAuthorizedModel(db, apiKeyRec, raw.model, primary);
-    if (!authorized.ok) return fail(res, 400, '该密钥未授权使用此模型');
+    if (failIfModelUnauthorized(res, authorized)) return;
+    if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
     const model = authorized.model;
     const rate = providerMultiplier(primary, db);
     const inputReserve = Math.ceil(JSON.stringify(raw).length / 3) + 256;
@@ -6333,20 +6465,25 @@ const server = http.createServer(async (req, res) => {
     const apiKeyRec = found.key;
     if (apiKeyRec && apiKeyRec.enabled === false) return fail(res, 403, '该 API 密钥已停用');
     if (isBanned(user)) return fail(res, 403, '账号已被封禁');
-    if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
     scrubStuckReserves(user, apiKeyRec);
 
     // Prefer native /v1/responses passthrough (keeps tools / function_call for Codex).
     // Fall back to lossy chat/completions conversion only if every upstream rejects responses.
-    const pseudoPayload = { model: raw.model, messages: [{ role: 'user', content: 'x' }] };
-    const allCandidates = providersForModel(pseudoPayload, db);
+    const pinned = pinnedProviderForKey(db, apiKeyRec);
+    const allCandidates = chatCandidatesForRequest({
+      providers: providers(db),
+      model: String(raw.model || ''),
+      pinnedProvider: pinned,
+      allowCrossGroupFailover: false
+    });
     // Codex/tools need native /v1/responses — prefer vip1129 / OpenAI-compatible only.
     const passthroughCandidates = allCandidates.filter(providerSupportsResponsesPassthrough).slice(0, 2);
     const candidates = passthroughCandidates.length ? passthroughCandidates : allCandidates.slice(0, 1);
     if (!candidates.length) return fail(res, 503, '模型服务暂不可用，请稍后再试');
     const primary = candidates[0];
     const authorized = resolveAuthorizedModel(db, apiKeyRec, raw.model, primary);
-    if (!authorized.ok) return fail(res, 400, '该密钥未授权使用此模型');
+    if (failIfModelUnauthorized(res, authorized)) return;
+    if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
     const model = authorized.model;
     const rate = providerMultiplier(primary, db);
     const inputReserve = Math.ceil(JSON.stringify(raw).length / 3) + 256;

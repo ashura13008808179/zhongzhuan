@@ -209,7 +209,7 @@ try {
   assertAmount(overdrawn.balance, 0);
   assertAmount(overdrawn.upstreamOutstandingAmount, 1.7);
   assert.equal(overdrawn.accountActive, false);
-  assertAmount(first.body.stats.upstreamCostToday, 9.1553);
+  assertAmount(first.body.stats.upstreamCostToday, 9.1553 / 7);
   assertAmount(first.body.stats.chargedToday, 10.0708);
 
   const duplicate = await request('/api/admin/upstream-billing/sync', {
