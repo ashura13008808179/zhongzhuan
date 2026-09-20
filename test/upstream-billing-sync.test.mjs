@@ -1,7 +1,7 @@
 /**
  * End-to-end ledger test with a local vip1129-compatible usage endpoint.
- * It proves that the upstream actual_cost, rather than local request matching,
- * is the number used to correct customer billing.
+ * Customer charge stays token-table × global rate. Official actual_cost is
+ * recorded for accounting; VIP1129 true upstream cost is actual_cost / 7.
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -174,7 +174,7 @@ try {
   });
   db.users.push({
     id: 'usr_overdrawn_customer', email: 'overdrawn@example.com', username: 'overdrawnuser', name: 'Overdrawn User',
-    balance: 0.5, quotaTokens: 0, usedTokens: 0, reservedTokens: 0, reservedBalance: 0,
+    balance: 0, quotaTokens: 0, usedTokens: 0, reservedTokens: 0, reservedBalance: 0,
     pendingActualHold: 0, upstreamOutstandingAmount: 0, accountActive: true, role: 'user',
     apiKeys: [{
       id: 'key_overdrawn_customer', key: 'rk-overdrawn-customer', name: 'overdrawn', groupId: 'grp_gpt_mix',
@@ -202,15 +202,19 @@ try {
   let customer = after.users.find((item) => item.id === userId);
   const overdrawn = after.users.find((item) => item.id === 'usr_overdrawn_customer');
   let direct = after.logs.find((item) => item.id === 'log_direct');
-  assertAmount(customer.balance, 12.12917, 'unexpected balance');
-  assertAmount(direct.chargedAmount, 7.59583);
+  assertAmount(customer.balance, 18.54104, 'unexpected balance');
+  assertAmount(direct.chargedAmount, 1.4572);
+  assertAmount(direct.upstreamCost, 6.9053 / 7);
+  assertAmount(direct.upstreamReportedCost, 6.9053);
+  assert.equal(direct.upstreamCostTrue, true);
   assert.equal(direct.multiplier, 1.1);
   assert.equal(after.upstreamBills.length, 3);
   assertAmount(overdrawn.balance, 0);
-  assertAmount(overdrawn.upstreamOutstandingAmount, 1.7);
+  assertAmount(overdrawn.upstreamOutstandingAmount, 0.00176);
   assert.equal(overdrawn.accountActive, false);
-  assertAmount(first.body.stats.upstreamCostToday, 9.1553);
-  assertAmount(first.body.stats.chargedToday, 10.0708);
+  assertAmount(first.body.stats.upstreamCostToday, 9.1553 / 7);
+  assertAmount(first.body.stats.chargedToday, 1.4607);
+  assert.ok(direct.chargedAmount > direct.upstreamCost, 'VIP 0.4-style charge must cover true cost after /7');
 
   const duplicate = await request('/api/admin/upstream-billing/sync', {
     method: 'POST', headers: auth, body: JSON.stringify({ fullBackfill: true })
@@ -218,7 +222,7 @@ try {
   assert.equal(duplicate.status, 200, JSON.stringify(duplicate.body));
   after = store.read();
   customer = after.users.find((item) => item.id === userId);
-  assertAmount(customer.balance, 12.12917, 'a repeated sync must not charge again');
+  assertAmount(customer.balance, 18.54104, 'a repeated sync must not charge again');
   assert.equal(after.upstreamBills.length, 3, 'a repeated sync must not duplicate bills');
 
   const repriced = await request('/api/admin/pricing', {
@@ -226,18 +230,21 @@ try {
   });
   assert.equal(repriced.status, 200, JSON.stringify(repriced.body));
   assert.equal(repriced.body.ledgerSync?.skipped, false);
-  assert.equal(repriced.body.repricedLedgerRows, 3);
+  // Direct chat log has no tokenCost, so only the two imported usage rows reprice.
+  assert.equal(repriced.body.repricedLedgerRows, 2);
   after = store.read();
   customer = after.users.find((item) => item.id === userId);
   const repricedOverdrawn = after.users.find((item) => item.id === 'usr_overdrawn_customer');
   direct = after.logs.find((item) => item.id === 'log_direct');
-  assertAmount(customer.balance, 9.26705, 'unexpected repriced balance');
-  assertAmount(repricedOverdrawn.upstreamOutstandingAmount, 2.5);
+  assertAmount(customer.balance, 18.5404, 'unexpected repriced balance');
+  assertAmount(repricedOverdrawn.upstreamOutstandingAmount, 0.0024);
   assert.equal(repricedOverdrawn.accountActive, false);
-  assertAmount(direct.chargedAmount, 10.35795);
-  assert.equal(direct.multiplier, 1.5);
+  assertAmount(direct.chargedAmount, 1.4572);
+  assert.equal(direct.multiplier, 1.1);
+  assertAmount(direct.upstreamCost, 6.9053 / 7);
+  assert.equal(direct.upstreamCostTrue, true);
   assert.equal(repriced.body.multiplierVip1129, 1.5);
-  assertAmount(after.upstreamBills.reduce((sum, bill) => sum + Number(bill.chargedAmount || 0), 0), 13.73295);
+  assertAmount(after.upstreamBills.reduce((sum, bill) => sum + Number(bill.chargedAmount || 0), 0), 1.462);
 
   const blocked = await request('/v1/chat/completions', {
     method: 'POST',

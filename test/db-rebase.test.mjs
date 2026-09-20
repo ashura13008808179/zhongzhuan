@@ -94,4 +94,11 @@ modelNext.users[0].apiKeys[0].models = ['gpt-5.6-terra', 'gpt-5.6-sol'];
 const modelMerged = rebaseDbSnapshot(snapshotDbForRebase(modelBaseDb), modelNext, modelBaseDb, { logCap: 3000 });
 assert.deepEqual(modelMerged.users[0].apiKeys[0].models, ['gpt-5.6-terra', 'gpt-5.6-sol']);
 
+const fileBase = { ...cloneDbValue(initial), files: [] };
+const fileNext = cloneDbValue(fileBase);
+fileNext.files.push({ id: 'file_abc', userId: 'usr_concurrent', filename: 'a.txt', bytes: 1 });
+const fileMerged = rebaseDbSnapshot(snapshotDbForRebase(fileBase), fileNext, fileBase, { logCap: 3000 });
+assert.equal(fileMerged.files.length, 1);
+assert.equal(fileMerged.files[0].id, 'file_abc');
+
 console.log('db-rebase.test.mjs: all assertions passed');

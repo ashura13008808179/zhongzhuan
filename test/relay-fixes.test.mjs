@@ -30,7 +30,16 @@ import {
   formatBillingMultiplier,
   DEFAULT_BILLING_MULTIPLIER,
   defaultDisplayMultiplier,
-  resolveDisplayMultiplier
+  resolveDisplayMultiplier,
+  applySyncedModels,
+  chatCandidatesForRequest,
+  filterModelsForProviderFamily,
+  pickSeededDefaultModel,
+  SEEDED_DEFAULT_MODELS,
+  reconcileGroupMap,
+  providerFetchTimeoutMs,
+  providerPrefersAnthropicMessages,
+  CLAUDE_CHAT_TIMEOUT_MS
 } from '../lib/relay-core.js';
 
 const isVip1129 = (p) => p?.upstreamSync === 'vip1129' || String(p?.url || '').includes('vip1129.cc');
@@ -222,5 +231,59 @@ assert.equal(defaultDisplayMultiplier('grp_gpt_mix'), 0.05);
 assert.equal(resolveDisplayMultiplier({ id: 'grp_gpt_pro' }), 0.2);
 assert.equal(resolveDisplayMultiplier({ id: 'grp_gpt_pro', displayMultiplier: 0.2, billingMultiplier: 2.5 }), 0.2);
 assert.equal(resolveDisplayMultiplier({ id: 'grp_gpt_pro', displayMultiplier: 0.8 }), 0.8);
+
+const mixedModels = ['kimi-k3', 'glm-5.2', 'deepseek-chat', 'deepseek-v4-flash'];
+assert.deepEqual(filterModelsForProviderFamily({ id: 'grp_deepseek' }, mixedModels), ['deepseek-chat', 'deepseek-v4-flash']);
+assert.equal(pickSeededDefaultModel({ id: 'grp_deepseek' }, mixedModels, SEEDED_DEFAULT_MODELS.grp_deepseek), 'deepseek-chat');
+const ds = { id: 'grp_deepseek', defaultModel: 'kimi-k3', models: mixedModels };
+applySyncedModels(ds, mixedModels, 'deepseek-chat');
+assert.equal(ds.defaultModel, 'deepseek-chat');
+assert.ok(ds.models.every((m) => String(m).startsWith('deepseek')));
+assert.equal(ds.models.includes('kimi-k3'), false);
+
+const claudePinned = { id: 'grp_claude_kiro', defaultModel: 'claude-sonnet-4-5-20250929' };
+const awsCc = { id: 'grp_aws_cc', models: ['claude-sonnet-4-5-20250929'], priority: 210 };
+const routed = chatCandidatesForRequest({
+  providers: [claudePinned, awsCc],
+  model: 'claude-sonnet-4-5-20250929',
+  pinnedProvider: claudePinned,
+  allowCrossGroupFailover: false
+});
+assert.deepEqual(routed.map((p) => p.id), ['grp_claude_kiro']);
+const unknownRoute = chatCandidatesForRequest({
+  providers: [awsCc],
+  model: 'zz-unknown-model-xyz'
+});
+assert.deepEqual(unknownRoute, []);
+
+const kiroCatalog = ['claude-sonnet-4-5-20250929', 'claude-fable-5', 'claude-opus-4'];
+assert.equal(pickSeededDefaultModel({ id: 'grp_claude_kiro' }, kiroCatalog, SEEDED_DEFAULT_MODELS.grp_claude_kiro), SEEDED_DEFAULT_MODELS.grp_claude_kiro);
+const kiro = { id: 'grp_claude_kiro', defaultModel: 'claude-sonnet-4-5-20250929', models: kiroCatalog };
+applySyncedModels(kiro, kiroCatalog, SEEDED_DEFAULT_MODELS.grp_claude_kiro);
+assert.equal(kiro.defaultModel, 'claude-haiku-4-5-20251001');
+assert.equal(kiro.models[0], 'claude-haiku-4-5-20251001');
+assert.equal(providerPrefersAnthropicMessages(kiro, kiro.defaultModel), true);
+assert.ok(providerFetchTimeoutMs({ id: 'grp_claude_kiro', timeoutMs: 20000 }) >= CLAUDE_CHAT_TIMEOUT_MS);
+assert.ok(providerFetchTimeoutMs({ id: 'grp_deepseek', timeoutMs: 20000 }) >= 90000);
+
+const remapped = reconcileGroupMap(
+  { grp_claude_kiro: 1, grp_claude_kiro_welfare: 33 },
+  [
+    { id: 1, name: 'DeepSeek 官方' },
+    { id: 89, name: 'Kiro（AWS企业号）' },
+    { id: 33, name: 'Kiro（福利）' }
+  ],
+  ['grp_claude_kiro', 'grp_claude_kiro_welfare']
+);
+assert.equal(remapped.grp_claude_kiro, 89);
+assert.equal(remapped.grp_claude_kiro_welfare, 33);
+
+const pinnedStill = chatCandidatesForRequest({
+  providers: [kiro, awsCc],
+  model: 'claude-sonnet-4-5-20250929',
+  pinnedProvider: kiro,
+  allowCrossGroupFailover: false
+});
+assert.deepEqual(pinnedStill.map((p) => p.id), ['grp_claude_kiro']);
 
 console.log('relay-fixes.test.mjs: all assertions passed');
