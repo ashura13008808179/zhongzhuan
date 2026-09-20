@@ -588,6 +588,9 @@ function poolStats(db) {
         providerId: bill.providerId,
         userId: bill.userId,
         providerName: (db.settings?.providers || []).find((p) => p.id === bill.providerId)?.name || bill.providerId,
+        kind: bill.kind,
+        actualCost: bill.actualCost,
+        upstreamReportedCost: bill.actualCost,
         upstreamCost: bill.actualCost,
         chargedAmount: bill.chargedAmount,
         upstreamCostSource: 'reported',
@@ -607,7 +610,7 @@ function poolStats(db) {
     if (log.status === 'referral_rebate' || log.status === CHECKIN_LOG_STATUS) continue;
     requestCountToday += 1;
     const pid = log.providerId || 'unknown';
-    const provider = providerById.get(pid) || null;
+    const provider = providerById.get(pid) || (log.kind ? { upstreamSync: log.kind } : null);
     const up = accountingUpstreamCost(log, provider);
     const charged = Number(log.chargedAmount || 0);
     const uid = log.userId || 'unknown';
@@ -3111,8 +3114,7 @@ function settleImportedUpstreamBill(user, key, log, nextCost, rate) {
   user.upstreamOutstandingAmount = Math.max(0,
     (Number(user.upstreamOutstandingAmount) || 0) - oldOutstanding + outstanding);
   if (!isUnlimited(user) && outstanding > 1e-12) user.accountActive = false;
-  log.upstreamCost = Math.max(0, Number(nextCost) || 0);
-  log.upstreamCostSource = 'reported';
+  log.tokenCost = Math.max(0, Number(nextCost) || 0);
   log.chargedAmount = nextCharge;
   log.alreadyCharged = nextCharge;
   log.collectedAmount = collectedAmount;

@@ -112,8 +112,14 @@ try {
   assert.equal(after.settings.upstreamUsageSync.initialBackfillCompleted, true);
   assert.equal(after.upstreamBills.length, 1);
   assert.equal(after.upstreamBills[0].actualCost, 6.9053);
-  assert.ok(Math.abs(after.upstreamBills[0].chargedAmount - 7.59583) < 1e-9);
-  assert.ok(Math.abs(user.balance - 2.40417) < 1e-9, `unexpected balance ${user.balance}`);
+  // token-table: 10 in × 0.005/1k + 1 out × 0.03/1k = 0.00008; × VIP rate 1.1
+  assert.ok(Math.abs(after.upstreamBills[0].chargedAmount - 0.000088) < 1e-9);
+  assert.ok(Math.abs(user.balance - 9.999912) < 1e-9, `unexpected balance ${user.balance}`);
+  const bootLog = (after.logs || []).find((item) => item.upstreamUsageId === 'boot-usage');
+  assert.ok(bootLog, 'boot sync must write a local log');
+  assert.ok(Math.abs(Number(bootLog.upstreamCost) - (6.9053 / 7)) < 1e-9, `unexpected true upstream ${bootLog.upstreamCost}`);
+  assert.equal(bootLog.upstreamReportedCost, 6.9053);
+  assert.equal(bootLog.upstreamCostTrue, true);
   console.log('upstream-billing-boot.test.mjs: all assertions passed');
 } finally {
   if (child) await stop(child);

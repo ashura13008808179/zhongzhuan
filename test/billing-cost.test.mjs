@@ -334,6 +334,7 @@ assert.equal(VIP1129_UPSTREAM_COST_DIVISOR, 7);
 const vipProvider = { id: 'grp_gpt_pro', upstreamSync: 'vip1129', url: 'https://api.vip1129.cc/v1/chat/completions' };
 const beiProvider = { id: 'grp_kimi', upstreamSync: 'beibeihai', url: 'https://sub.beibeihai.xyz/v1/chat/completions' };
 assert.equal(providerUsesVip1129CostDivisor(vipProvider), true);
+assert.equal(providerUsesVip1129CostDivisor({ kind: 'vip1129' }), true);
 assert.equal(providerUsesVip1129CostDivisor(beiProvider), false);
 assert.equal(trueUpstreamCost(0.000588, vipProvider), 0.000588 / 7);
 assert.equal(trueUpstreamCost(0.01698245, beiProvider), 0.01698245);
