@@ -137,7 +137,6 @@ export function defaultGroupMap() {
     grp_cc_max: 56,
     grp_glm: 79,
     grp_kimi: 81,
-    grp_gemini: 55,
     grp_nano_banana: 53,
     grp_nano_banana_pro: 76,
     grp_grok_heavy: 80,

@@ -50,7 +50,6 @@ import { pushPaymentEvent, waitForEvents, currentSeq, publicPaymentEvent } from 
 import {
   compactGroupMap,
   normalizeAvailableGroups,
-  suggestGroupMap,
   wireAllProviders,
   resolveProxyApiKey as resolveProxyApiKeyPure,
   findSyncedKeyRecord,
@@ -68,6 +67,10 @@ import {
   GPT_RELAY_GROUP_IDS,
   GPT_RELAY_PRIORITY,
   preferGptTerra,
+  applySyncedModels,
+  chatCandidatesForRequest,
+  SEEDED_DEFAULT_MODELS,
+  modelFamilyToken,
   resolveRecommendedModel,
   normalizeRecommendedModel,
   AVATAR_IDS,
@@ -76,7 +79,14 @@ import {
   normalizeBillingMultiplier,
   DEFAULT_BILLING_MULTIPLIER,
   defaultDisplayMultiplier,
-  resolveDisplayMultiplier
+  resolveDisplayMultiplier,
+  reconcileGroupMap,
+  providerFetchTimeoutMs,
+  ensureProviderTimeouts,
+  providerPrefersAnthropicMessages,
+  isClaudeFamilyModel,
+  isClaudeKiroProvider,
+  KIRO_FAILFAST_TIMEOUT_MS
 } from './lib/relay-core.js';
 import {
   modelPrice,
@@ -92,7 +102,9 @@ import {
   tokenFloorCost,
   applyUpstreamUsageRow,
   allowEstimatedBilling,
-  isPendingBillStatus
+  isPendingBillStatus,
+  accountingUpstreamCost,
+  applyTrueUpstreamCost
 } from './lib/billing-cost.js';
 import { applyLiveMoneyCharge, applyLiveMoneyRefund, settleRemainder, parkPendingHold, releasePendingHold, liveBillTarget, exactUserCharge, LIVE_POLL_INTERVAL_MS } from './lib/live-billing.js';
 import { applyUsagePricesToProviders, nextTokenPriceSyncAt, msUntilNextTokenPriceSync, TOKEN_PRICE_RETRY_MS, channelTokenPriceView } from './lib/token-price-sync.js';
@@ -151,8 +163,21 @@ import {
   anthropicStreamFinished,
   anthropicContentToText,
   anthropicToChatPayload,
+  chatToAnthropicPayload,
+  anthropicMessageToChatCompletion,
   chatCompletionToAnthropic as chatCompletionToAnthropicWire
 } from './lib/anthropic-wire.js';
+import { buildBillingAlerts } from './lib/billing-alerts.js';
+import {
+  parseUpload,
+  createStoredFile,
+  listStoredFiles,
+  findStoredFile,
+  readStoredFileBytes,
+  updateStoredFile,
+  deleteStoredFile,
+  hydratePayloadFiles
+} from './lib/relay-files.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, 'public');
@@ -582,6 +607,9 @@ function poolStats(db) {
         providerId: bill.providerId,
         userId: bill.userId,
         providerName: (db.settings?.providers || []).find((p) => p.id === bill.providerId)?.name || bill.providerId,
+        kind: bill.kind,
+        actualCost: bill.actualCost,
+        upstreamReportedCost: bill.actualCost,
         upstreamCost: bill.actualCost,
         chargedAmount: bill.chargedAmount,
         upstreamCostSource: 'reported',
@@ -593,11 +621,16 @@ function poolStats(db) {
     const u = (db.users || []).find((x) => x.id === uid);
     return u?.username || u?.name || uid || 'unknown';
   };
+  const providerById = new Map((db.settings?.providers || []).map((p) => [p.id, p]));
+  let invertedCount = 0;
+  let invertedLossToday = 0;
   for (const log of costRows) {
     if (!log?.createdAt || localDay(new Date(log.createdAt)) !== day) continue;
     if (log.status === 'referral_rebate' || log.status === CHECKIN_LOG_STATUS) continue;
     requestCountToday += 1;
-    const up = Number(log.upstreamCost || 0);
+    const pid = log.providerId || 'unknown';
+    const provider = providerById.get(pid) || (log.kind ? { upstreamSync: log.kind } : null);
+    const up = accountingUpstreamCost(log, provider);
     const charged = Number(log.chargedAmount || 0);
     const uid = log.userId || 'unknown';
     if (!chargedTodayByUser[uid]) {
@@ -608,11 +641,14 @@ function poolStats(db) {
     if (Number.isFinite(charged) && charged > 0) chargedTodayByUser[uid].chargedAmount += charged;
     if (Number.isFinite(up)) {
       upstreamCostToday += up;
-      const pid = log.providerId || 'unknown';
-      if (!upstreamByProvider[pid]) upstreamByProvider[pid] = { providerId: pid, providerName: log.providerName || pid, upstreamCost: 0, chargedAmount: 0, requests: 0 };
+      if (!upstreamByProvider[pid]) upstreamByProvider[pid] = { providerId: pid, providerName: log.providerName || provider?.name || pid, upstreamCost: 0, chargedAmount: 0, requests: 0 };
       upstreamByProvider[pid].upstreamCost += up;
       upstreamByProvider[pid].chargedAmount += Number.isFinite(charged) ? charged : 0;
       upstreamByProvider[pid].requests += 1;
+    }
+    if (up > 0 && Number.isFinite(charged) && charged + 1e-12 < up) {
+      invertedCount += 1;
+      invertedLossToday += Math.max(0, up - charged);
     }
     if (log.upstreamCostSource === 'reported') upstreamCostReportedCount += 1;
     else if (Number.isFinite(up) && up > 0) upstreamCostEstimatedCount += 1;
@@ -645,7 +681,9 @@ function poolStats(db) {
         upstreamCost: Math.round(row.upstreamCost * 10000) / 10000,
         chargedAmount: Math.round(row.chargedAmount * 10000) / 10000
       }))
-      .sort((a, b) => b.chargedAmount - a.chargedAmount)
+      .sort((a, b) => b.chargedAmount - a.chargedAmount),
+    invertedCount,
+    invertedLossToday: Math.round(invertedLossToday * 10000) / 10000
   };
 }
 
@@ -745,15 +783,9 @@ function resolveGroupModels(db, groupId) {
 function snapProviderDefaultModel(provider) {
   if (!provider) return false;
   const before = `${provider.defaultModel}|${(provider.models || []).join(',')}|${provider.priority}`;
+  const seed = SEEDED_DEFAULT_MODELS[provider.id] || provider.defaultModel || '';
+  applySyncedModels(provider, provider.models, seed);
   preferGptTerra(provider);
-  const models = [...new Set((provider.models || []).map((m) => String(m).trim()).filter(Boolean))];
-  if (models.length) {
-    const cur = String(provider.defaultModel || '').trim();
-    if (!cur || !models.includes(cur)) {
-      provider.defaultModel = models[0];
-      preferGptTerra(provider);
-    }
-  }
   return `${provider.defaultModel}|${(provider.models || []).join(',')}|${provider.priority}` !== before;
 }
 
@@ -774,20 +806,29 @@ function keyAllowsModel(db, apiKeyRec, model) {
   return allowed.includes(want);
 }
 
+function catalogHasModel(db, model) {
+  const want = String(model || '').trim();
+  if (!want) return false;
+  if (catalogModels(db).includes(want)) return true;
+  return (db.settings?.providers || []).some((p) => {
+    if (p?.enabled === false) return false;
+    if (String(p.defaultModel || '').trim() === want) return true;
+    return Array.isArray(p.models) && p.models.includes(want);
+  });
+}
+
 function resolveAuthorizedModel(db, apiKeyRec, requested, provider) {
   const allowed = allowedModelsForKey(db, apiKeyRec);
   const req = String(requested || '').trim();
   const def = String(provider?.defaultModel || '').trim();
   if (req) {
+    if (!catalogHasModel(db, req)) return { ok: false, model: req, reason: 'unknown_model' };
     if (keyAllowsModel(db, apiKeyRec, req)) return { ok: true, model: req };
-    if (req === def && allowed[0]) return { ok: true, model: allowed[0] };
-    const listed = (db.settings?.providers || []).some((p) => Array.isArray(p.models) && p.models.includes(req));
-    if (!listed && allowed[0]) return { ok: true, model: allowed[0] };
-    return { ok: false, model: req };
+    return { ok: false, model: req, reason: 'unauthorized' };
   }
   if (def && keyAllowsModel(db, apiKeyRec, def)) return { ok: true, model: def };
   if (allowed[0]) return { ok: true, model: allowed[0] };
-  return { ok: false, model: def };
+  return { ok: false, model: def, reason: 'unknown_model' };
 }
 
 
@@ -906,7 +947,7 @@ async function autofillBeibeihaiGroupMap(db, token = null) {
   const listed = await beibeihaiListGroups(cfg.baseUrl, authToken);
   if (!listed.ok) return cfg;
   const groups = normalizeAvailableGroups(listed.data);
-  const nextMap = suggestGroupMap(cfg.groupMap, groups, localBeibeihaiGroupIds(db), BEIBEIHAI_GROUP_HINTS);
+  const nextMap = reconcileGroupMap(cfg.groupMap, groups, localBeibeihaiGroupIds(db), BEIBEIHAI_GROUP_HINTS);
   if (JSON.stringify(nextMap) !== JSON.stringify(compactGroupMap(cfg.groupMap))) {
     cfg.groupMap = nextMap;
     saveBeibeihaiConfig(db, cfg);
@@ -1006,7 +1047,7 @@ async function autofillVip1129GroupMap(db, token = null) {
   const listed = await vip1129ListGroups(cfg.baseUrl, authToken);
   if (!listed.ok) return cfg;
   const groups = normalizeAvailableGroups(listed.data);
-  const nextMap = suggestGroupMap(cfg.groupMap, groups, localVip1129GroupIds(db), VIP1129_GROUP_HINTS);
+  const nextMap = reconcileGroupMap(cfg.groupMap, groups, localVip1129GroupIds(db), VIP1129_GROUP_HINTS);
   if (JSON.stringify(nextMap) !== JSON.stringify(compactGroupMap(cfg.groupMap))) {
     cfg.groupMap = nextMap;
     saveVip1129Config(db, cfg);
@@ -1492,13 +1533,12 @@ const DEFAULT_MODEL_GROUPS = [
   { id: 'grp_gpt_mix', name: 'GPT 混用', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: DEFAULT_RECOMMENDED_MODEL, models: [], priority: GPT_RELAY_PRIORITY.grp_gpt_mix, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_gpt_mix') },
   { id: 'grp_cc_max', name: 'CC-MAX', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-sonnet-4', models: [], priority: 60, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_cc_max') },
   { id: 'grp_cursor_pool', name: 'Cursor账号池', url: 'https://api2.cursor.sh/v1/chat/completions', defaultModel: 'claude-sonnet-4', models: [], priority: 80, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_cursor_pool'), maintenance: true, maintenanceMessage: '请联系站长购买' },
-  { id: 'grp_glm', name: '智普 GLM', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'glm-5.1', models: [], priority: 90, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_glm') },
+  { id: 'grp_glm', name: '智普 GLM', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'glm-5.2', models: [], priority: 90, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_glm') },
   { id: 'grp_kimi', name: 'Kimi', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'kimi-k2.6', models: [], priority: 100, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_kimi') },
-  { id: 'grp_gemini', name: 'Gemini', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'gemini-2.5-flash', models: [], priority: 110, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_gemini') },
   { id: 'grp_grok_heavy', name: 'Grok Heavy', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'composer-2.5', models: [], priority: 120, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_grok_heavy'), timeoutMs: 90000 },
-  { id: 'grp_claude_kiro', name: 'Claude-Kiro', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-haiku-4-5-20251001', models: [], priority: 130, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_claude_kiro') },
-  { id: 'grp_claude_kiro_welfare', name: 'Claude-Kiro 福利', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-fable-5', models: [], priority: 140, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_claude_kiro_welfare') },
-  { id: 'grp_aws_cc', name: 'AWS-CC', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: 'claude-fable-5', models: [], priority: 210, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_aws_cc') },
+  { id: 'grp_claude_kiro', name: 'Claude-Kiro', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-haiku-4-5-20251001', models: [], priority: 130, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_claude_kiro'), timeoutMs: KIRO_FAILFAST_TIMEOUT_MS, maxRetries: 0 },
+  { id: 'grp_claude_kiro_welfare', name: 'Claude-Kiro 福利', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-fable-5', models: [], priority: 140, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_claude_kiro_welfare'), timeoutMs: KIRO_FAILFAST_TIMEOUT_MS, maxRetries: 0 },
+  { id: 'grp_aws_cc', name: 'AWS-CC', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: 'claude-fable-5', models: [], priority: 210, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_aws_cc'), timeoutMs: 120000 },
 ];
 
 function seedDefaultProviders(db) {
@@ -1519,8 +1559,8 @@ function seedDefaultProviders(db) {
     priority: g.priority,
     billingMultiplier: Number(g.billingMultiplier) || DEFAULT_BILLING_MULTIPLIER,
     displayMultiplier: resolveDisplayMultiplier(g),
-    timeoutMs: Number(g.timeoutMs) || 60000,
-    maxRetries: 1,
+    timeoutMs: Number(g.timeoutMs) || providerFetchTimeoutMs(g),
+    maxRetries: isClaudeKiroProvider(g) ? 0 : (Number.isFinite(Number(g.maxRetries)) ? Number(g.maxRetries) : 1),
     modelPrices: {},
     maintenance: !!g.maintenance,
     maintenanceMessage: g.maintenanceMessage || null,
@@ -1551,8 +1591,8 @@ function ensureDefaultModelGroups(db) {
       priority: g.priority,
       billingMultiplier: Number(g.billingMultiplier) || DEFAULT_BILLING_MULTIPLIER,
       displayMultiplier: resolveDisplayMultiplier(g),
-      timeoutMs: Number(g.timeoutMs) || 60000,
-      maxRetries: 1,
+      timeoutMs: Number(g.timeoutMs) || providerFetchTimeoutMs(g),
+      maxRetries: isClaudeKiroProvider(g) ? 0 : (Number.isFinite(Number(g.maxRetries)) ? Number(g.maxRetries) : 1),
       modelPrices: {},
       maintenance: !!g.maintenance,
       maintenanceMessage: g.maintenanceMessage || null,
@@ -1563,25 +1603,13 @@ function ensureDefaultModelGroups(db) {
   return added;
 }
 
-function modelFamilyToken(name) {
-  return String(name || '').toLowerCase().split(/[-_./]/)[0];
-}
-
 function repairSeededDefaultModels(db) {
   let changed = false;
   const providers = db.settings?.providers || [];
   for (const g of DEFAULT_MODEL_GROUPS) {
     const p = providers.find(x => x && x.id === g.id);
     if (!p || !g.defaultModel) continue;
-    const current = String(p.defaultModel || '').trim();
-    const seed = String(g.defaultModel).trim();
-    const models = (p.models || []).map((m) => String(m).trim()).filter(Boolean);
-    const curTok = modelFamilyToken(current);
-    const seedTok = modelFamilyToken(seed);
-    if (!current || (curTok && seedTok && curTok !== seedTok)) {
-      p.defaultModel = models.includes(seed) ? seed : (models[0] || seed);
-      changed = true;
-    }
+    if (applySyncedModels(p, p.models, g.defaultModel)) changed = true;
   }
   for (const p of providers) {
     if (snapProviderDefaultModel(p)) changed = true;
@@ -1859,6 +1887,45 @@ function modelsEndpointFromChatUrl(url) {
   return `${raw}/models`;
 }
 
+function filesEndpointFromChatUrl(url, extraPath = '') {
+  const raw = String(url || '').trim().replace(/\/+$/, '');
+  if (!raw) return '';
+  let base = '';
+  if (/\/chat\/completions$/i.test(raw)) base = raw.replace(/\/chat\/completions$/i, '/files');
+  else if (/\/messages$/i.test(raw)) base = raw.replace(/\/messages$/i, '/files');
+  else if (/\/v1$/i.test(raw)) base = `${raw}/files`;
+  else {
+    const v1 = raw.indexOf('/v1/');
+    base = v1 >= 0 ? `${raw.slice(0, v1 + 3)}/files` : `${raw}/files`;
+  }
+  const extra = String(extraPath || '').replace(/^\/+/, '');
+  return extra ? `${base}/${extra}` : base;
+}
+
+const MAX_FILE_UPLOAD_BODY = Math.max(MAX_UPLOAD_BODY, 32 * 1024 * 1024);
+
+async function readRawBody(req, maxBytes = MAX_FILE_UPLOAD_BODY) {
+  const len = Number(req.headers['content-length']);
+  if (Number.isFinite(len) && len > maxBytes) {
+    const err = new Error('payload_too_large');
+    err.code = 'PAYLOAD_TOO_LARGE';
+    throw err;
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > maxBytes) {
+      req.destroy();
+      const err = new Error('payload_too_large');
+      err.code = 'PAYLOAD_TOO_LARGE';
+      throw err;
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, size);
+}
+
 async function fetchUpstreamModels(provider, overrideApiKey = null) {
   const apiKey = String(overrideApiKey || provider?.apiKey || '').trim();
   if (!provider?.url || !apiKey) {
@@ -1951,15 +2018,12 @@ async function syncAllUpstreamModels(db, { onlyStaleMs = 0, ids = null } = {}) {
     try {
       const bearer = await ensureUpstreamProbeKey(db, provider);
       const { endpoint, models } = await fetchUpstreamModelsRetry(db, provider, bearer);
-      provider.models = models;
+      const seed = SEEDED_DEFAULT_MODELS[provider.id] || DEFAULT_MODEL_GROUPS.find((g) => g.id === provider.id)?.defaultModel || provider.defaultModel;
+      applySyncedModels(provider, models, seed);
       snapProviderDefaultModel(provider);
-      if (!provider.defaultModel || !models.includes(provider.defaultModel)) {
-        provider.defaultModel = models[0];
-        preferGptTerra(provider);
-      }
       provider.modelsSyncedAt = new Date().toISOString();
       provider.modelsSource = endpoint;
-      results.push({ id: provider.id, name: provider.name, ok: true, count: models.length, endpoint });
+      results.push({ id: provider.id, name: provider.name, ok: true, count: (provider.models || []).length, endpoint });
     } catch (err) {
       results.push({ id: provider.id, name: provider.name, ok: false, error: err.message || String(err) });
     }
@@ -1974,18 +2038,21 @@ function providers(db) {
 }
 function providersForModel(payload, db) {
   const list = providers(db);
-  const model = String(payload.model || '');
-  // Exact model match only. Empty models[] must NOT match every request (e.g. Cursor pool).
-  const exact = list
-    .filter(p => Array.isArray(p.models) && p.models.length && p.models.includes(model))
-    .sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100));
-  if (exact.length) return exact;
-  if (!model) {
-    const any = list.slice().sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100));
-    if (any.length) return any;
+  const model = String(payload.model || '').trim();
+  return chatCandidatesForRequest({ providers: list, model, pinnedProvider: null, allowCrossGroupFailover: false });
+}
+function pinnedProviderForKey(db, apiKeyRec) {
+  if (!apiKeyRec?.groupId) return null;
+  return (db.settings?.providers || []).find((p) => p.id === apiKeyRec.groupId && p.enabled !== false && !isMaintenanceProvider(p)) || null;
+}
+function failIfModelUnauthorized(res, authorized) {
+  if (!authorized || authorized.ok) return false;
+  if (authorized.reason === 'unknown_model') {
+    fail(res, 404, `未知模型：${authorized.model || '（空）'}`, { code: 'model_not_found' });
+    return true;
   }
-  const fallback = list.find(p => p.id === db.settings.defaultProviderId) || list[0];
-  return fallback ? [fallback] : [];
+  fail(res, 400, '该密钥未授权使用此模型', { code: 'model_not_allowed' });
+  return true;
 }
 function providerFor(payload, db) {
   return providersForModel(payload, db)[0] || null;
@@ -2154,16 +2221,12 @@ async function probeProviderHealth(db, provider) {
     provider.health.probe = 'models';
     provider.health.endpoint = endpoint;
     provider.health.modelCount = models.length;
-    // 探测成功时顺带刷新模型列表，保持与上游一致
-    provider.models = models;
+    const seed = SEEDED_DEFAULT_MODELS[provider.id] || DEFAULT_MODEL_GROUPS.find((g) => g.id === provider.id)?.defaultModel || provider.defaultModel;
+    applySyncedModels(provider, models, seed);
     snapProviderDefaultModel(provider);
-    if (!provider.defaultModel) {
-      provider.defaultModel = models[0];
-      preferGptTerra(provider);
-    }
     provider.modelsSyncedAt = new Date().toISOString();
     provider.modelsSource = endpoint;
-    return { id: provider.id, name: provider.name, ok: true, count: models.length, endpoint };
+    return { id: provider.id, name: provider.name, ok: true, count: (provider.models || []).length, endpoint };
   } catch (err) {
     updateProviderHealth(db, provider.id, false, err.message || String(err));
     return { id: provider.id, name: provider.name, ok: false, error: err.message || String(err) };
@@ -2595,12 +2658,13 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
     user.upstreamOutstandingAmount = Math.max(0, Number(user.upstreamOutstandingAmount) || 0) + unpaidAmount;
     user.accountActive = false;
   }
-  db.logs.unshift({
+  const logRow = {
     id: id('log'),
     userId: user.id,
     apiKeyId: apiKeyRec?.id || null,
     model,
     providerId: provider.id,
+    providerName: provider.name || provider.id,
     tokens: upstreamTokens,
     billedTokens,
     tokenCost,
@@ -2621,9 +2685,12 @@ function settleUsage(db, user, provider, usage, rate, tokenReservation, amountRe
     startedAt: new Date(started).toISOString(),
     status: status || 'success',
     createdAt: new Date().toISOString()
-  });
+  };
+  if (reported != null) applyTrueUpstreamCost(logRow, reported, provider);
+  else logRow.upstreamCost = tokenCost;
+  db.logs.unshift(logRow);
   db.logs = db.logs.slice(0, 3000);
-  return { billedTokens, chargedAmount, upstreamTokens, upstreamCost: reported != null ? reported : tokenCost, upstreamCostSource: reported != null ? 'reported' : 'token_table', pending: false };
+  return { billedTokens, chargedAmount, upstreamTokens, upstreamCost: logRow.upstreamCost, upstreamCostSource: logRow.upstreamCostSource, pending: false };
 }
 function releaseReserve(user, tokenReservation, amountReservation, apiKeyRec = null) {
   user.reservedTokens = Math.max(0, (user.reservedTokens || 0) - tokenReservation);
@@ -2895,7 +2962,7 @@ async function reconcilePendingActualCosts(db) {
     user.upstreamOutstandingAmount = Math.max(0,
       (Number(user.upstreamOutstandingAmount) || 0) - oldOutstanding + unpaidAmount);
     if (!isUnlimited(user) && unpaidAmount > 1e-12) user.accountActive = false;
-    log.upstreamCost = cost;
+    applyTrueUpstreamCost(log, cost, provider);
     log.upstreamCostSource = 'reported';
     log.chargedAmount = chargedAmount;
     log.alreadyCharged = collectedAmount;
@@ -3048,8 +3115,7 @@ function settleImportedUpstreamBill(user, key, log, nextCost, rate) {
   user.upstreamOutstandingAmount = Math.max(0,
     (Number(user.upstreamOutstandingAmount) || 0) - oldOutstanding + outstanding);
   if (!isUnlimited(user) && outstanding > 1e-12) user.accountActive = false;
-  log.upstreamCost = Math.max(0, Number(nextCost) || 0);
-  log.upstreamCostSource = 'reported';
+  log.tokenCost = Math.max(0, Number(nextCost) || 0);
   log.chargedAmount = nextCharge;
   log.alreadyCharged = nextCharge;
   log.collectedAmount = collectedAmount;
@@ -3085,7 +3151,7 @@ function repriceStoredUpstreamBills(db) {
     bill.chargedAmount = settleImportedUpstreamBill(user, key, log, tokenCost, rate);
     log.tokenCost = tokenCost;
     if (Number.isFinite(official) && official > 0) {
-      log.upstreamCost = official;
+      applyTrueUpstreamCost(log, official, provider);
       log.upstreamCostSource = 'reported';
     }
     bill.multiplier = rate;
@@ -3133,7 +3199,8 @@ function createImportedUpstreamLog(db, owner, row, bill) {
   }, log.model);
   settleImportedUpstreamBill(owner.user, owner.key, log, tokenCost, rate);
   log.tokenCost = tokenCost;
-  log.upstreamCost = Number(bill.actualCost) || tokenCost;
+  applyTrueUpstreamCost(log, Number(bill.actualCost) || tokenCost, owner.provider);
+  if (!(Number(bill.actualCost) > 0)) log.upstreamCost = tokenCost;
   log.upstreamCostSource = 'reported';
   log.billingSource = 'token_table';
   owner.user.usedTokens = (Number(owner.user.usedTokens) || 0) + log.billedTokens;
@@ -3200,7 +3267,7 @@ function settlePendingLogFromUpstreamBill(db, owner, log, row, bill) {
     settleImportedUpstreamBill(owner.user, owner.key, log, tokenCost, rate);
     log.tokenCost = tokenCost;
   }
-  log.upstreamCost = bill.actualCost;
+  applyTrueUpstreamCost(log, bill.actualCost, owner.provider);
   log.upstreamCostSource = 'reported';
   log.pendingActual = false;
   log.holdAmount = 0;
@@ -3338,7 +3405,7 @@ async function reconcileUpstreamUsageLedger(db, { fullBackfill = false } = {}) {
           if (log.pendingActual === true || Number(log.holdAmount) > 0) {
             releasePendingHold(owner.user, owner.key, Math.max(0, Number(log.holdAmount) || 0));
           }
-          log.upstreamCost = actualCost;
+          applyTrueUpstreamCost(log, actualCost, owner.provider);
           log.upstreamCostSource = 'reported';
           log.pendingActual = false;
           log.holdAmount = 0;
@@ -3541,9 +3608,7 @@ function billingRequestHeaders(bearer, extra = {}, clientRequestId = '') {
 async function fetchUpstream(provider, payload, outputBudget, model, overrideApiKey = null, abortHolder = null, clientRequestId = '') {
   const controller = new AbortController();
   if (abortHolder) abortHolder.abort = () => { try { controller.abort(); } catch { /* ignore */ } };
-  const waitMs = payload && payload.stream
-    ? Math.min(Math.max(Number(provider.timeoutMs) || 0, 180000), 300000)
-    : (provider.timeoutMs || 60000);
+  const waitMs = providerFetchTimeoutMs(provider, { stream: !!(payload && payload.stream) });
   const timeout = setTimeout(() => controller.abort(), waitMs);
   const bearer = String(overrideApiKey || provider.apiKey || '').trim();
   try {
@@ -3621,8 +3686,8 @@ function normalizeResponsesUsage(usage) {
 async function fetchUpstreamResponses(provider, payload, model, overrideApiKey = null, abortHolder = null, clientRequestId = '') {
   const controller = new AbortController();
   if (abortHolder) abortHolder.abort = () => { try { controller.abort(); } catch { /* ignore */ } };
-  // Ignore the 60s chat timeoutMs: Codex tool rounds need several minutes.
-  const waitMs = Math.min(Math.max(Number(provider.timeoutMs) || 0, 180000), 300000);
+  // Ignore a short chat timeoutMs: Codex tool rounds need several minutes.
+  const waitMs = Math.max(providerFetchTimeoutMs(provider, { stream: true }), 180000);
   const timeout = setTimeout(() => controller.abort(), waitMs);
   const bearer = String(overrideApiKey || provider.apiKey || '').trim();
   const endpoint = responsesEndpointFromChatUrl(provider.url);
@@ -3649,7 +3714,7 @@ async function fetchUpstreamResponses(provider, payload, model, overrideApiKey =
 async function fetchUpstreamMessages(provider, payload, model, overrideApiKey = null, extraHeaders = {}, abortHolder = null, clientRequestId = '') {
   const controller = new AbortController();
   if (abortHolder) abortHolder.abort = () => { try { controller.abort(); } catch { /* ignore */ } };
-  const waitMs = Math.min(Math.max(Number(provider.timeoutMs) || 0, 180000), 300000);
+  const waitMs = providerFetchTimeoutMs(provider, { stream: !!(payload && payload.stream) });
   const timeout = setTimeout(() => controller.abort(), waitMs);
   const bearer = String(overrideApiKey || provider.apiKey || '').trim();
   const endpoint = messagesEndpointFromChatUrl(provider.url);
@@ -3683,6 +3748,57 @@ async function fetchUpstreamMessages(provider, payload, model, overrideApiKey = 
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function fetchChatWithClaudeFallback(provider, payload, outputBudget, model, proxyKey, abortHolder, clientRequestId, extraHeaders = {}) {
+  const kiroFast = isClaudeKiroProvider(provider);
+  const tryAnthFirst = !kiroFast && providerPrefersAnthropicMessages(provider, model);
+  const claude = tryAnthFirst || isClaudeFamilyModel(model);
+  // Kiro/welfare: single chat hop only (upstream /messages hangs the same; stacking caused multi-minute client hangs).
+  const paths = kiroFast ? ['chat'] : (claude ? (tryAnthFirst ? ['messages', 'chat'] : ['chat', 'messages']) : ['chat']);
+  const attempts = kiroFast ? 1 : Math.max(1, Number(provider?.maxRetries || 0) + 1);
+  const models = [model];
+  const alt = String(provider?.defaultModel || '').trim();
+  if (!kiroFast && claude && alt && alt !== model) models.push(alt);
+
+  async function tryModel(useModel) {
+    let lastErr = '';
+    let lastResponse = null;
+    const callMessages = () => fetchUpstreamMessages(
+      provider,
+      chatToAnthropicPayload({ ...payload, model: useModel, max_tokens: outputBudget, stream: payload?.stream === true }),
+      useModel,
+      proxyKey,
+      extraHeaders,
+      abortHolder,
+      clientRequestId
+    );
+    const callChat = () => fetchUpstream(provider, payload, outputBudget, useModel, proxyKey, abortHolder, clientRequestId);
+    for (let n = 0; n < attempts; n++) {
+      for (const via of paths) {
+        try {
+          const response = via === 'messages' ? await callMessages() : await callChat();
+          if (response.ok) return { ok: true, via, response, model: useModel };
+          lastErr = await response.text().catch(() => '');
+          lastResponse = response;
+          if (via === 'chat' && !claude) {
+            return { ok: false, via, response, errText: lastErr, model: useModel };
+          }
+        } catch (err) {
+          lastErr = err?.message || String(err);
+          lastResponse = null;
+        }
+      }
+    }
+    return { ok: false, via: paths[0], response: lastResponse, errText: lastErr, model: useModel };
+  }
+
+  let last = null;
+  for (const useModel of models) {
+    last = await tryModel(useModel);
+    if (last.ok) return last;
+  }
+  return last || { ok: false, via: paths[0], errText: '' };
 }
 
 function providerSupportsResponsesPassthrough(provider) {
@@ -3840,23 +3956,24 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
   if (!payload || !Array.isArray(payload.messages) || !payload.messages.length) return fail(res, 400, 'messages 不能为空');
   if (apiKeyRec && apiKeyRec.enabled === false) return fail(res, 403, '该 API 密钥已停用');
   if (isBanned(user)) return fail(res, 403, '账号已被封禁');
-  if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
   scrubStuckReserves(user, apiKeyRec);
 
   const requestedModel = String(payload.model || '');
-  const pinned = apiKeyRec?.groupId
-    ? (db.settings?.providers || []).find((p) => p.id === apiKeyRec.groupId && p.enabled !== false && !isMaintenanceProvider(p))
-    : null;
-  const primaryHint = pinned || providersForModel(payload, db)[0];
+  const pinned = pinnedProviderForKey(db, apiKeyRec);
+  const primaryHint = pinned || providersForModel(payload, db)[0] || providers(db)[0] || null;
   if (!primaryHint) return fail(res, 503, '模型服务暂不可用，请稍后重试');
   const authorized = resolveAuthorizedModel(db, apiKeyRec, requestedModel, primaryHint);
-  if (!authorized.ok) return fail(res, 400, '该密钥无权调用此模型');
+  if (failIfModelUnauthorized(res, authorized)) return;
   const model = authorized.model;
-  let candidates = providersForModel({ ...payload, model }, db);
-  if (pinned) {
-    candidates = [pinned, ...candidates.filter((p) => p.id !== pinned.id)];
-  }
-  if (!candidates.length) candidates = [primaryHint];
+  let candidates = chatCandidatesForRequest({
+    providers: providers(db),
+    model,
+    pinnedProvider: pinned,
+    allowCrossGroupFailover: false
+  });
+  if (!candidates.length) candidates = pinned ? [pinned] : [];
+  if (!candidates.length) return fail(res, 404, `未知模型：${model}`, { code: 'model_not_found' });
+  if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
   const primary = candidates[0];
   const rate = providerMultiplier(primary, db);
   const inputReserve = Math.ceil(JSON.stringify(payload.messages).length * 2) + 256;
@@ -3932,6 +4049,7 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
   const started = Date.now();
   const wantStream = payload.stream === true;
   let lastError = null;
+  hydratePayloadFiles(payload, db, { dataDir, userId: user.id });
 
   for (const provider of candidates) {
     let live = null;
@@ -3954,15 +4072,25 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
       }
       const abortHolder = {};
       const clientRequestId = `client:${id('req')}`;
-      const upstream = await fetchUpstream(provider, upstreamPayload, outputBudget, model || provider.defaultModel, proxyKey, abortHolder, clientRequestId);
-      if (!upstream.ok) {
-        const errText = await upstream.text().catch(() => '');
-        updateProviderHealth(db, provider.id, false, `HTTP ${upstream.status}: ${errText.slice(0, 120)}`);
-      recordSiteError(db, { source: 'chat', code: 'channel_down', message: `上游对话失败 HTTP ${upstream.status}（${provider.name}）`, detail: errText.slice(0, 300), fix: tipsForCode('channel_down'), context: { providerId: provider.id, userId: user.id } });
+      const fetched = await fetchChatWithClaudeFallback(
+        provider,
+        upstreamPayload,
+        outputBudget,
+        model || provider.defaultModel,
+        proxyKey,
+        abortHolder,
+        clientRequestId,
+        req.headers
+      );
+      if (!fetched.ok) {
+        const errText = String(fetched.errText || '').slice(0, 300);
+        updateProviderHealth(db, provider.id, false, `HTTP ${fetched.response?.status || 0}: ${errText.slice(0, 120)}`);
+        recordSiteError(db, { source: 'chat', code: 'channel_down', message: `上游对话失败（${provider.name}）`, detail: errText, fix: tipsForCode('channel_down'), context: { providerId: provider.id, userId: user.id } });
         writeDb(db);
         lastError = new Error('provider_error');
         continue;
       }
+      const upstream = fetched.response;
 
       updateProviderHealth(db, provider.id, true);
       writeDb(db);
@@ -3990,7 +4118,8 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
           abortHolder,
           live,
           reservation,
-          clientRequestId
+          clientRequestId,
+          anthropicUpstream: fetched.via === 'messages'
         });
       }
 
@@ -4004,6 +4133,14 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
         lastError = new Error('invalid_json');
         await live.abandon();
         continue;
+      }
+      if (fetched.via === 'messages') {
+        if (result && (result.type === 'error' || result.error)) {
+          lastError = new Error(result.error?.message || result.message || 'anthropic_error');
+          await live.abandon();
+          continue;
+        }
+        result = anthropicMessageToChatCompletion(result, settledModel);
       }
 
       const usage = result.usage || {};
@@ -4044,7 +4181,8 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
   const {
     model, rate, tokenReservation, amountReservation, started, inputReserve,
     apiKeyRec = null, responsesApi = false, anthropicApi = false,
-    abortHolder = null, live = null, reservation = null, clientRequestId = ''
+    abortHolder = null, live = null, reservation = null, clientRequestId = '',
+    anthropicUpstream = false
   } = ctx;
   const hold = reservation || { tokenReservation, amountReservation };
   const billing = live || startLiveBillSession({
@@ -4142,6 +4280,55 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
       }
       try {
         const parsed = JSON.parse(data);
+        if (anthropicUpstream) {
+          usage = mergeAnthropicStreamUsage(usage || {}, parsed);
+          if (parsed.usage || parsed.message?.usage) {
+            const norm = normalizeAnthropicUsage(usage);
+            billing.noteUsage?.(norm);
+          }
+          const textDelta = parsed?.delta?.text
+            || (parsed?.delta?.type === 'text_delta' ? parsed.delta.text : '')
+            || '';
+          if (parsed.type === 'content_block_delta' && textDelta) {
+            completionText += textDelta;
+            if (writeOpenAi) {
+              const chunk = {
+                id: `chatcmpl_${responseId}`,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [{ index: 0, delta: { content: textDelta }, finish_reason: null }]
+              };
+              try { res.write(`data: ${JSON.stringify(chunk)}\n\n`); } catch { /* ignore */ }
+            }
+            if (responsesApi) emitResponsesDelta(textDelta);
+            if (anthropicApi) {
+              if (!anthropicStarted) {
+                anthropicStarted = true;
+                writeAnthropicSse(res, 'message_start', {
+                  type: 'message_start',
+                  message: { id: responseId, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } }
+                });
+                writeAnthropicSse(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+              }
+              writeAnthropicSse(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: textDelta } });
+            }
+          }
+          if (Array.isArray(parsed?.content_block ? [parsed.content_block] : parsed?.content)) {
+            /* ignore */
+          }
+          if (parsed.type === 'content_block_start' && parsed.content_block?.type === 'tool_use') {
+            const idx = Number.isInteger(parsed.index) ? parsed.index : toolAcc.length;
+            toolAcc[idx] = { id: parsed.content_block.id || '', name: parsed.content_block.name || '', arguments: '' };
+          }
+          if (parsed.type === 'content_block_delta' && parsed.delta?.type === 'input_json_delta') {
+            const idx = Number.isInteger(parsed.index) ? parsed.index : Math.max(0, toolAcc.length - 1);
+            if (!toolAcc[idx]) toolAcc[idx] = { id: '', name: '', arguments: '' };
+            toolAcc[idx].arguments += parsed.delta.partial_json || '';
+          }
+          if (anthropicStreamFinished(parsed, data)) streamFinishReason = parsed.stop_reason || streamFinishReason || 'end_turn';
+          continue;
+        }
         if (writeOpenAi) {
           const masked = sanitizeSseDataLine(`data: ${data}`, model);
           if (masked) {
@@ -4260,6 +4447,8 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
   }
 
   if (settled) return;
+
+  if (anthropicUpstream && usage) usage = normalizeAnthropicUsage(usage);
 
   if (!usage) {
     const promptTokens = inputReserve;
@@ -5050,10 +5239,18 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/api/admin/security-alerts') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
     db.securityAlerts ??= [];
+    const openCount = db.securityAlerts.filter(a => a.status === 'open').length;
     return json(res, 200, {
       alerts: db.securityAlerts.slice(0, 50).map(publicSecurityAlert),
-      openCount: db.securityAlerts.filter(a => a.status === 'open').length
+      openCount,
+      open: openCount
     });
+  }
+
+  if (req.method === 'GET' && (url.pathname === '/api/admin/billing-alerts' || url.pathname === '/api/admin/billing/alerts')) {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const stats = poolStats(db);
+    return json(res, 200, buildBillingAlerts(db, stats));
   }
 
   if (req.method === 'POST' && url.pathname.startsWith('/api/admin/security-alerts/') && url.pathname.endsWith('/ban-all')) {
@@ -5729,6 +5926,7 @@ const server = http.createServer(async (req, res) => {
       await waitForUpstreamUsageSync();
       const billingDb = readDb();
       const repricedLedgerRows = repriceStoredUpstreamBills(billingDb);
+      writeDb(billingDb);
       const ledgerSync = await reconcileUpstreamUsageLedger(billingDb, { fullBackfill: true });
       writeDb(billingDb);
       out.ledgerSync = ledgerSync;
@@ -6018,6 +6216,123 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  if (/^\/v1\/files(\/|$)/.test(url.pathname) && ['GET', 'POST', 'DELETE'].includes(req.method)) {
+    if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
+    const apiKey = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const found = findByApiSecret(db, apiKey);
+    if (!found) return fail(res, 401, '无效的 API Key');
+    const user = found.user;
+    const apiKeyRec = found.key;
+    if (apiKeyRec && apiKeyRec.enabled === false) return fail(res, 403, '该 API 密钥已停用');
+    if (isBanned(user)) return fail(res, 403, '账号已被封禁');
+    const rest = url.pathname.slice('/v1/files'.length).replace(/^\/+/, '');
+    const [fileId, fileAction] = rest ? rest.split('/') : ['', ''];
+    const provider = pinnedProviderForKey(db, apiKeyRec)
+      || providers(db).find((p) => isVip1129Provider(p) || isBeibeihaiProvider(p))
+      || providers(db)[0]
+      || null;
+    const raw = req.method === 'GET' ? Buffer.alloc(0) : await readRawBody(req, MAX_FILE_UPLOAD_BODY);
+
+    if (req.method === 'POST' && url.pathname === '/v1/files') {
+      const parsed = parseUpload(req.headers['content-type'], raw);
+      const created = createStoredFile(db, {
+        dataDir,
+        userId: user.id,
+        filename: parsed.filename,
+        purpose: parsed.purpose,
+        bytes: parsed.bytes,
+        contentType: parsed.contentType
+      });
+      writeDb(db);
+      if (provider) {
+        try {
+          const proxyKey = await ensureProxyApiKey(db, user, provider, apiKeyRec);
+          const endpoint = filesEndpointFromChatUrl(provider.url, '');
+          if (proxyKey && endpoint && /^https:\/\//i.test(endpoint)) {
+            const headers = { Authorization: `Bearer ${proxyKey}` };
+            const ct = req.headers['content-type'];
+            if (ct) headers['Content-Type'] = ct;
+            const upstream = await fetch(endpoint, {
+              method: 'POST',
+              headers,
+              body: raw,
+              signal: AbortSignal.timeout(60000)
+            });
+            if (upstream.ok && /json/i.test(upstream.headers.get('content-type') || '')) {
+              await upstream.text().catch(() => '');
+            }
+          }
+        } catch { /* local file remains source of truth */ }
+      }
+      return json(res, 200, created);
+    }
+
+    if (req.method === 'GET' && url.pathname === '/v1/files') {
+      return json(res, 200, { object: 'list', data: listStoredFiles(db, user.id) });
+    }
+
+    if (fileId && req.method === 'GET' && fileAction === 'content') {
+      const row = findStoredFile(db, fileId, user.id);
+      const bytes = row ? readStoredFileBytes(dataDir, row) : null;
+      if (!row || !bytes) {
+        return json(res, 404, { error: { message: '文件不存在', type: 'invalid_request_error', code: 'file_not_found' } });
+      }
+      res.writeHead(200, {
+        'Content-Type': row.contentType || 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${String(row.filename || 'file').replace(/"/g, '')}"`,
+        'Cache-Control': 'no-store'
+      });
+      return res.end(bytes);
+    }
+
+    if (fileId && req.method === 'GET' && !fileAction) {
+      const row = findStoredFile(db, fileId, user.id);
+      if (!row) {
+        return json(res, 404, { error: { message: '文件不存在', type: 'invalid_request_error', code: 'file_not_found' } });
+      }
+      return json(res, 200, {
+        id: row.id,
+        object: 'file',
+        bytes: row.bytes,
+        created_at: row.created_at,
+        filename: row.filename,
+        purpose: row.purpose,
+        status: row.status
+      });
+    }
+
+    if (fileId && req.method === 'POST' && !fileAction) {
+      const parsed = parseUpload(req.headers['content-type'], raw, 'upload.bin');
+      const updated = updateStoredFile(db, {
+        dataDir,
+        fileId,
+        userId: user.id,
+        filename: parsed.filename,
+        purpose: parsed.purpose,
+        bytes: parsed.bytes,
+        contentType: parsed.contentType
+      });
+      if (!updated) {
+        return json(res, 404, { error: { message: '文件不存在', type: 'invalid_request_error', code: 'file_not_found' } });
+      }
+      writeDb(db);
+      return json(res, 200, updated);
+    }
+
+    if (fileId && req.method === 'DELETE') {
+      const ok = deleteStoredFile(db, { dataDir, fileId, userId: user.id });
+      if (!ok) {
+        return json(res, 404, { error: { message: '文件不存在', type: 'invalid_request_error', code: 'file_not_found' } });
+      }
+      writeDb(db);
+      return json(res, 200, { id: fileId, object: 'file', deleted: true });
+    }
+
+    return json(res, 404, {
+      error: { message: '文件不存在', type: 'invalid_request_error', code: 'file_not_found' }
+    });
+  }
+
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
     if (!rateLimit(req, res, CHAT_RATE_LIMIT, 'chat')) return;
     const apiKey = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
@@ -6076,18 +6391,25 @@ const server = http.createServer(async (req, res) => {
     const apiKeyRec = found.key;
     if (apiKeyRec && apiKeyRec.enabled === false) return fail(res, 403, '该 API 密钥已停用');
     if (isBanned(user)) return fail(res, 403, '账号已被封禁');
-    if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
     scrubStuckReserves(user, apiKeyRec);
 
-    const pseudoPayload = { model: raw.model, messages: [{ role: 'user', content: 'x' }] };
-    const allCandidates = providersForModel(pseudoPayload, db);
-    const passthroughCandidates = allCandidates.filter(providerSupportsResponsesPassthrough).slice(0, 2);
-    const candidates = passthroughCandidates.length ? passthroughCandidates : allCandidates.slice(0, 1);
+    const pinned = pinnedProviderForKey(db, apiKeyRec);
+    const allCandidates = chatCandidatesForRequest({
+      providers: providers(db),
+      model: String(raw.model || ''),
+      pinnedProvider: pinned,
+      allowCrossGroupFailover: false
+    });
+    const passthroughAll = allCandidates.filter(providerSupportsResponsesPassthrough);
+    const passthroughCandidates = pinned ? passthroughAll.slice(0, 1) : passthroughAll.slice(0, 4);
+    const candidates = passthroughCandidates.length ? passthroughCandidates : allCandidates.slice(0, pinned ? 1 : 2);
     if (!candidates.length) return fail(res, 503, '模型服务暂不可用，请稍后再试');
     const primary = candidates[0];
     const authorized = resolveAuthorizedModel(db, apiKeyRec, raw.model, primary);
-    if (!authorized.ok) return fail(res, 400, '该密钥未授权使用此模型');
+    if (failIfModelUnauthorized(res, authorized)) return;
+    if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
     const model = authorized.model;
+    hydratePayloadFiles(raw, db, { dataDir, userId: user.id });
     const rate = providerMultiplier(primary, db);
     const inputReserve = Math.ceil(JSON.stringify(raw).length / 3) + 256;
     const requestedOutput = Math.max(1, Math.min(Number(raw.max_tokens) || DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOKENS));
@@ -6161,6 +6483,11 @@ const server = http.createServer(async (req, res) => {
     for (const provider of candidates) {
       let live = null;
       try {
+        if (isClaudeKiroProvider(provider)) {
+          // Upstream Kiro /messages hangs like /chat; skip passthrough and use chat fail-fast below.
+          lastError = new Error('kiro_skip_messages_passthrough');
+          break;
+        }
         const proxyKey = await ensureProxyApiKey(db, user, provider, apiKeyRec);
         if (!proxyKey) {
           lastError = new Error('missing_proxy_key');
@@ -6333,21 +6660,28 @@ const server = http.createServer(async (req, res) => {
     const apiKeyRec = found.key;
     if (apiKeyRec && apiKeyRec.enabled === false) return fail(res, 403, '该 API 密钥已停用');
     if (isBanned(user)) return fail(res, 403, '账号已被封禁');
-    if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
     scrubStuckReserves(user, apiKeyRec);
 
     // Prefer native /v1/responses passthrough (keeps tools / function_call for Codex).
     // Fall back to lossy chat/completions conversion only if every upstream rejects responses.
-    const pseudoPayload = { model: raw.model, messages: [{ role: 'user', content: 'x' }] };
-    const allCandidates = providersForModel(pseudoPayload, db);
+    const pinned = pinnedProviderForKey(db, apiKeyRec);
+    const allCandidates = chatCandidatesForRequest({
+      providers: providers(db),
+      model: String(raw.model || ''),
+      pinnedProvider: pinned,
+      allowCrossGroupFailover: false
+    });
     // Codex/tools need native /v1/responses — prefer vip1129 / OpenAI-compatible only.
-    const passthroughCandidates = allCandidates.filter(providerSupportsResponsesPassthrough).slice(0, 2);
-    const candidates = passthroughCandidates.length ? passthroughCandidates : allCandidates.slice(0, 1);
+    const passthroughAll = allCandidates.filter(providerSupportsResponsesPassthrough);
+    const passthroughCandidates = pinned ? passthroughAll.slice(0, 1) : passthroughAll.slice(0, 4);
+    const candidates = passthroughCandidates.length ? passthroughCandidates : allCandidates.slice(0, pinned ? 1 : 2);
     if (!candidates.length) return fail(res, 503, '模型服务暂不可用，请稍后再试');
     const primary = candidates[0];
     const authorized = resolveAuthorizedModel(db, apiKeyRec, raw.model, primary);
-    if (!authorized.ok) return fail(res, 400, '该密钥未授权使用此模型');
+    if (failIfModelUnauthorized(res, authorized)) return;
+    if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
     const model = authorized.model;
+    hydratePayloadFiles(raw, db, { dataDir, userId: user.id });
     const rate = providerMultiplier(primary, db);
     const inputReserve = Math.ceil(JSON.stringify(raw).length / 3) + 256;
     const requestedOutput = Math.max(1, Math.min(Number(raw.max_output_tokens || raw.max_tokens) || DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOKENS));
@@ -6717,6 +7051,7 @@ for (const provider of initial.settings.providers) {
     provider.cacheReadPricePer1K = Math.max(0, Number(provider.inputPricePer1K || 0) * 0.1);
   }
 }
+if (ensureProviderTimeouts(initial.settings.providers)) writeDb(initial);
 ensureMeasuredPrices(initial);
 if (migrateDeepSeekLivePrices(initial)) writeDb(initial);
 if (!initial.settings.providers.length && LEGACY_UPSTREAM.url && LEGACY_UPSTREAM.apiKey) {
