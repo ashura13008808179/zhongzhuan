@@ -39,7 +39,10 @@ import {
   reconcileGroupMap,
   providerFetchTimeoutMs,
   providerPrefersAnthropicMessages,
-  CLAUDE_CHAT_TIMEOUT_MS
+  CLAUDE_CHAT_TIMEOUT_MS,
+  KIRO_FAILFAST_TIMEOUT_MIN_MS,
+  KIRO_FAILFAST_TIMEOUT_MAX_MS,
+  BEIBEIHAI_GROUP_HINTS
 } from '../lib/relay-core.js';
 
 const isVip1129 = (p) => p?.upstreamSync === 'vip1129' || String(p?.url || '').includes('vip1129.cc');
@@ -76,7 +79,10 @@ assert.equal(intendedUpstreamSync({ id: 'grp_deepseek' }), 'beibeihai');
 assert.equal(intendedUpstreamSync({ id: 'grp_cursor_pool' }), null);
 assert.equal(intendedUpstreamSync({ id: 'grp_glm' }), 'beibeihai');
 assert.equal(intendedUpstreamSync({ id: 'grp_aws_cc' }), 'vip1129');
-assert.equal(intendedUpstreamSync({ id: 'grp_gemini' }), 'beibeihai');
+assert.equal(intendedUpstreamSync({ id: 'grp_gemini' }), null);
+assert.equal(Object.prototype.hasOwnProperty.call(BEIBEIHAI_GROUP_HINTS, 'grp_gemini'), false);
+assert.equal(SEEDED_DEFAULT_MODELS.grp_glm, 'glm-5.2');
+assert.equal(Object.prototype.hasOwnProperty.call(SEEDED_DEFAULT_MODELS, 'grp_gemini'), false);
 
 const wired = wireAllProviders([
   { id: 'grp_deepseek', name: 'DeepSeek', url: 'https://api.deepseek.com/v1/chat/completions', apiKey: '' },
@@ -262,8 +268,10 @@ const kiro = { id: 'grp_claude_kiro', defaultModel: 'claude-sonnet-4-5-20250929'
 applySyncedModels(kiro, kiroCatalog, SEEDED_DEFAULT_MODELS.grp_claude_kiro);
 assert.equal(kiro.defaultModel, 'claude-haiku-4-5-20251001');
 assert.equal(kiro.models[0], 'claude-haiku-4-5-20251001');
-assert.equal(providerPrefersAnthropicMessages(kiro, kiro.defaultModel), true);
-assert.ok(providerFetchTimeoutMs({ id: 'grp_claude_kiro', timeoutMs: 20000 }) >= CLAUDE_CHAT_TIMEOUT_MS);
+assert.equal(providerPrefersAnthropicMessages(kiro, kiro.defaultModel), false);
+const kiroHop = providerFetchTimeoutMs({ id: 'grp_claude_kiro', timeoutMs: 20000 });
+assert.ok(kiroHop >= KIRO_FAILFAST_TIMEOUT_MIN_MS && kiroHop <= KIRO_FAILFAST_TIMEOUT_MAX_MS);
+assert.ok(kiroHop < CLAUDE_CHAT_TIMEOUT_MS);
 assert.ok(providerFetchTimeoutMs({ id: 'grp_deepseek', timeoutMs: 20000 }) >= 90000);
 
 const remapped = reconcileGroupMap(
