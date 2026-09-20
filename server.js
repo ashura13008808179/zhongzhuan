@@ -5796,6 +5796,7 @@ const server = http.createServer(async (req, res) => {
       await waitForUpstreamUsageSync();
       const billingDb = readDb();
       const repricedLedgerRows = repriceStoredUpstreamBills(billingDb);
+      writeDb(billingDb);
       const ledgerSync = await reconcileUpstreamUsageLedger(billingDb, { fullBackfill: true });
       writeDb(billingDb);
       out.ledgerSync = ledgerSync;
