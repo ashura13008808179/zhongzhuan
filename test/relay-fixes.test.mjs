@@ -35,7 +35,11 @@ import {
   chatCandidatesForRequest,
   filterModelsForProviderFamily,
   pickSeededDefaultModel,
-  SEEDED_DEFAULT_MODELS
+  SEEDED_DEFAULT_MODELS,
+  reconcileGroupMap,
+  providerFetchTimeoutMs,
+  providerPrefersAnthropicMessages,
+  CLAUDE_CHAT_TIMEOUT_MS
 } from '../lib/relay-core.js';
 
 const isVip1129 = (p) => p?.upstreamSync === 'vip1129' || String(p?.url || '').includes('vip1129.cc');
@@ -251,5 +255,35 @@ const unknownRoute = chatCandidatesForRequest({
   model: 'zz-unknown-model-xyz'
 });
 assert.deepEqual(unknownRoute, []);
+
+const kiroCatalog = ['claude-sonnet-4-5-20250929', 'claude-fable-5', 'claude-opus-4'];
+assert.equal(pickSeededDefaultModel({ id: 'grp_claude_kiro' }, kiroCatalog, SEEDED_DEFAULT_MODELS.grp_claude_kiro), SEEDED_DEFAULT_MODELS.grp_claude_kiro);
+const kiro = { id: 'grp_claude_kiro', defaultModel: 'claude-sonnet-4-5-20250929', models: kiroCatalog };
+applySyncedModels(kiro, kiroCatalog, SEEDED_DEFAULT_MODELS.grp_claude_kiro);
+assert.equal(kiro.defaultModel, 'claude-haiku-4-5-20251001');
+assert.equal(kiro.models[0], 'claude-haiku-4-5-20251001');
+assert.equal(providerPrefersAnthropicMessages(kiro, kiro.defaultModel), true);
+assert.ok(providerFetchTimeoutMs({ id: 'grp_claude_kiro', timeoutMs: 20000 }) >= CLAUDE_CHAT_TIMEOUT_MS);
+assert.ok(providerFetchTimeoutMs({ id: 'grp_deepseek', timeoutMs: 20000 }) >= 90000);
+
+const remapped = reconcileGroupMap(
+  { grp_claude_kiro: 1, grp_claude_kiro_welfare: 33 },
+  [
+    { id: 1, name: 'DeepSeek 官方' },
+    { id: 89, name: 'Kiro（AWS企业号）' },
+    { id: 33, name: 'Kiro（福利）' }
+  ],
+  ['grp_claude_kiro', 'grp_claude_kiro_welfare']
+);
+assert.equal(remapped.grp_claude_kiro, 89);
+assert.equal(remapped.grp_claude_kiro_welfare, 33);
+
+const pinnedStill = chatCandidatesForRequest({
+  providers: [kiro, awsCc],
+  model: 'claude-sonnet-4-5-20250929',
+  pinnedProvider: kiro,
+  allowCrossGroupFailover: false
+});
+assert.deepEqual(pinnedStill.map((p) => p.id), ['grp_claude_kiro']);
 
 console.log('relay-fixes.test.mjs: all assertions passed');

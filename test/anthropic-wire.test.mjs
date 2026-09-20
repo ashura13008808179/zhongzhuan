@@ -5,6 +5,8 @@ import {
   mergeAnthropicStreamUsage,
   anthropicStreamFinished,
   anthropicToChatPayload,
+  chatToAnthropicPayload,
+  anthropicMessageToChatCompletion,
   chatCompletionToAnthropic
 } from '../lib/anthropic-wire.js';
 
@@ -80,5 +82,38 @@ assert.equal(anth.stop_reason, 'tool_use');
 assert.equal(anth.content[0].type, 'tool_use');
 assert.equal(anth.content[0].name, 'read_local_file');
 assert.equal(anth.content[0].input.path, 'probe-in.txt');
+
+const roundTrip = chatToAnthropicPayload(converted);
+assert.equal(roundTrip.tools[0].name, 'read_local_file');
+assert.equal(roundTrip.max_tokens, 64);
+assert.ok(roundTrip.messages.some((m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'tool_use' && p.name === 'read_local_file')));
+assert.ok(roundTrip.messages.some((m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'tool_result')));
+
+const writeTools = chatToAnthropicPayload({
+  model: 'claude-haiku-4-5-20251001',
+  max_tokens: 32,
+  tools: [{
+    type: 'function',
+    function: {
+      name: 'write_file',
+      description: 'Create or overwrite a file',
+      parameters: { type: 'object', properties: { path: { type: 'string' }, contents: { type: 'string' } }, required: ['path', 'contents'] }
+    }
+  }],
+  messages: [{ role: 'user', content: '添加文件 notes.txt' }]
+});
+assert.equal(writeTools.tools[0].name, 'write_file');
+assert.equal(writeTools.messages[0].content, '添加文件 notes.txt');
+
+const fromAnth = anthropicMessageToChatCompletion({
+  id: 'msg_1',
+  model: 'claude-haiku-4-5-20251001',
+  content: [{ type: 'tool_use', id: 'toolu_w', name: 'write_file', input: { path: 'notes.txt', contents: 'hi' } }],
+  stop_reason: 'tool_use',
+  usage: { input_tokens: 9, output_tokens: 4, actual_cost: 0.001 }
+}, 'claude-haiku-4-5-20251001');
+assert.equal(fromAnth.choices[0].finish_reason, 'tool_calls');
+assert.equal(fromAnth.choices[0].message.tool_calls[0].function.name, 'write_file');
+assert.equal(fromAnth.usage.actual_cost, 0.001);
 
 console.log('anthropic-wire.test.mjs: all assertions passed');

@@ -50,7 +50,6 @@ import { pushPaymentEvent, waitForEvents, currentSeq, publicPaymentEvent } from 
 import {
   compactGroupMap,
   normalizeAvailableGroups,
-  suggestGroupMap,
   wireAllProviders,
   resolveProxyApiKey as resolveProxyApiKeyPure,
   findSyncedKeyRecord,
@@ -80,7 +79,12 @@ import {
   normalizeBillingMultiplier,
   DEFAULT_BILLING_MULTIPLIER,
   defaultDisplayMultiplier,
-  resolveDisplayMultiplier
+  resolveDisplayMultiplier,
+  reconcileGroupMap,
+  providerFetchTimeoutMs,
+  ensureProviderTimeouts,
+  providerPrefersAnthropicMessages,
+  isClaudeFamilyModel
 } from './lib/relay-core.js';
 import {
   modelPrice,
@@ -157,8 +161,21 @@ import {
   anthropicStreamFinished,
   anthropicContentToText,
   anthropicToChatPayload,
+  chatToAnthropicPayload,
+  anthropicMessageToChatCompletion,
   chatCompletionToAnthropic as chatCompletionToAnthropicWire
 } from './lib/anthropic-wire.js';
+import { buildBillingAlerts } from './lib/billing-alerts.js';
+import {
+  parseUpload,
+  createStoredFile,
+  listStoredFiles,
+  findStoredFile,
+  readStoredFileBytes,
+  updateStoredFile,
+  deleteStoredFile,
+  hydratePayloadFiles
+} from './lib/relay-files.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, 'public');
@@ -928,7 +945,7 @@ async function autofillBeibeihaiGroupMap(db, token = null) {
   const listed = await beibeihaiListGroups(cfg.baseUrl, authToken);
   if (!listed.ok) return cfg;
   const groups = normalizeAvailableGroups(listed.data);
-  const nextMap = suggestGroupMap(cfg.groupMap, groups, localBeibeihaiGroupIds(db), BEIBEIHAI_GROUP_HINTS);
+  const nextMap = reconcileGroupMap(cfg.groupMap, groups, localBeibeihaiGroupIds(db), BEIBEIHAI_GROUP_HINTS);
   if (JSON.stringify(nextMap) !== JSON.stringify(compactGroupMap(cfg.groupMap))) {
     cfg.groupMap = nextMap;
     saveBeibeihaiConfig(db, cfg);
@@ -1028,7 +1045,7 @@ async function autofillVip1129GroupMap(db, token = null) {
   const listed = await vip1129ListGroups(cfg.baseUrl, authToken);
   if (!listed.ok) return cfg;
   const groups = normalizeAvailableGroups(listed.data);
-  const nextMap = suggestGroupMap(cfg.groupMap, groups, localVip1129GroupIds(db), VIP1129_GROUP_HINTS);
+  const nextMap = reconcileGroupMap(cfg.groupMap, groups, localVip1129GroupIds(db), VIP1129_GROUP_HINTS);
   if (JSON.stringify(nextMap) !== JSON.stringify(compactGroupMap(cfg.groupMap))) {
     cfg.groupMap = nextMap;
     saveVip1129Config(db, cfg);
@@ -1518,9 +1535,9 @@ const DEFAULT_MODEL_GROUPS = [
   { id: 'grp_kimi', name: 'Kimi', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'kimi-k2.6', models: [], priority: 100, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_kimi') },
   { id: 'grp_gemini', name: 'Gemini', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'gemini-2.5-flash', models: [], priority: 110, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_gemini') },
   { id: 'grp_grok_heavy', name: 'Grok Heavy', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'composer-2.5', models: [], priority: 120, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_grok_heavy'), timeoutMs: 90000 },
-  { id: 'grp_claude_kiro', name: 'Claude-Kiro', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-haiku-4-5-20251001', models: [], priority: 130, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_claude_kiro') },
-  { id: 'grp_claude_kiro_welfare', name: 'Claude-Kiro 福利', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-fable-5', models: [], priority: 140, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_claude_kiro_welfare') },
-  { id: 'grp_aws_cc', name: 'AWS-CC', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: 'claude-fable-5', models: [], priority: 210, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_aws_cc') },
+  { id: 'grp_claude_kiro', name: 'Claude-Kiro', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-haiku-4-5-20251001', models: [], priority: 130, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_claude_kiro'), timeoutMs: 120000 },
+  { id: 'grp_claude_kiro_welfare', name: 'Claude-Kiro 福利', url: BEIBEIHAI_CHAT_URL, upstreamSync: 'beibeihai', defaultModel: 'claude-fable-5', models: [], priority: 140, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_claude_kiro_welfare'), timeoutMs: 120000 },
+  { id: 'grp_aws_cc', name: 'AWS-CC', url: VIP1129_CHAT_URL, upstreamSync: 'vip1129', defaultModel: 'claude-fable-5', models: [], priority: 210, billingMultiplier: DEFAULT_BILLING_MULTIPLIER, displayMultiplier: defaultDisplayMultiplier('grp_aws_cc'), timeoutMs: 120000 },
 ];
 
 function seedDefaultProviders(db) {
@@ -1541,7 +1558,7 @@ function seedDefaultProviders(db) {
     priority: g.priority,
     billingMultiplier: Number(g.billingMultiplier) || DEFAULT_BILLING_MULTIPLIER,
     displayMultiplier: resolveDisplayMultiplier(g),
-    timeoutMs: Number(g.timeoutMs) || 60000,
+    timeoutMs: Number(g.timeoutMs) || providerFetchTimeoutMs(g),
     maxRetries: 1,
     modelPrices: {},
     maintenance: !!g.maintenance,
@@ -1573,7 +1590,7 @@ function ensureDefaultModelGroups(db) {
       priority: g.priority,
       billingMultiplier: Number(g.billingMultiplier) || DEFAULT_BILLING_MULTIPLIER,
       displayMultiplier: resolveDisplayMultiplier(g),
-      timeoutMs: Number(g.timeoutMs) || 60000,
+      timeoutMs: Number(g.timeoutMs) || providerFetchTimeoutMs(g),
       maxRetries: 1,
       modelPrices: {},
       maintenance: !!g.maintenance,
@@ -1906,23 +1923,6 @@ async function readRawBody(req, maxBytes = MAX_FILE_UPLOAD_BODY) {
     chunks.push(chunk);
   }
   return Buffer.concat(chunks, size);
-}
-
-function guessUploadFilename(contentType, raw) {
-  const header = String(contentType || '');
-  const text = raw && raw.length < 64 * 1024 ? raw.toString('utf8') : raw ? raw.subarray(0, 4096).toString('utf8') : '';
-  const fromDisp = text.match(/filename\*?=(?:UTF-8''|")?([^\r\n";]+)/i);
-  if (fromDisp) {
-    try { return decodeURIComponent(fromDisp[1].replace(/"/g, '').trim()); } catch { return fromDisp[1].replace(/"/g, '').trim(); }
-  }
-  if (/json/i.test(header)) {
-    try {
-      const parsed = JSON.parse(text);
-      if (parsed?.filename) return String(parsed.filename);
-      if (parsed?.file?.filename) return String(parsed.file.filename);
-    } catch { /* ignore */ }
-  }
-  return 'upload.bin';
 }
 
 async function fetchUpstreamModels(provider, overrideApiKey = null) {
@@ -3607,9 +3607,7 @@ function billingRequestHeaders(bearer, extra = {}, clientRequestId = '') {
 async function fetchUpstream(provider, payload, outputBudget, model, overrideApiKey = null, abortHolder = null, clientRequestId = '') {
   const controller = new AbortController();
   if (abortHolder) abortHolder.abort = () => { try { controller.abort(); } catch { /* ignore */ } };
-  const waitMs = payload && payload.stream
-    ? Math.min(Math.max(Number(provider.timeoutMs) || 0, 180000), 300000)
-    : (provider.timeoutMs || 60000);
+  const waitMs = providerFetchTimeoutMs(provider, { stream: !!(payload && payload.stream) });
   const timeout = setTimeout(() => controller.abort(), waitMs);
   const bearer = String(overrideApiKey || provider.apiKey || '').trim();
   try {
@@ -3687,8 +3685,8 @@ function normalizeResponsesUsage(usage) {
 async function fetchUpstreamResponses(provider, payload, model, overrideApiKey = null, abortHolder = null, clientRequestId = '') {
   const controller = new AbortController();
   if (abortHolder) abortHolder.abort = () => { try { controller.abort(); } catch { /* ignore */ } };
-  // Ignore the 60s chat timeoutMs: Codex tool rounds need several minutes.
-  const waitMs = Math.min(Math.max(Number(provider.timeoutMs) || 0, 180000), 300000);
+  // Ignore a short chat timeoutMs: Codex tool rounds need several minutes.
+  const waitMs = Math.max(providerFetchTimeoutMs(provider, { stream: true }), 180000);
   const timeout = setTimeout(() => controller.abort(), waitMs);
   const bearer = String(overrideApiKey || provider.apiKey || '').trim();
   const endpoint = responsesEndpointFromChatUrl(provider.url);
@@ -3715,7 +3713,7 @@ async function fetchUpstreamResponses(provider, payload, model, overrideApiKey =
 async function fetchUpstreamMessages(provider, payload, model, overrideApiKey = null, extraHeaders = {}, abortHolder = null, clientRequestId = '') {
   const controller = new AbortController();
   if (abortHolder) abortHolder.abort = () => { try { controller.abort(); } catch { /* ignore */ } };
-  const waitMs = Math.min(Math.max(Number(provider.timeoutMs) || 0, 180000), 300000);
+  const waitMs = providerFetchTimeoutMs(provider, { stream: !!(payload && payload.stream) });
   const timeout = setTimeout(() => controller.abort(), waitMs);
   const bearer = String(overrideApiKey || provider.apiKey || '').trim();
   const endpoint = messagesEndpointFromChatUrl(provider.url);
@@ -3749,6 +3747,55 @@ async function fetchUpstreamMessages(provider, payload, model, overrideApiKey = 
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function fetchChatWithClaudeFallback(provider, payload, outputBudget, model, proxyKey, abortHolder, clientRequestId, extraHeaders = {}) {
+  const tryAnthFirst = providerPrefersAnthropicMessages(provider, model);
+  const claude = tryAnthFirst || isClaudeFamilyModel(model);
+  const paths = claude ? (tryAnthFirst ? ['messages', 'chat'] : ['chat', 'messages']) : ['chat'];
+  const attempts = Math.max(1, Number(provider?.maxRetries || 0) + 1);
+  const models = [model];
+  const alt = String(provider?.defaultModel || '').trim();
+  if (claude && alt && alt !== model) models.push(alt);
+
+  async function tryModel(useModel) {
+    let lastErr = '';
+    let lastResponse = null;
+    const callMessages = () => fetchUpstreamMessages(
+      provider,
+      chatToAnthropicPayload({ ...payload, model: useModel, max_tokens: outputBudget, stream: payload?.stream === true }),
+      useModel,
+      proxyKey,
+      extraHeaders,
+      abortHolder,
+      clientRequestId
+    );
+    const callChat = () => fetchUpstream(provider, payload, outputBudget, useModel, proxyKey, abortHolder, clientRequestId);
+    for (let n = 0; n < attempts; n++) {
+      for (const via of paths) {
+        try {
+          const response = via === 'messages' ? await callMessages() : await callChat();
+          if (response.ok) return { ok: true, via, response, model: useModel };
+          lastErr = await response.text().catch(() => '');
+          lastResponse = response;
+          if (via === 'chat' && !claude) {
+            return { ok: false, via, response, errText: lastErr, model: useModel };
+          }
+        } catch (err) {
+          lastErr = err?.message || String(err);
+          lastResponse = null;
+        }
+      }
+    }
+    return { ok: false, via: paths[0], response: lastResponse, errText: lastErr, model: useModel };
+  }
+
+  let last = null;
+  for (const useModel of models) {
+    last = await tryModel(useModel);
+    if (last.ok) return last;
+  }
+  return last || { ok: false, via: paths[0], errText: '' };
 }
 
 function providerSupportsResponsesPassthrough(provider) {
@@ -3999,6 +4046,7 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
   const started = Date.now();
   const wantStream = payload.stream === true;
   let lastError = null;
+  hydratePayloadFiles(payload, db, { dataDir, userId: user.id });
 
   for (const provider of candidates) {
     let live = null;
@@ -4021,15 +4069,25 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
       }
       const abortHolder = {};
       const clientRequestId = `client:${id('req')}`;
-      const upstream = await fetchUpstream(provider, upstreamPayload, outputBudget, model || provider.defaultModel, proxyKey, abortHolder, clientRequestId);
-      if (!upstream.ok) {
-        const errText = await upstream.text().catch(() => '');
-        updateProviderHealth(db, provider.id, false, `HTTP ${upstream.status}: ${errText.slice(0, 120)}`);
-      recordSiteError(db, { source: 'chat', code: 'channel_down', message: `上游对话失败 HTTP ${upstream.status}（${provider.name}）`, detail: errText.slice(0, 300), fix: tipsForCode('channel_down'), context: { providerId: provider.id, userId: user.id } });
+      const fetched = await fetchChatWithClaudeFallback(
+        provider,
+        upstreamPayload,
+        outputBudget,
+        model || provider.defaultModel,
+        proxyKey,
+        abortHolder,
+        clientRequestId,
+        req.headers
+      );
+      if (!fetched.ok) {
+        const errText = String(fetched.errText || '').slice(0, 300);
+        updateProviderHealth(db, provider.id, false, `HTTP ${fetched.response?.status || 0}: ${errText.slice(0, 120)}`);
+        recordSiteError(db, { source: 'chat', code: 'channel_down', message: `上游对话失败（${provider.name}）`, detail: errText, fix: tipsForCode('channel_down'), context: { providerId: provider.id, userId: user.id } });
         writeDb(db);
         lastError = new Error('provider_error');
         continue;
       }
+      const upstream = fetched.response;
 
       updateProviderHealth(db, provider.id, true);
       writeDb(db);
@@ -4057,7 +4115,8 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
           abortHolder,
           live,
           reservation,
-          clientRequestId
+          clientRequestId,
+          anthropicUpstream: fetched.via === 'messages'
         });
       }
 
@@ -4071,6 +4130,14 @@ async function chat(req, res, db, user, apiKeyRec = null, prePayload = null) {
         lastError = new Error('invalid_json');
         await live.abandon();
         continue;
+      }
+      if (fetched.via === 'messages') {
+        if (result && (result.type === 'error' || result.error)) {
+          lastError = new Error(result.error?.message || result.message || 'anthropic_error');
+          await live.abandon();
+          continue;
+        }
+        result = anthropicMessageToChatCompletion(result, settledModel);
       }
 
       const usage = result.usage || {};
@@ -4111,7 +4178,8 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
   const {
     model, rate, tokenReservation, amountReservation, started, inputReserve,
     apiKeyRec = null, responsesApi = false, anthropicApi = false,
-    abortHolder = null, live = null, reservation = null, clientRequestId = ''
+    abortHolder = null, live = null, reservation = null, clientRequestId = '',
+    anthropicUpstream = false
   } = ctx;
   const hold = reservation || { tokenReservation, amountReservation };
   const billing = live || startLiveBillSession({
@@ -4209,6 +4277,55 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
       }
       try {
         const parsed = JSON.parse(data);
+        if (anthropicUpstream) {
+          usage = mergeAnthropicStreamUsage(usage || {}, parsed);
+          if (parsed.usage || parsed.message?.usage) {
+            const norm = normalizeAnthropicUsage(usage);
+            billing.noteUsage?.(norm);
+          }
+          const textDelta = parsed?.delta?.text
+            || (parsed?.delta?.type === 'text_delta' ? parsed.delta.text : '')
+            || '';
+          if (parsed.type === 'content_block_delta' && textDelta) {
+            completionText += textDelta;
+            if (writeOpenAi) {
+              const chunk = {
+                id: `chatcmpl_${responseId}`,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [{ index: 0, delta: { content: textDelta }, finish_reason: null }]
+              };
+              try { res.write(`data: ${JSON.stringify(chunk)}\n\n`); } catch { /* ignore */ }
+            }
+            if (responsesApi) emitResponsesDelta(textDelta);
+            if (anthropicApi) {
+              if (!anthropicStarted) {
+                anthropicStarted = true;
+                writeAnthropicSse(res, 'message_start', {
+                  type: 'message_start',
+                  message: { id: responseId, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } }
+                });
+                writeAnthropicSse(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+              }
+              writeAnthropicSse(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: textDelta } });
+            }
+          }
+          if (Array.isArray(parsed?.content_block ? [parsed.content_block] : parsed?.content)) {
+            /* ignore */
+          }
+          if (parsed.type === 'content_block_start' && parsed.content_block?.type === 'tool_use') {
+            const idx = Number.isInteger(parsed.index) ? parsed.index : toolAcc.length;
+            toolAcc[idx] = { id: parsed.content_block.id || '', name: parsed.content_block.name || '', arguments: '' };
+          }
+          if (parsed.type === 'content_block_delta' && parsed.delta?.type === 'input_json_delta') {
+            const idx = Number.isInteger(parsed.index) ? parsed.index : Math.max(0, toolAcc.length - 1);
+            if (!toolAcc[idx]) toolAcc[idx] = { id: '', name: '', arguments: '' };
+            toolAcc[idx].arguments += parsed.delta.partial_json || '';
+          }
+          if (anthropicStreamFinished(parsed, data)) streamFinishReason = parsed.stop_reason || streamFinishReason || 'end_turn';
+          continue;
+        }
         if (writeOpenAi) {
           const masked = sanitizeSseDataLine(`data: ${data}`, model);
           if (masked) {
@@ -4327,6 +4444,8 @@ async function streamChat(req, res, db, user, provider, upstream, ctx) {
   }
 
   if (settled) return;
+
+  if (anthropicUpstream && usage) usage = normalizeAnthropicUsage(usage);
 
   if (!usage) {
     const promptTokens = inputReserve;
@@ -5117,10 +5236,18 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/api/admin/security-alerts') {
     if (!isAdmin(user)) return fail(res, 403, '无权访问');
     db.securityAlerts ??= [];
+    const openCount = db.securityAlerts.filter(a => a.status === 'open').length;
     return json(res, 200, {
       alerts: db.securityAlerts.slice(0, 50).map(publicSecurityAlert),
-      openCount: db.securityAlerts.filter(a => a.status === 'open').length
+      openCount,
+      open: openCount
     });
+  }
+
+  if (req.method === 'GET' && (url.pathname === '/api/admin/billing-alerts' || url.pathname === '/api/admin/billing/alerts')) {
+    if (!isAdmin(user)) return fail(res, 403, '无权访问');
+    const stats = poolStats(db);
+    return json(res, 200, buildBillingAlerts(db, stats));
   }
 
   if (req.method === 'POST' && url.pathname.startsWith('/api/admin/security-alerts/') && url.pathname.endsWith('/ban-all')) {
@@ -6096,53 +6223,108 @@ const server = http.createServer(async (req, res) => {
     if (apiKeyRec && apiKeyRec.enabled === false) return fail(res, 403, '该 API 密钥已停用');
     if (isBanned(user)) return fail(res, 403, '账号已被封禁');
     const rest = url.pathname.slice('/v1/files'.length).replace(/^\/+/, '');
+    const [fileId, fileAction] = rest ? rest.split('/') : ['', ''];
     const provider = pinnedProviderForKey(db, apiKeyRec)
       || providers(db).find((p) => isVip1129Provider(p) || isBeibeihaiProvider(p))
       || providers(db)[0]
       || null;
     const raw = req.method === 'GET' ? Buffer.alloc(0) : await readRawBody(req, MAX_FILE_UPLOAD_BODY);
-    if (provider) {
-      try {
-        const proxyKey = await ensureProxyApiKey(db, user, provider, apiKeyRec);
-        const endpoint = filesEndpointFromChatUrl(provider.url, rest);
-        if (proxyKey && endpoint && /^https:\/\//i.test(endpoint)) {
-          const headers = {
-            Authorization: `Bearer ${proxyKey}`
-          };
-          const ct = req.headers['content-type'];
-          if (ct && req.method !== 'GET') headers['Content-Type'] = ct;
-          const upstream = await fetch(endpoint, {
-            method: req.method,
-            headers,
-            body: req.method === 'GET' ? undefined : raw,
-            signal: AbortSignal.timeout(60000)
-          });
-          const text = await upstream.text();
-          const upType = upstream.headers.get('content-type') || '';
-          if (upstream.ok && /json/i.test(upType)) {
-            res.writeHead(upstream.status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-            return res.end(text);
-          }
-        }
-      } catch {
-        /* fall through to local stub */
-      }
-    }
+
     if (req.method === 'POST' && url.pathname === '/v1/files') {
-      const filename = guessUploadFilename(req.headers['content-type'], raw);
+      const parsed = parseUpload(req.headers['content-type'], raw);
+      const created = createStoredFile(db, {
+        dataDir,
+        userId: user.id,
+        filename: parsed.filename,
+        purpose: parsed.purpose,
+        bytes: parsed.bytes,
+        contentType: parsed.contentType
+      });
+      writeDb(db);
+      if (provider) {
+        try {
+          const proxyKey = await ensureProxyApiKey(db, user, provider, apiKeyRec);
+          const endpoint = filesEndpointFromChatUrl(provider.url, '');
+          if (proxyKey && endpoint && /^https:\/\//i.test(endpoint)) {
+            const headers = { Authorization: `Bearer ${proxyKey}` };
+            const ct = req.headers['content-type'];
+            if (ct) headers['Content-Type'] = ct;
+            const upstream = await fetch(endpoint, {
+              method: 'POST',
+              headers,
+              body: raw,
+              signal: AbortSignal.timeout(60000)
+            });
+            if (upstream.ok && /json/i.test(upstream.headers.get('content-type') || '')) {
+              await upstream.text().catch(() => '');
+            }
+          }
+        } catch { /* local file remains source of truth */ }
+      }
+      return json(res, 200, created);
+    }
+
+    if (req.method === 'GET' && url.pathname === '/v1/files') {
+      return json(res, 200, { object: 'list', data: listStoredFiles(db, user.id) });
+    }
+
+    if (fileId && req.method === 'GET' && fileAction === 'content') {
+      const row = findStoredFile(db, fileId, user.id);
+      const bytes = row ? readStoredFileBytes(dataDir, row) : null;
+      if (!row || !bytes) {
+        return json(res, 404, { error: { message: '文件不存在', type: 'invalid_request_error', code: 'file_not_found' } });
+      }
+      res.writeHead(200, {
+        'Content-Type': row.contentType || 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${String(row.filename || 'file').replace(/"/g, '')}"`,
+        'Cache-Control': 'no-store'
+      });
+      return res.end(bytes);
+    }
+
+    if (fileId && req.method === 'GET' && !fileAction) {
+      const row = findStoredFile(db, fileId, user.id);
+      if (!row) {
+        return json(res, 404, { error: { message: '文件不存在', type: 'invalid_request_error', code: 'file_not_found' } });
+      }
       return json(res, 200, {
-        id: `file_${crypto.randomBytes(12).toString('hex')}`,
+        id: row.id,
         object: 'file',
-        bytes: raw.length,
-        created_at: Math.floor(Date.now() / 1000),
-        filename,
-        purpose: 'assistants',
-        status: 'processed'
+        bytes: row.bytes,
+        created_at: row.created_at,
+        filename: row.filename,
+        purpose: row.purpose,
+        status: row.status
       });
     }
-    if (req.method === 'GET' && url.pathname === '/v1/files') {
-      return json(res, 200, { object: 'list', data: [] });
+
+    if (fileId && req.method === 'POST' && !fileAction) {
+      const parsed = parseUpload(req.headers['content-type'], raw, 'upload.bin');
+      const updated = updateStoredFile(db, {
+        dataDir,
+        fileId,
+        userId: user.id,
+        filename: parsed.filename,
+        purpose: parsed.purpose,
+        bytes: parsed.bytes,
+        contentType: parsed.contentType
+      });
+      if (!updated) {
+        return json(res, 404, { error: { message: '文件不存在', type: 'invalid_request_error', code: 'file_not_found' } });
+      }
+      writeDb(db);
+      return json(res, 200, updated);
     }
+
+    if (fileId && req.method === 'DELETE') {
+      const ok = deleteStoredFile(db, { dataDir, fileId, userId: user.id });
+      if (!ok) {
+        return json(res, 404, { error: { message: '文件不存在', type: 'invalid_request_error', code: 'file_not_found' } });
+      }
+      writeDb(db);
+      return json(res, 200, { id: fileId, object: 'file', deleted: true });
+    }
+
     return json(res, 404, {
       error: { message: '文件不存在', type: 'invalid_request_error', code: 'file_not_found' }
     });
@@ -6215,14 +6397,16 @@ const server = http.createServer(async (req, res) => {
       pinnedProvider: pinned,
       allowCrossGroupFailover: false
     });
-    const passthroughCandidates = allCandidates.filter(providerSupportsResponsesPassthrough).slice(0, 2);
-    const candidates = passthroughCandidates.length ? passthroughCandidates : allCandidates.slice(0, 1);
+    const passthroughAll = allCandidates.filter(providerSupportsResponsesPassthrough);
+    const passthroughCandidates = pinned ? passthroughAll.slice(0, 1) : passthroughAll.slice(0, 4);
+    const candidates = passthroughCandidates.length ? passthroughCandidates : allCandidates.slice(0, pinned ? 1 : 2);
     if (!candidates.length) return fail(res, 503, '模型服务暂不可用，请稍后再试');
     const primary = candidates[0];
     const authorized = resolveAuthorizedModel(db, apiKeyRec, raw.model, primary);
     if (failIfModelUnauthorized(res, authorized)) return;
     if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
     const model = authorized.model;
+    hydratePayloadFiles(raw, db, { dataDir, userId: user.id });
     const rate = providerMultiplier(primary, db);
     const inputReserve = Math.ceil(JSON.stringify(raw).length / 3) + 256;
     const requestedOutput = Math.max(1, Math.min(Number(raw.max_tokens) || DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOKENS));
@@ -6480,14 +6664,16 @@ const server = http.createServer(async (req, res) => {
       allowCrossGroupFailover: false
     });
     // Codex/tools need native /v1/responses — prefer vip1129 / OpenAI-compatible only.
-    const passthroughCandidates = allCandidates.filter(providerSupportsResponsesPassthrough).slice(0, 2);
-    const candidates = passthroughCandidates.length ? passthroughCandidates : allCandidates.slice(0, 1);
+    const passthroughAll = allCandidates.filter(providerSupportsResponsesPassthrough);
+    const passthroughCandidates = pinned ? passthroughAll.slice(0, 1) : passthroughAll.slice(0, 4);
+    const candidates = passthroughCandidates.length ? passthroughCandidates : allCandidates.slice(0, pinned ? 1 : 2);
     if (!candidates.length) return fail(res, 503, '模型服务暂不可用，请稍后再试');
     const primary = candidates[0];
     const authorized = resolveAuthorizedModel(db, apiKeyRec, raw.model, primary);
     if (failIfModelUnauthorized(res, authorized)) return;
     if (!isUnlimited(user) && user.accountActive === false) return fail(res, 402, insufficientBalanceMessage());
     const model = authorized.model;
+    hydratePayloadFiles(raw, db, { dataDir, userId: user.id });
     const rate = providerMultiplier(primary, db);
     const inputReserve = Math.ceil(JSON.stringify(raw).length / 3) + 256;
     const requestedOutput = Math.max(1, Math.min(Number(raw.max_output_tokens || raw.max_tokens) || DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOKENS));
@@ -6857,6 +7043,7 @@ for (const provider of initial.settings.providers) {
     provider.cacheReadPricePer1K = Math.max(0, Number(provider.inputPricePer1K || 0) * 0.1);
   }
 }
+if (ensureProviderTimeouts(initial.settings.providers)) writeDb(initial);
 ensureMeasuredPrices(initial);
 if (migrateDeepSeekLivePrices(initial)) writeDb(initial);
 if (!initial.settings.providers.length && LEGACY_UPSTREAM.url && LEGACY_UPSTREAM.apiKey) {

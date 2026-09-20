@@ -168,11 +168,34 @@ try {
     const files = await req('/v1/files', {
       method: 'POST',
       headers: { Authorization: `Bearer ${v1secret}` },
-      body: JSON.stringify({ purpose: 'assistants' })
+      body: JSON.stringify({ filename: 'probe-in.txt', content: 'AGENT_IO_OK_915', purpose: 'assistants' })
     });
     check('POST /v1/files json not html', !String(files.text || '').toLowerCase().includes('<html') && !String(files.body?.raw || '').toLowerCase().includes('page not found'), String(files.text || files.body?.raw || '').slice(0, 120));
     check('POST /v1/files not bare 404 html', files.status !== 404 || (files.body && files.body.error), `${files.status} ${JSON.stringify(files.body).slice(0, 160)}`);
     check('POST /v1/files api body', files.status === 200 || files.status === 501 || files.status === 401 || files.status === 400, files.status);
+    const fileId = files.body?.id;
+    if (fileId) {
+      const listed = await req('/v1/files', { headers: { Authorization: `Bearer ${v1secret}` } });
+      check('GET /v1/files list', listed.status === 200 && Array.isArray(listed.body.data) && listed.body.data.some((f) => f.id === fileId), JSON.stringify(listed.body).slice(0, 180));
+      const got = await req(`/v1/files/${fileId}`, { headers: { Authorization: `Bearer ${v1secret}` } });
+      check('GET /v1/files/:id', got.status === 200 && got.body.filename === 'probe-in.txt', JSON.stringify(got.body).slice(0, 180));
+      const content = await req(`/v1/files/${fileId}/content`, { headers: { Authorization: `Bearer ${v1secret}` } });
+      check('对话/读取文件 content', content.status === 200 && String(content.text || '').includes('AGENT_IO_OK_915'), String(content.text || '').slice(0, 120));
+      const edited = await req(`/v1/files/${fileId}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${v1secret}` },
+        body: JSON.stringify({ filename: 'probe-in.txt', content: 'EDITED_OK' })
+      });
+      check('对话：修改文件', edited.status === 200 && edited.body.id === fileId, JSON.stringify(edited.body).slice(0, 160));
+      const content2 = await req(`/v1/files/${fileId}/content`, { headers: { Authorization: `Bearer ${v1secret}` } });
+      check('修改后读取文件', content2.status === 200 && String(content2.text || '').includes('EDITED_OK'), String(content2.text || '').slice(0, 120));
+      const created = await req('/v1/files', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${v1secret}` },
+        body: JSON.stringify({ filename: 'added.txt', content: 'NEW_FILE', purpose: 'assistants' })
+      });
+      check('对话：添加文件', created.status === 200 && created.body.id && created.body.filename === 'added.txt', JSON.stringify(created.body).slice(0, 160));
+    }
   }
 
   const ci = await req('/api/checkin', { method: 'POST', headers: userTok, body: '{}' });
@@ -198,6 +221,8 @@ try {
     '/api/admin/orders',
     '/api/admin/checkin',
     '/api/admin/code-pool',
+    '/api/admin/billing-alerts',
+    '/api/admin/security-alerts',
     '/api/admin/site-errors',
     '/api/admin/site-settings',
     '/api/admin/payment-gateway',
@@ -215,6 +240,9 @@ try {
     const g = await req(p);
     check(`guest ${p} forbidden`, g.status === 401 || g.status === 403, g.status);
   }
+  const billingAlerts = await req('/api/admin/billing-alerts', { headers: adminTok });
+  check('admin billing-alerts open defined', billingAlerts.status === 200 && typeof billingAlerts.body.open === 'number', `open=${billingAlerts.body.open}`);
+  check('admin billing-alerts alerts array', Array.isArray(billingAlerts.body.alerts), JSON.stringify(billingAlerts.body).slice(0, 160));
 
   const pricing = await req('/api/admin/pricing', { headers: adminTok });
   check('dual rates', Number(pricing.body.multiplier) === 2.5 && Number(pricing.body.multiplierVip1129) === 1.5, JSON.stringify(pricing.body));
