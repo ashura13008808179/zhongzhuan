@@ -1080,7 +1080,7 @@ function adminTabsHtml() {
     ['rates', '倍率'],
     ['channels', '渠道'],
     ['users', '用户'],
-    ['alerts', '安全告警'],
+    ['alerts', '告警'],
     ['codes', '卡密'],
     ['audit', '审计'],
     ['orders', '订单'],
@@ -1333,7 +1333,7 @@ ${tokenPriceSyncHtml(settings.tokenPriceSync)}</section>`);
         });
       }
     } else if (adminTab === 'alerts') {
-      const { alerts, openCount } = await api('/api/admin/security-alerts');
+      const { alerts, openCount, billingAlerts, billingOpenCount } = await api('/api/admin/security-alerts');
       if (!stillCurrent()) return;
       const rows = (alerts || []).map(a => {
         const names = (a.users || []).map(u => {
@@ -1354,7 +1354,25 @@ ${tokenPriceSyncHtml(settings.tokenPriceSync)}</section>`);
           <td class="ops-cell">${actions}</td>
         </tr>`;
       }).join('') || '<tr><td colspan="6" class="empty">暂无注册暴增告警</td></tr>';
-      shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><div class="card-head"><div><p class="eyebrow">SECURITY</p><h2>安全告警</h2><p class="sub">短时间内大批量注册会推送到值班手机和本页。你可以一键封掉这批账号，或对单个账号点「封号」。</p></div><span class="sub">待处理 ${openCount || 0}</span></div>
+      const billingRows = (billingAlerts || []).map(a => {
+        const names = (a.users || []).map(u => `@${esc(u.username || u.userId)}`).slice(0, 12).join('、') || '-';
+        const st = a.status === 'open' ? '待处理' : '已忽略';
+        const actions = a.status === 'open'
+          ? `<button class="ghost-btn" data-dismiss-billing="${esc(a.id)}">忽略</button>`
+          : `<span class="sub">已处理</span>`;
+        return `<tr class="${a.status === 'open' ? 'is-invert' : ''}">
+          <td>${esc(String(a.createdAt || '').replace('T', ' ').slice(0, 19))}</td>
+          <td>上游实付倒挂 ${Number(a.count || 0)} 笔 · ¥${Number(a.loss || 0).toFixed(4)}</td>
+          <td>${esc(a.day || '-')}</td>
+          <td>${names}</td>
+          <td><span class="tag ${a.status === 'open' ? 'danger' : 'success'}">${st}</span></td>
+          <td class="ops-cell">${actions}</td>
+        </tr>`;
+      }).join('') || '<tr><td colspan="6" class="empty">暂无计费倒挂预警</td></tr>';
+      shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}
+        <section class="card"><div class="card-head"><div><p class="eyebrow">BILLING</p><h2>计费倒挂预警</h2><p class="sub">官方 actual_cost 高于 Token 表收费时会推送到值班手机和本页。客户扣费仍按价格表，不会改成官方账单。</p></div><span class="sub">待处理 ${billingOpenCount || 0}</span></div>
+        <table class="admin-table"><thead><tr><th>时间</th><th>事件</th><th>日期</th><th>用户</th><th>状态</th><th>操作</th></tr></thead><tbody>${billingRows}</tbody></table></section>
+        <section class="card" style="margin-top:16px"><div class="card-head"><div><p class="eyebrow">SECURITY</p><h2>安全告警</h2><p class="sub">短时间内大批量注册会推送到值班手机和本页。你可以一键封掉这批账号，或对单个账号点「封号」。</p></div><span class="sub">待处理 ${openCount || 0}</span></div>
         <div id="alertsMsg" class="inline-msg"></div>
         <table class="admin-table"><thead><tr><th>时间</th><th>事件</th><th>IP</th><th>账号</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></section>`);
       const showAlertErr = (err) => { const el = $('#alertsMsg'); if (el) { el.textContent = err.message || String(err); el.className = 'inline-msg'; } };
@@ -1382,26 +1400,56 @@ ${tokenPriceSyncHtml(settings.tokenPriceSync)}</section>`);
           renderOperations();
         } catch (err) { showAlertErr(err); }
       });
+      page.querySelectorAll('[data-dismiss-billing]').forEach(btn => btn.onclick = async () => {
+        try {
+          await api(`/api/admin/billing-alerts/${btn.dataset.dismissBilling}/dismiss`, { method: 'POST', body: '{}' });
+          renderOperations();
+        } catch (err) { showAlertErr(err); }
+      });
     } else if (adminTab === 'users') {
       const { users } = await api('/api/admin/users');
       if (!stillCurrent()) return;
-      shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><div class="card-head"><div><p class="eyebrow">USERS</p><h2>用户管理</h2><p class="sub">用户名和显示名称全站唯一。可加余额、减余额、改余额、封号。</p></div><span class="sub">${users.length} 位用户</span></div><div id="usersMsg" class="inline-msg"></div><table class="admin-table"><thead><tr><th>邮箱</th><th>用户名</th><th>名称</th><th>余额</th><th>配额</th><th>已用</th><th>角色</th><th>状态</th><th>操作</th></tr></thead><tbody>${users.map(u => `<tr data-user="${esc(u.id)}">
+      shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}<section class="card"><div class="card-head"><div><p class="eyebrow">USERS</p><h2>用户管理</h2><p class="sub">用户名和显示名称全站唯一。可加余额、减余额、改余额、封号。今日收费是 Token 表扣费，上游实付是官方 actual_cost。</p></div><span class="sub">${users.length} 位用户</span></div><div id="usersMsg" class="inline-msg"></div><table class="admin-table"><thead><tr><th>邮箱</th><th>用户名</th><th>名称</th><th>余额</th><th>配额</th><th>已用</th><th>今日收费</th><th>今日上游</th><th>倒挂</th><th>角色</th><th>状态</th><th>操作</th></tr></thead><tbody>${users.map(u => `<tr data-user="${esc(u.id)}" class="${Number(u.todayInverted||0)?'is-invert':''}">
         <td>${esc(u.email)}</td>
         <td>@${esc(u.username||'-')}</td>
         <td>${esc(u.name)}</td>
         <td><input class="mini-input" data-edit="balance" type="number" step="0.01" min="0" value="${u.balance}"></td>
         <td><input class="mini-input" data-edit="quotaTokens" type="number" min="0" value="${u.quotaTokens}"></td>
         <td>${Number(u.usedTokens||0).toLocaleString()}</td>
+        <td>¥${Number(u.todayCharged||0).toFixed(4)}</td>
+        <td>¥${Number(u.todayUpstream||0).toFixed(4)}</td>
+        <td>${Number(u.todayInverted||0)?`<span class="tag danger">${u.todayInverted} / ¥${Number(u.todayLoss||0).toFixed(4)}</span>`:'—'}</td>
         <td><select data-edit="role"><option value="user" ${u.role==='user'?'selected':''}>user</option><option value="admin" ${u.role==='admin'?'selected':''}>admin</option></select></td>
         <td><span class="tag ${u.banned?'danger':(u.accountActive?'success':'danger')}">${u.banned?'已封禁':(u.accountActive?'启用':'未激活')}</span></td>
         <td class="ops-cell">
+          <button class="ghost-btn" data-user-bills="${esc(u.id)}">账单</button>
           <button class="ghost-btn" data-delta="${esc(u.id)}" data-sign="1">加余额</button>
           <button class="ghost-btn" data-delta="${esc(u.id)}" data-sign="-1">减余额</button>
           <button class="ghost-btn" data-toggle-ban="${esc(u.id)}" data-banned="${u.banned? 'true':'false'}">${u.banned?'解封':'封号'}</button>
           <button class="ghost-btn" data-save-user="${esc(u.id)}">保存余额</button>
         </td>
-      </tr>`).join('')}</tbody></table></section>`);
+      </tr>`).join('')}</tbody></table></section>
+      <section class="card" style="margin-top:16px" id="userBillsCard" hidden><div class="card-head"><div><p class="eyebrow">USER BILLS</p><h2 id="userBillsTitle">用户账单</h2><p class="sub" id="userBillsSub">Token 表收费 vs 上游实付</p></div></div><div id="userBillsBox"></div></section>`);
       const showUsersErr = (err) => { const el = $('#usersMsg'); if (el) { el.textContent = err.message || String(err); el.className = 'inline-msg'; } };
+      page.querySelectorAll('[data-user-bills]').forEach(btn => btn.onclick = async () => {
+        const card = document.getElementById('userBillsCard');
+        const box = document.getElementById('userBillsBox');
+        const title = document.getElementById('userBillsTitle');
+        const sub = document.getElementById('userBillsSub');
+        if (card) card.hidden = false;
+        if (box) box.innerHTML = '<p class="sub">正在读取账单…</p>';
+        try {
+          const data = await api(`/api/admin/users/${encodeURIComponent(btn.dataset.userBills)}`);
+          const u = data.user || {};
+          const t = data.today || {};
+          if (title) title.textContent = `@${u.username || u.email || u.id} 的账单`;
+          if (sub) sub.textContent = `今日 Token 表收费 ¥${Number(t.logCharged||0).toFixed(4)} · 上游实付 ¥${Number(t.billUpstream||t.logUpstream||0).toFixed(4)} · 倒挂 ${Number(t.invertedCount||0)} 笔 / ¥${Number(t.invertedLoss||0).toFixed(4)}`;
+          const logs = data.recentLogs || [];
+          if (box) {
+            box.innerHTML = `<table class="admin-table"><thead><tr><th>时间</th><th>模型</th><th>Token表收费</th><th>上游实付</th><th>来源</th><th>状态</th></tr></thead><tbody>${logs.map(l => `<tr class="${l.inverted?'is-invert':''}"><td>${esc(String(l.at||'').replace('T',' ').slice(0,19))}</td><td>${esc(l.model||'-')}</td><td>¥${Number(l.chargedAmount||0).toFixed(4)}</td><td>¥${Number(l.upstreamCost||0).toFixed(4)}</td><td>${esc(l.upstreamCostSource==='reported'?'官方实扣':'价格表')}</td><td>${l.inverted?'<span class="tag danger">倒挂</span>':esc(l.status||'')}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">暂无请求</td></tr>'}</tbody></table>`;
+          }
+        } catch (err) { showUsersErr(err); }
+      });
       page.querySelectorAll('[data-toggle-ban]').forEach(btn => btn.onclick = async () => {
         try {
           const banned = btn.dataset.banned === 'true';
@@ -1623,12 +1671,21 @@ ${tokenPriceSyncHtml(settings.tokenPriceSync)}</section>`);
     } else if (adminTab === 'pool') {
       const stats = await api('/api/admin/code-pool');
       if (!stillCurrent()) return;
+      const invertN = Number(stats.invertedCount || 0);
+      const invertLoss = Number(stats.invertedLossToday || 0);
+      const marginToday = Number(stats.chargedToday || 0) - Number(stats.upstreamCostToday || 0);
+      const invertBanner = invertN
+        ? `<div class="pay-expiry-tip is-expired" style="margin-bottom:16px"><strong>预警：上游实付超过 Token 表收费</strong><br>今日 ${invertN} 笔倒挂，合计 ¥${invertLoss.toFixed(4)}。客户仍按价格表 × 全局倍率扣费，不会改成官方账单。请核对本页标红的用户和请求。</div>`
+        : '';
+      const userRows = (stats.chargedTodayByUser || []).map(r => `<tr class="${Number(r.invertedCount||0)?'is-invert':''}"><td>${esc(r.username||r.userId)}</td><td>${r.requests}</td><td>¥${Number(r.chargedAmount||0).toFixed(4)}</td><td>¥${Number(r.upstreamCost||0).toFixed(4)}</td><td>¥${Number(r.margin||0).toFixed(4)}</td><td>${Number(r.invertedCount||0)?`<span class="tag danger">${r.invertedCount} 笔 / ¥${Number(r.invertedLoss||0).toFixed(4)}</span>`:'—'}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">今日暂无客户实扣</td></tr>';
+      const invertRows = (stats.invertedRequests || []).map(r => `<tr class="is-invert"><td>${esc(String(r.createdAt||'').replace('T',' ').slice(0,19))}</td><td>${esc(r.username||r.userId)}</td><td>${esc(r.model||'-')}</td><td>${esc(r.providerName||r.providerId||'-')}</td><td>¥${Number(r.chargedAmount||0).toFixed(4)}</td><td>¥${Number(r.upstreamCost||0).toFixed(4)}</td><td>¥${Number(r.loss||0).toFixed(4)}</td></tr>`).join('') || '<tr><td colspan="7" class="empty">今日没有倒挂请求</td></tr>';
       shell('运营配置', 'ADMIN CONSOLE', `${adminTabsHtml()}
+      ${invertBanner}
       <div class="metric-grid admin-finance">
         <article><small>今日收入</small><strong>¥${Number(stats.incomeToday||0).toFixed(2)}</strong><span class="green">付款领取卡密面额</span></article>
         <article><small>卡密支出</small><strong>¥${Number(stats.cardSpendToday||0).toFixed(2)}</strong><span>今日兑换成余额</span></article>
         <article><small>上游 API 开销${stats.upstreamCostIsEstimate===false?"（实扣）":"（估算）"}</small><strong>¥${Number(stats.upstreamCostToday||0).toFixed(4)}</strong><span>今日上游成本 · ${Number(stats.requestCountToday||0)} 次请求${stats.upstreamCostReportedCount?` · 实扣${stats.upstreamCostReportedCount}`:""}</span></article>
-        <article><small>客户实扣</small><strong>¥${Number(stats.chargedToday||0).toFixed(4)}</strong><span>今日向用户扣费</span></article>
+        <article><small>客户实扣</small><strong>¥${Number(stats.chargedToday||0).toFixed(4)}</strong><span>Token 表收费 · 毛利 ¥${marginToday.toFixed(4)}${invertN?` · 倒挂 ${invertN} 笔`:''}</span></article>
       </div>
       <section class="card" style="margin-top:16px"><div class="card-head"><div><p class="eyebrow">UPSTREAM LEDGER</p><h2>上游账单同步</h2><p class="sub">以每把上游 Key 的 <code>actual_cost</code> 为准。活跃 Key 每 2 秒结算，空闲 Key 每分钟核对；首次同步会补齐历史漏账。</p></div><button class="primary-btn" id="syncUpstreamBilling">立即同步</button></div><p id="upstreamBillingMsg" class="inline-msg">${stats.upstreamUsageSync?.lastRunAt ? `上次同步：${new Date(stats.upstreamUsageSync.lastRunAt).toLocaleString('zh-CN')} · 本次账本 ${Number(stats.upstreamLedgerRows||0)} 条` : '等待首次账单同步'}</p></section>
       <section class="card" id="payMetaCard"><div class="card-head"><div><p class="eyebrow">PAYMENT QR</p><h2>付款码有效期</h2><p class="sub">微信/支付宝不会回调本站。可在此登记预计到期日；到期或临近时，用户付款页与此处都会提示。</p></div></div>
@@ -1642,8 +1699,9 @@ ${tokenPriceSyncHtml(settings.tokenPriceSync)}</section>`);
         <div id="payMetaMsg" class="inline-msg"></div>
       </section>
       <section class="card"><div class="card-head"><div><p class="eyebrow">TODAY ISSUE</p><h2>今日发卡统计</h2><p class="sub">仅管理员可见。日期：${esc(stats.day)} · 库存目标每档 ${stats.target} 张</p></div><div><b>今日发放 ${stats.issuedTodayCount} 张 / ¥${Number(stats.issuedTodaySum).toFixed(0)}</b><br><span class="sub">今日兑换 ${stats.redeemedTodayCount} 张 / ¥${Number(stats.redeemedTodaySum).toFixed(0)}</span></div></div><table class="admin-table"><thead><tr><th>金额</th><th>可用库存</th><th>今日发放</th><th>今日发放金额</th><th>今日兑换</th><th>今日兑换金额</th></tr></thead><tbody>${(stats.byAmount||[]).map(r=>`<tr><td>¥${r.amount}</td><td>${r.available}</td><td>${r.issuedToday}</td><td>¥${r.issuedTodaySum}</td><td>${r.redeemedToday}</td><td>¥${r.redeemedTodaySum}</td></tr>`).join('')}</tbody></table></section>
-      <section class="card" style="margin-top:16px"><div class="card-head"><div><p class="eyebrow">TODAY BY USER</p><h2>今日按用户实扣</h2><p class="sub">只统计今天官方账本里记到该用户头上的实扣，用来对余额。管理员自己测的也会出现在这里，但不扣管理员余额。</p></div></div><table class="admin-table"><thead><tr><th>用户</th><th>请求数</th><th>官方成本</th><th>客户实扣</th></tr></thead><tbody>${(stats.chargedTodayByUser||[]).map(r=>`<tr><td>${esc(r.username||r.userId)}</td><td>${r.requests}</td><td>¥${Number(r.upstreamCost).toFixed(4)}</td><td>¥${Number(r.chargedAmount).toFixed(4)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">今日暂无客户实扣</td></tr>'}</tbody></table></section>
-      <section class="card" style="margin-top:16px"><div class="card-head"><div><p class="eyebrow">UPSTREAM COST</p><h2>今日上游开销明细</h2><p class="sub">按渠道汇总当日 upstreamCost（优先上游返回实扣；否则为单价×token×渠道上游倍率，非 displayMultiplier）</p></div></div><table class="admin-table"><thead><tr><th>渠道</th><th>请求数</th><th>上游开销</th><th>客户实扣</th></tr></thead><tbody>${(stats.upstreamByProvider||[]).map(r=>`<tr><td>${esc(r.providerName||r.providerId)}</td><td>${r.requests}</td><td>¥${Number(r.upstreamCost).toFixed(4)}</td><td>¥${Number(r.chargedAmount).toFixed(4)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">今日暂无上游调用</td></tr>'}</tbody></table></section>`);
+      <section class="card" style="margin-top:16px"><div class="card-head"><div><p class="eyebrow">TODAY BY USER</p><h2>今日按用户：收费 vs 上游实付</h2><p class="sub">客户按 Token 价格表 × 全局倍率收费。上游实付以官方 actual_cost 为准。标红表示这笔官方实付已经高于向用户收的钱。</p></div></div><table class="admin-table"><thead><tr><th>用户</th><th>请求数</th><th>Token表收费</th><th>上游实付</th><th>毛利</th><th>倒挂</th></tr></thead><tbody>${userRows}</tbody></table></section>
+      <section class="card" style="margin-top:16px"><div class="card-head"><div><p class="eyebrow">OVER CHARGE</p><h2>倒挂请求明细</h2><p class="sub">只列出官方实付大于 Token 表收费的请求，最多 80 条。</p></div></div><table class="admin-table"><thead><tr><th>时间</th><th>用户</th><th>模型</th><th>渠道</th><th>Token表收费</th><th>上游实付</th><th>差额</th></tr></thead><tbody>${invertRows}</tbody></table></section>
+      <section class="card" style="margin-top:16px"><div class="card-head"><div><p class="eyebrow">UPSTREAM COST</p><h2>今日上游开销明细</h2><p class="sub">按渠道汇总当日官方实付与 Token 表收费。优先上游 actual_cost；没有官方账单时用价格表估算，不参与倒挂预警。</p></div></div><table class="admin-table"><thead><tr><th>渠道</th><th>请求数</th><th>上游开销</th><th>客户实扣</th><th>倒挂</th></tr></thead><tbody>${(stats.upstreamByProvider||[]).map(r=>`<tr class="${Number(r.invertedCount||0)?'is-invert':''}"><td>${esc(r.providerName||r.providerId)}</td><td>${r.requests}</td><td>¥${Number(r.upstreamCost).toFixed(4)}</td><td>¥${Number(r.chargedAmount).toFixed(4)}</td><td>${Number(r.invertedCount||0)?`<span class="tag danger">${r.invertedCount} / ¥${Number(r.invertedLoss||0).toFixed(4)}</span>`:'—'}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">今日暂无上游调用</td></tr>'}</tbody></table></section>`);
 
       document.getElementById('syncUpstreamBilling')?.addEventListener('click', async () => {
         const button = document.getElementById('syncUpstreamBilling');

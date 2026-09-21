@@ -96,6 +96,11 @@ export function tipsForCode(code, extra = {}) {
     gateway_incomplete: [
       '在「聚合支付」补全 apiUrl / pid / key / siteUrl',
       '或关闭聚合支付，继续使用个人收款码+备注确认'
+    ],
+    upstream_over_charge: [
+      '打开管理后台「今日财务」，核对倒挂用户、模型和差额',
+      '客户仍按 Token 价格表 × 全局倍率收费，不会改成官方 actual_cost',
+      '到「渠道」检查该模型单价是否低于上游实扣，必要时更新 Token 价格表'
     ]
   };
   return map[code] || [

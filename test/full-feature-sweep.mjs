@@ -155,6 +155,24 @@ try {
       body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
     });
     check('chat empty model not 401', chatBad.status !== 401 && chatBad.status !== 200, chatBad.status);
+    const unknown = await req('/v1/chat/completions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${v1secret}` },
+      body: JSON.stringify({ model: 'zz-unknown-model-xyz', messages: [{ role: 'user', content: 'hi' }] })
+    });
+    check('unknown model 4xx', unknown.status >= 400 && unknown.status < 500, `${unknown.status} ${JSON.stringify(unknown.body).slice(0, 180)}`);
+    check('unknown model not 200', unknown.status !== 200, unknown.status);
+    check('unknown model json error', typeof unknown.body.error === 'string' || typeof unknown.body.error === 'object', JSON.stringify(unknown.body).slice(0, 180));
+    const filesUnauth = await req('/v1/files', { method: 'POST', body: '{}' });
+    check('POST /v1/files unauth', filesUnauth.status === 401 || filesUnauth.status === 403, filesUnauth.status);
+    const files = await req('/v1/files', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${v1secret}` },
+      body: JSON.stringify({ purpose: 'assistants' })
+    });
+    check('POST /v1/files json not html', !String(files.text || '').toLowerCase().includes('<html') && !String(files.body?.raw || '').toLowerCase().includes('page not found'), String(files.text || files.body?.raw || '').slice(0, 120));
+    check('POST /v1/files not bare 404 html', files.status !== 404 || (files.body && files.body.error), `${files.status} ${JSON.stringify(files.body).slice(0, 160)}`);
+    check('POST /v1/files api body', files.status === 200 || files.status === 501 || files.status === 401 || files.status === 400, files.status);
   }
 
   const ci = await req('/api/checkin', { method: 'POST', headers: userTok, body: '{}' });
@@ -311,6 +329,7 @@ try {
     ['POST', '/v1/chat/completions'],
     ['POST', '/v1/messages'],
     ['POST', '/v1/responses'],
+    ['POST', '/v1/files'],
     ['POST', '/api/chat']
   ];
   for (const [method, p] of v1) {

@@ -171,9 +171,10 @@ function startPoll() {
         after = Number.isFinite(Number(j.seq)) ? Number(j.seq) : after;
         localStorage.setItem('relay_admin_event_seq', String(after));
         const events = j.events || [];
-        const alertable = events.filter(ev => ev.kind === 'placed' || ev.kind === 'paid' || ev.kind === 'signup_burst');
+        const alertable = events.filter(ev => ev.kind === 'placed' || ev.kind === 'paid' || ev.kind === 'signup_burst' || ev.kind === 'upstream_over_charge');
         if (alertable.length) {
           const burst = alertable.filter(e => e.kind === 'signup_burst');
+          const over = alertable.filter(e => e.kind === 'upstream_over_charge');
           const pays = alertable.filter(e => e.kind === 'placed' || e.kind === 'paid');
           let title = '';
           let body = '';
@@ -183,6 +184,12 @@ function startPoll() {
             body = first.body || `短时间内新注册 ${first.count || ''} 个账号`;
             const badge = document.querySelector('[data-tab="alerts"]');
             if (badge && tab !== 'alerts') badge.textContent = `告警(${burst.length})`;
+          } else if (over.length) {
+            const first = over[0];
+            title = first.title || '上游实付倒挂';
+            body = first.body || `Token 表收费低于上游实付 ${first.count || ''} 笔`;
+            const badge = document.querySelector('[data-tab="alerts"]');
+            if (badge && tab !== 'alerts') badge.textContent = `告警`;
           } else if (pays.length) {
             const first = pays.find(e => e.kind === 'paid') || pays[0];
             title = pays.some(e => e.kind === 'paid')
@@ -237,8 +244,11 @@ async function render(preloaded) {
           <div class="card"><small>今日发卡</small><b>${money(f.incomeToday)}</b></div>
           <div class="card"><small>注册告警</small><b class="${(inbox.securityAlerts || []).length ? 'bad' : 'ok'}">${(inbox.securityAlerts || []).length}</b></div>
         </div>
-        <p class="sub">诊断上次：${inbox.diagnostics?.at ? when(inbox.diagnostics.at) : '尚未运行'} · 失败 ${inbox.diagnostics?.summary?.failed ?? '-'}</p>
-        <div class="row"><button class="primary" id="goOrders">去确认充值</button><button class="ghost" id="goAlerts">看注册告警</button></div>
+        <p class="sub">诊断上次：${inbox.diagnostics?.at ? when(inbox.diagnostics.at) : '尚未运行'} · 失败 ${inbox.diagnostics?.summary?.failed ?? '-'}${Number(f.invertedCount||0) ? ` · 计费倒挂 ${f.invertedCount} 笔 / ¥${Number(f.invertedLossToday||0).toFixed(4)}` : ''}</p>
+        <div class="row"><button class="primary" id="goOrders">去确认充值</button><button class="ghost" id="goAlerts">看告警</button></div>
+        ${Number(f.invertedCount || 0)
+          ? `<article class="item" style="margin-top:12px"><h3 class="bad">上游实付超过 Token 表收费</h3><p class="sub">今日 ${Number(f.invertedCount)} 笔倒挂，合计 ¥${Number(f.invertedLossToday||0).toFixed(4)}。客户仍按价格表收费。</p></article>`
+          : ''}
         ${inbox.paymentQr?.wechat?.expired || inbox.paymentQr?.alipay?.expired
           ? `<article class="item" style="margin-top:12px"><h3 class="bad">收款码已过期</h3><p class="sub">${esc([inbox.paymentQr?.wechat?.expired ? '微信' : '', inbox.paymentQr?.alipay?.expired ? '支付宝' : ''].filter(Boolean).join(' / '))} 需要按金额分别换图。</p><button class="primary" id="goQr">去替换收款码</button></article>`
           : ''}`;
@@ -248,9 +258,17 @@ async function render(preloaded) {
     } else if (tab === 'alerts') {
       const data = await api('/api/admin/security-alerts');
       const list = data.alerts || [];
+      const billing = data.billingAlerts || [];
       pane.innerHTML = `
-        <p class="sub">待处理 ${data.openCount || 0} 条。可一键封掉这批账号，或对单个账号点「封号」。</p>
-        <div class="list">${list.length ? list.map(a => `
+        <p class="sub">计费倒挂待处理 ${data.billingOpenCount || 0} 条 · 注册告警待处理 ${data.openCount || 0} 条。</p>
+        <div class="list">${billing.length ? billing.map(a => `
+          <article class="item">
+            <h3>${a.status === 'open' ? '<span class="tag warn">待处理</span>' : '<span class="tag">已忽略</span>'} 倒挂 ${Number(a.count || 0)} 笔 · ¥${Number(a.loss || 0).toFixed(4)}</h3>
+            <p class="sub">${esc(when(a.createdAt))} · ${esc(a.day || '')}</p>
+            <p class="sub">${(a.users || []).map(u => '@' + (u.username || u.userId)).join('、') || '-'}</p>
+            ${a.status === 'open' ? `<div class="row"><button class="ghost" data-dismiss-billing="${esc(a.id)}">忽略</button></div>` : ''}
+          </article>`).join('') : ''}
+        ${list.length ? list.map(a => `
           <article class="item">
             <h3>${a.status === 'open' ? '<span class="tag warn">待处理</span>' : (a.status === 'banned' ? '<span class="tag">已封</span>' : '<span class="tag">已忽略</span>')} 注册 ${Number(a.count || 0)} 个</h3>
             <p class="sub">${esc(when(a.createdAt))} · IP ${esc(a.ip || '-')}</p>
@@ -260,7 +278,7 @@ async function render(preloaded) {
                 ${a.status === 'open' && !u.banned ? `<button class="ghost" data-ban-one="${esc(a.id)}" data-user="${esc(u.userId)}">封号</button>` : ''}
               </div>`).join('')}
             ${a.status === 'open' ? `<div class="row"><button class="primary" data-ban-all="${esc(a.id)}">一键封号</button><button class="ghost" data-dismiss="${esc(a.id)}">忽略</button></div>` : `<p class="sub">已处理 ${a.bannedCount || 0} 人</p>`}
-          </article>`).join('') : '<p class="sub">暂无告警</p>'}</div>`;
+          </article>`).join('') : (billing.length ? '' : '<p class="sub">暂无告警</p>')}</div>`;
       pane.querySelectorAll('[data-ban-all]').forEach(btn => btn.onclick = async () => {
         if (!confirm('确认封禁该批次全部新注册账号？')) return;
         await api(`/api/admin/security-alerts/${btn.dataset.banAll}/ban-all`, { method: 'POST', body: '{}' });
@@ -273,6 +291,10 @@ async function render(preloaded) {
       });
       pane.querySelectorAll('[data-dismiss]').forEach(btn => btn.onclick = async () => {
         await api(`/api/admin/security-alerts/${btn.dataset.dismiss}/dismiss`, { method: 'POST', body: '{}' });
+        render();
+      });
+      pane.querySelectorAll('[data-dismiss-billing]').forEach(btn => btn.onclick = async () => {
+        await api(`/api/admin/billing-alerts/${btn.dataset.dismissBilling}/dismiss`, { method: 'POST', body: '{}' });
         render();
       });
     } else if (tab === 'orders') {
@@ -320,6 +342,7 @@ async function render(preloaded) {
             <h3>@${esc(u.username || '-')} ${u.banned ? '<span class="tag bad">已封禁</span>' : (u.accountActive ? '<span class="tag">正常</span>' : '<span class="tag warn">未激活</span>')}</h3>
             <p class="sub">${esc(u.name || '')} · ${esc(u.email || '')}</p>
             <p><b class="${u.banned ? 'bad' : 'ok'}">${money(u.balance)}</b></p>
+            <p class="sub">今日收费 ¥${Number(u.todayCharged||0).toFixed(4)} · 上游 ¥${Number(u.todayUpstream||0).toFixed(4)}${Number(u.todayInverted||0) ? ` · <b class="bad">倒挂 ${u.todayInverted}</b>` : ''}</p>
             <div class="row">
               <button class="primary" data-add="${esc(u.id)}">加余额</button>
               <button class="ghost" data-sub="${esc(u.id)}">减余额</button>

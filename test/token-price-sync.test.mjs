@@ -103,6 +103,9 @@ assert.equal(bei.modelPrices.kimi.inputPricePer1K, 0.5, 'unsampled models keep l
 
 assert.equal(catalogPrice('deepseek-v4-flash').inputPricePer1K, 0.00015);
 assert.equal(catalogPrice('deepseek-v4-flash').outputPricePer1K, 0.0006);
+assert.equal(catalogPrice('grok-4.6').inputPricePer1K, 0.002473);
+assert.equal(catalogPrice('grok-4.6').outputPricePer1K, 0.0066);
+assert.equal(catalogPrice('grok-4.6').cacheReadPricePer1K, 0.0003709);
 
 const now = Date.parse('2026-09-18T10:30:00.000Z');
 const mixed = recentUsageRows([

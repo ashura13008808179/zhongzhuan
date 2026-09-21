@@ -28,6 +28,9 @@
 .model-price-head{font:9px 'DM Mono';color:#636e81;letter-spacing:1px}
 .tag.danger{color:#f0a0a0;background:#3a2424}
 .admin-table{width:100%;border-collapse:collapse}
+.admin-table tr.is-invert td{color:#f0a0a0}
+.admin-table tr.is-invert{background:rgba(239,68,68,.08)}
+.admin-tab.has-alert{color:#f0a0a0;border-color:#5a3434}
 .admin-table th,.admin-table td{text-align:left;padding:10px 6px;border-bottom:1px solid #252b37;font-size:11px;color:#9ca5b5;vertical-align:middle}
 .admin-table th{font:9px 'DM Mono';letter-spacing:1px;color:#636e81}
 .mini-input,select{height:32px;background:#10131a;border:1px solid #303646;border-radius:6px;color:var(--text);padding:0 8px;font:11px 'Space Grotesk';width:100px}

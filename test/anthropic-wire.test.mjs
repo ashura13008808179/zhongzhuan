@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {
   messagesEndpointFromChatUrl,
+  v1EndpointFromChatUrl,
   normalizeAnthropicUsage,
   mergeAnthropicStreamUsage,
   anthropicStreamFinished,
@@ -15,6 +16,14 @@ assert.equal(
 assert.equal(
   messagesEndpointFromChatUrl('https://api.vip1129.cc/v1/chat/completions'),
   'https://api.vip1129.cc/v1/messages'
+);
+assert.equal(
+  v1EndpointFromChatUrl('https://api.vip1129.cc/v1/chat/completions', 'files'),
+  'https://api.vip1129.cc/v1/files'
+);
+assert.equal(
+  v1EndpointFromChatUrl('https://api.vip1129.cc/v1/chat/completions', 'responses'),
+  'https://api.vip1129.cc/v1/responses'
 );
 
 const usage = normalizeAnthropicUsage({
