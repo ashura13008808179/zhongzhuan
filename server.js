@@ -53,8 +53,9 @@ import {
   wireAllProviders,
   resolveProxyApiKey as resolveProxyApiKeyPure,
   findSyncedKeyRecord,
-  findListedSecret,
   findListedSecretById,
+  planUpstreamProbeKeys,
+  upstreamProbeKeyName,
   upstreamSecretOf,
   preserveUpstreamSecret,
   validateInviteCode,
@@ -3529,6 +3530,17 @@ async function ensureProxyApiKey(db, user, provider, apiKeyRec = null) {
   return String(provider?.apiKey || '').trim();
 }
 
+async function deleteUpstreamKeysBestEffort(deleteFn, auth, ids) {
+  for (const id of ids || []) {
+    if (id == null || id === '') continue;
+    try {
+      await deleteFn(auth.cfg.baseUrl, auth.token, id);
+    } catch {
+      // Best-effort cleanup; a leftover id is retried on the next probe.
+    }
+  }
+}
+
 async function ensureUpstreamProbeKey(db, provider, { forceNew = false } = {}) {
   db.settings ??= {};
   db.settings.upstreamProbeKeys ??= {};
@@ -3546,54 +3558,35 @@ async function ensureUpstreamProbeKey(db, provider, { forceNew = false } = {}) {
     return secret.key;
   };
 
-  const probeName = `relay-probe-${provider.id}`.slice(0, 60);
-  if (isVip1129Provider(provider)) {
-    const groupId = resolveVip1129GroupId(db, provider.id);
-    if (groupId == null) return '';
-    const auth = await ensureVip1129Token(db);
-    if (!auth.ok) return '';
-    if (!forceNew) {
-      const listed = await vip1129ListKeys(auth.cfg.baseUrl, auth.token, 'page=1&page_size=100');
-      if (listed.ok) {
-        const exact = findListedSecret(listed.data, { name: probeName, groupId });
-        if (exact.key) return persist(exact);
-        const named = findListedSecret(listed.data, { nameIncludes: 'relay-probe', groupId });
-        if (named.key) return persist(named);
-        const any = findListedSecret(listed.data, { groupId });
-        if (any.key) return persist(any);
-      }
-    }
-    const created = await vip1129CreateKey(auth.cfg.baseUrl, auth.token, {
-      name: probeName,
-      group_id: groupId
-    });
-    if (created.ok) return persist(vip1129ExtractSecret(created.data));
-    return '';
+  const probeName = upstreamProbeKeyName(provider.id);
+  const kind = isVip1129Provider(provider) ? 'vip1129' : (isBeibeihaiProvider(provider) ? 'beibeihai' : null);
+  if (!kind) return String(provider?.apiKey || '').trim();
+
+  const groupId = kind === 'vip1129'
+    ? resolveVip1129GroupId(db, provider.id)
+    : resolveBeibeihaiGroupId(db, provider.id);
+  if (groupId == null) return '';
+  const auth = kind === 'vip1129' ? await ensureVip1129Token(db) : await ensureBeibeihaiToken(db);
+  if (!auth.ok) return '';
+
+  const listKeys = kind === 'vip1129' ? vip1129ListKeys : beibeihaiListKeys;
+  const createKey = kind === 'vip1129' ? vip1129CreateKey : beibeihaiCreateKey;
+  const deleteKey = kind === 'vip1129' ? vip1129DeleteKey : beibeihaiDeleteKey;
+  const extract = kind === 'vip1129' ? vip1129ExtractSecret : beibeihaiExtractSecret;
+
+  const listed = await listKeys(auth.cfg.baseUrl, auth.token, 'page=1&page_size=100');
+  if (listed.ok) {
+    const plan = planUpstreamProbeKeys(listed.data, { probeName, groupId, forceNew });
+    if (plan.deleteIds.length) await deleteUpstreamKeysBestEffort(deleteKey, auth, plan.deleteIds);
+    if (!plan.create) return persist(plan.keep);
   }
-  if (isBeibeihaiProvider(provider)) {
-    const groupId = resolveBeibeihaiGroupId(db, provider.id);
-    if (groupId == null) return '';
-    const auth = await ensureBeibeihaiToken(db);
-    if (!auth.ok) return '';
-    if (!forceNew) {
-      const listed = await beibeihaiListKeys(auth.cfg.baseUrl, auth.token, 'page=1&page_size=100');
-      if (listed.ok) {
-        const exact = findListedSecret(listed.data, { name: probeName, groupId });
-        if (exact.key) return persist(exact);
-        const named = findListedSecret(listed.data, { nameIncludes: 'relay-probe', groupId });
-        if (named.key) return persist(named);
-        const any = findListedSecret(listed.data, { groupId });
-        if (any.key) return persist(any);
-      }
-    }
-    const created = await beibeihaiCreateKey(auth.cfg.baseUrl, auth.token, {
-      name: probeName,
-      group_id: groupId
-    });
-    if (created.ok) return persist(beibeihaiExtractSecret(created.data));
-    return '';
-  }
-  return String(provider?.apiKey || '').trim();
+
+  const created = await createKey(auth.cfg.baseUrl, auth.token, {
+    name: probeName,
+    group_id: groupId
+  });
+  if (created.ok) return persist(extract(created.data));
+  return '';
 }
 
 function billingRequestHeaders(bearer, extra = {}, clientRequestId = '') {
